@@ -1,0 +1,32 @@
+# Local smoke test of the Stage 1 path (main model, tiny eval). Not a result.
+stage: smoke
+model: Qwen/Qwen2.5-1.5B-Instruct
+reference_dtype: bfloat16
+seed: 0
+output_dir: artifacts/smoke_stage1
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 2
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 4
+    max_new_tokens: 512
+    batch_size: 4
+
+kmeans:
+  iters: 25
+  max_fit_chunks: 1000000
+  assign_batch: 65536
+
+runs:
+  - {name: original, method: original}
+  - {name: ternary_rtn, method: ternary, group: 32}

@@ -1,0 +1,8 @@
+# Installed on the Vast instance during bootstrap (image already ships torch/CUDA).
+# Pinned to the versions the local pipeline was tested with.
+transformers==5.14.1
+datasets==5.0.0
+huggingface_hub==1.24.0
+safetensors==0.8.0
+PyYAML==6.0.3
+matplotlib==3.10.8
