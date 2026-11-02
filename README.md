@@ -24,6 +24,8 @@ how far the model's behaviour moves. The full plan is in
 pip install torch transformers datasets pyyaml matplotlib   # see requirements-remote.txt for pinned versions
 python scripts/run_experiment.py --config configs/stage0_debug.yaml      # sanity, Qwen2.5-0.5B
 python scripts/run_experiment.py --config configs/stage1_baselines.yaml  # baselines, Qwen2.5-1.5B-Instruct
+python scripts/run_experiment.py --config configs/stage1_baselines_7b.yaml  # baselines, Qwen2.5-7B-Instruct
+python scripts/run_experiment.py --config configs/stage2_codebook_7b.yaml   # codebook cells, Qwen2.5-7B-Instruct
 python -m pytest tests -q
 ```
 
@@ -57,3 +59,8 @@ config skips runs already present in `results.csv`.
 - **Spec deviation.** The d = 8, K = 65,536 Stage 2 cell is deliberately
   dropped: its per-matrix codebook alone adds ~1.25 bits/weight, and the K/V
   projections have fewer chunks than codewords.
+- **Main model for Stage 2 onward.** Stage 2 runs on Qwen2.5-7B-Instruct
+  instead of 1.5B (user decision, 2026-11-02), with the Stage 1 baselines
+  repeated on 7B (`configs/stage1_baselines_7b.yaml`) so every comparison is
+  within one model. The 1.5B Stage 1 results are kept for reference. On 7B
+  the embedding and lm_head are untied and both count at 16 bits.

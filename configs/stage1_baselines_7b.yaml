@@ -1,0 +1,36 @@
+# Stage 1 baselines repeated on Qwen2.5-7B-Instruct, the Stage 2 main model
+# (user decision 2026-11-02: run Stage 2 on a 5-7B model). Same eval as the 1.5B run.
+stage: 1
+output_dir: artifacts/qwen_s01/stage1_baselines_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+kmeans:
+  iters: 25
+  max_fit_chunks: 1000000
+  assign_batch: 32768      # halved vs 1.5B: 7B weights + fp32 lm_head already use ~17 GB
+
+runs:
+  - {name: original, method: original}
+  - {name: q4_rtn, method: rtn, bits: 4, group: 32}
+  - {name: q3_rtn, method: rtn, bits: 3, group: 32}
+  - {name: q2_rtn, method: rtn, bits: 2, group: 32}
+  - {name: ternary_rtn, method: ternary, group: 32}
