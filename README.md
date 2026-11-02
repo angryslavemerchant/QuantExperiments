@@ -28,7 +28,7 @@ python -m pytest tests -q
 ```
 
 Each run writes `results.csv`, per-run JSON, GSM8K generations and the two
-plots to the config's `output_dir` under `artifacts/`. Rerunning the same
+plots to the config's `output_dir` under `artifacts/qwen_s01/` (one folder for all stages, so a remote run declares a single artifact path that always exists). Rerunning the same
 config skips runs already present in `results.csv`.
 
 ## Implementation notes

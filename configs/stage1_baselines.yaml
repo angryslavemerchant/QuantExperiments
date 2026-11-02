@@ -3,7 +3,7 @@ stage: 1
 model: Qwen/Qwen2.5-1.5B-Instruct
 reference_dtype: bfloat16
 seed: 0
-output_dir: artifacts/stage1_baselines
+output_dir: artifacts/qwen_s01/stage1_baselines
 
 eval:
   logit_chunk: 512

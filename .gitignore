@@ -5,6 +5,9 @@ __pycache__/
 
 artifacts/*
 !artifacts/.gitkeep
+!artifacts/qwen_s01/
+artifacts/qwen_s01/*
+!artifacts/qwen_s01/.gitkeep
 
 # Vast.ai ops (local state + credentials never committed)
 .vast/

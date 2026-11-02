@@ -3,7 +3,7 @@ stage: smoke
 model: Qwen/Qwen2.5-1.5B-Instruct
 reference_dtype: bfloat16
 seed: 0
-output_dir: artifacts/smoke_stage1
+output_dir: artifacts/qwen_s01/smoke_stage1
 
 eval:
   logit_chunk: 256
