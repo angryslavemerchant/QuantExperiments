@@ -2669,8 +2669,12 @@ def verify_created_instance(
             instance = matches[0]
             if instance.get("label") != expected_label:
                 raise OpsError("created instance label does not match the requested campaign")
+            # instance_id is the create-response ID for this exact offer purchase.
             _validate_live_contract_constraints(
-                instance, manifest, expected_offer=expected_offer
+                instance,
+                manifest,
+                expected_offer=expected_offer,
+                create_response_instance_id=instance_id,
             )
             return instance
         _bounded_sleep(5, deadline)
@@ -2757,19 +2761,42 @@ def _require_live_exact_positive_int(
 
 
 def _validate_live_offer_identity(
-    instance: dict[str, Any], expected_offer: dict[str, Any]
+    instance: dict[str, Any],
+    expected_offer: dict[str, Any],
+    *,
+    create_response_instance_id: int | None = None,
 ) -> None:
-    """Require one unambiguous live offer identity for a purchased contract."""
+    """Bind a live instance to the offer that was purchased.
+
+    Vast's ``show instances`` rows do not carry the purchased offer/ask ID under
+    any key (observed live 2026-11-02 on instance 58748479: none of the keys
+    below were present, and no key mentioned 'offer' or 'contract'). The
+    binding Vast does provide is the create response: PUT /asks/<offer_id>/
+    returns the new instance ID. So when no offer identity is reported, the
+    instance is accepted only if its own ``id`` equals the persisted
+    create-response instance ID for that exact offer purchase. Any reported
+    offer identity must still be unambiguous and match the selected offer.
+    """
 
     expected_id = _strict_positive_identity(
         expected_offer.get("id"), "selected offer ID"
     )
     keys = ("ask_contract_id", "offer_id", "actual_offer_id", "contract_offer_id")
-    present = [key for key in keys if key in instance]
-    if not present or any(instance.get(key) is None for key in present):
-        raise OpsError(
-            "live purchased instance did not report an unambiguous ask/offer contract ID"
+    present = [key for key in keys if instance.get(key) is not None]
+    if not present:
+        if create_response_instance_id is None:
+            raise OpsError(
+                "live purchased instance did not report an unambiguous ask/offer "
+                "contract ID and no create-response instance ID binds it"
+            )
+        bound_id = _strict_positive_identity(
+            create_response_instance_id, "create-response instance ID"
         )
+        if _offer_identity_number(instance, "id") != bound_id:
+            raise OpsError(
+                "live instance ID does not match the create-response instance ID"
+            )
+        return
     values = {
         _strict_positive_identity(instance[key], f"live {key}") for key in present
     }
@@ -2811,7 +2838,11 @@ def _validate_reconcilable_purchase_instance(
     live_machine_id = _strict_positive_identity(
         instance.get("machine_id"), "live machine ID"
     )
-    _validate_live_offer_identity(instance, {"id": expected_offer_id})
+    _validate_live_offer_identity(
+        instance,
+        {"id": expected_offer_id},
+        create_response_instance_id=record.get("create_response_instance_id"),
+    )
     if live_machine_id != expected_machine_id:
         raise OpsError("live machine identity does not match persisted purchase")
 
@@ -2833,6 +2864,7 @@ def _validate_live_contract_constraints(
     manifest: RunManifest,
     *,
     expected_offer: dict[str, Any] | None = None,
+    create_response_instance_id: int | None = None,
 ) -> float:
     """Validate every declared/searchable host constraint after purchase.
 
@@ -2909,7 +2941,11 @@ def _validate_live_contract_constraints(
             expected_offer.get("id"), "selected offer ID"
         )
         if expected_offer_id:
-            _validate_live_offer_identity(instance, expected_offer)
+            _validate_live_offer_identity(
+                instance,
+                expected_offer,
+                create_response_instance_id=create_response_instance_id,
+            )
     verified = instance.get("verified") is True or str(
         instance.get("verification") or ""
     ).lower() == "verified"

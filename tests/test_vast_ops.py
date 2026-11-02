@@ -2927,9 +2927,17 @@ def test_verify_created_instance_rejects_wrong_geolocation() -> None:
 def test_purchased_live_contract_requires_exact_offer_identity() -> None:
     instance = adoption_instance()
     manifest = replace(adoption_manifest(), required_geolocation=None)
+    # No offer identity reported and no create-response binding: refuse.
     with pytest.raises(OpsError, match="unambiguous ask/offer contract ID"):
         _validate_live_contract_constraints(
             instance, manifest, expected_offer={"id": 11, "machine_id": 999}
+        )
+    # A null identity field is the same as an absent one.
+    with pytest.raises(OpsError, match="unambiguous ask/offer contract ID"):
+        _validate_live_contract_constraints(
+            {**instance, "ask_contract_id": None},
+            manifest,
+            expected_offer={"id": 11, "machine_id": 999},
         )
 
     instance["ask_contract_id"] = 12
@@ -8585,3 +8593,80 @@ def test_peek_is_read_only_and_bounded() -> None:
     assert "tail -n 50" in seen[0] and "head -c" in seen[0]
     for verb in ("rm ", "mv ", "kill", "> "):
         assert verb not in seen[0]
+
+
+# Vast's live `show instances` row carries no offer/ask identity at all
+# (observed 2026-11-02, instance 58748479). The create response binds the
+# purchased offer to the instance ID instead.
+
+def _real_shaped_vast_row(**updates: object) -> dict[str, object]:
+    row = adoption_instance()
+    for key in ("ask_contract_id", "offer_id", "actual_offer_id", "contract_offer_id"):
+        row.pop(key, None)
+    row.update({"bundle_id": 5, "host_id": 7, "is_bid": False, "template_id": 1})
+    row.update(updates)
+    return row
+
+
+def test_unreported_offer_identity_is_bound_by_create_response_id() -> None:
+    manifest = replace(adoption_manifest(), required_geolocation=None)
+    offer = {"id": 11, "machine_id": 999}
+    row = _real_shaped_vast_row()
+    _validate_live_contract_constraints(
+        row, manifest, expected_offer=offer, create_response_instance_id=1234
+    )
+    with pytest.raises(OpsError, match="does not match the create-response instance ID"):
+        _validate_live_contract_constraints(
+            row, manifest, expected_offer=offer, create_response_instance_id=4321
+        )
+
+
+def test_reported_offer_identity_must_still_match_even_with_binding() -> None:
+    manifest = replace(adoption_manifest(), required_geolocation=None)
+    row = _real_shaped_vast_row(ask_contract_id=12)
+    with pytest.raises(OpsError, match="does not match selected offer"):
+        _validate_live_contract_constraints(
+            row,
+            manifest,
+            expected_offer={"id": 11, "machine_id": 999},
+            create_response_instance_id=1234,
+        )
+
+
+def test_verify_created_instance_accepts_real_shaped_row() -> None:
+    manifest = replace(adoption_manifest(), required_geolocation=None)
+    label = "quant-experiments-adopt_seed0"
+    row = _real_shaped_vast_row(label=label)
+    with patch("vast.ops.run_vast", return_value=[row]):
+        live = vast_ops.verify_created_instance(
+            1234,
+            manifest,
+            expected_label=label,
+            expected_offer={"id": 11, "machine_id": 999},
+        )
+    assert live["id"] == 1234
+
+
+def _purchase_record(**updates: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "run_id": "adopt_seed0",
+        "expected_label": "quant-experiments-adopt_seed0",
+        "offer_id": 11,
+        "machine_id": 999,
+        "create_response_instance_id": 1234,
+    }
+    record.update(updates)
+    return record
+
+
+def test_purchase_reconciliation_binds_real_shaped_row_by_create_response_id() -> None:
+    row = _real_shaped_vast_row(label="quant-experiments-adopt_seed0")
+    assert vast_ops._is_reconcilable_purchase_instance(_purchase_record(), row)
+    # Without a persisted create-response ID a label alone must not authorize destroy.
+    assert not vast_ops._is_reconcilable_purchase_instance(
+        _purchase_record(create_response_instance_id=None), row
+    )
+    # A different instance carrying the same label is not ours.
+    assert not vast_ops._is_reconcilable_purchase_instance(
+        _purchase_record(), {**row, "id": 4321}
+    )
