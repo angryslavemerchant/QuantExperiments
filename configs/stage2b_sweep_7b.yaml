@@ -1,0 +1,52 @@
+# Stage 2b: bits-matched shape-length sweep plus published GGUF reference points,
+# Qwen2.5-7B-Instruct. Run with scripts/run_parallel.py --shards 3 (shard = index mod 3).
+stage: 2b
+output_dir: artifacts/qwen_s01/stage2b_sweep_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+kmeans:
+  iters: 25
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+# Codebook cells hold the tag budget fixed (log2 K / d = 2.0, 2.5 or 3.0 bits)
+# and vary the shape length d. Already measured in stage2_codebook_7b:
+# d=8 K=4096 (1.5), d=4 K=4096 (3.0).
+# GGUF cells: bartowski's imatrix quants from llama.cpp; only the block linears
+# are swapped in (dequantized), the rest stays 16-bit, same protocol as ours.
+# Order is chosen so the three shards get similar work (shard = index mod 3).
+runs:
+  - {name: original, method: original}
+  - {name: cb_d6_k4096, method: codebook, d: 6, K: 4096}       # 2.0
+  - {name: cb_d4_k1024, method: codebook, d: 4, K: 1024}       # 2.5
+  - {name: gguf_q2_k, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-Q2_K.gguf}
+  - {name: cb_d3_k512, method: codebook, d: 3, K: 512}         # 3.0
+  - {name: gguf_iq2_m, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-IQ2_M.gguf}
+  - {name: cb_d2_k16, method: codebook, d: 2, K: 16}           # 2.0
+  - {name: gguf_q4_0, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-Q4_0.gguf}
+  - {name: cb_d3_k64, method: codebook, d: 3, K: 64}           # 2.0
+  - {name: gguf_iq3_xs, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-IQ3_XS.gguf}
+  - {name: cb_d4_k256, method: codebook, d: 4, K: 256}         # 2.0
+  - {name: gguf_q3_k_m, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-Q3_K_M.gguf}
+  - {name: cb_d2_k32, method: codebook, d: 2, K: 32}           # 2.5
+  - {name: gguf_q4_k_m, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-Q4_K_M.gguf}
+  - {name: cb_d2_k64, method: codebook, d: 2, K: 64}           # 3.0

@@ -35,7 +35,7 @@ from shapequant.pipeline import apply_run, compressible_linears, snapshot_origin
 from shapequant.plots import make_plots  # noqa: E402
 
 COLUMNS = [
-    "stage", "run_name", "method", "model", "d", "K", "shuffle", "masks", "M", "finetune", "start",
+    "stage", "run_name", "method", "source", "model", "d", "K", "shuffle", "masks", "M", "finetune", "start",
     "seed", "bits_per_weight_rounded", "bits_per_weight_ideal", "total_mb", "pct_of_original",
     "mean_kl", "p99_kl", "top1_agree", "perplexity", "gsm8k_acc", "codebook_usage",
     "recon_mse", "recon_rel_mse", "compress_seconds", "eval_tokens",
@@ -130,10 +130,18 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="run only runs[i] with i %% num_shards == shard (see run_parallel.py)")
+    ap.add_argument("--num-shards", type=int, default=1)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
     out_dir = Path(cfg["output_dir"])
+    if args.num_shards > 1:
+        if cfg.get("stage0_checks"):
+            raise SystemExit("stage0_checks cannot be sharded")
+        cfg["runs"] = [r for i, r in enumerate(cfg["runs"]) if i % args.num_shards == args.shard]
+        out_dir = out_dir / f"shard{args.shard}"
     (out_dir / "runs").mkdir(parents=True, exist_ok=True)
     (out_dir / "gsm8k").mkdir(exist_ok=True)
     csv_path = out_dir / "results.csv"
@@ -191,6 +199,7 @@ def main() -> int:
             "shuffle": run.get("shuffle", False), "masks": run.get("masks", False), "M": run.get("M"),
             "finetune": run.get("finetune", False),
             "start": run.get("start", "q4") if run["method"] == "codebook" else "fp16",
+            "source": (run.get("path") or f"{run['repo']}/{run['file']}") if run["method"] == "gguf" else None,
             "seed": seed, **stats, **metrics,
         }
         rows[name] = row

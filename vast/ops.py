@@ -96,7 +96,13 @@ BOOTSTRAP_TIMEOUT_SECONDS = 600
 OFFER_PRICE_BAND = 0.20
 # Hard per-GPU hourly ceilings applied before the band (user preference,
 # 2026-11-02). Keys are normalized GPU names (lowercase alphanumerics).
-OFFER_MAX_DPH_BY_GPU = {"rtx4090": 0.50, "rtx5090": 0.70}
+OFFER_MAX_DPH_BY_GPU = {
+    "rtx4090": 0.50,
+    "rtx5090": 0.70,
+    # User cap 2026-11-02: speed and machine quality over cost (time ~ $50/h).
+    "rtxpro6000ws": 1.70,
+    "rtxpro6000s": 1.70,
+}
 _MAX_PROVIDER_JSON_BYTES = 4 * 1024 * 1024
 _MAX_PROVIDER_JSON_DEPTH = 24
 # Provider market snapshots legitimately contain many scalar fields. Bound

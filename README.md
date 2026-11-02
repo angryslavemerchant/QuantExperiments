@@ -13,8 +13,10 @@ how far the model's behaviour moves. The full plan is in
 | `shapequant/codebook.py` | Chunking, k-means codebook fit, snap (`assign`), repaint (`decode`) |
 | `shapequant/memory.py` | Memory accounting by formula |
 | `shapequant/evaluate.py` | WikiText-2 KL / top-1 / perplexity, GSM8K generation check |
+| `shapequant/gguf_ref.py` | Published llama.cpp GGUF quants as reference points (block linears only) |
 | `shapequant/pipeline.py` | Applies a method to every block linear, collects stats |
 | `scripts/run_experiment.py` | One entry point, driven by a YAML config |
+| `scripts/run_parallel.py` | Runs a config as N parallel shards on one GPU, then merges |
 | `configs/` | One config per stage |
 | `vast/` | Guarded Vast.ai tooling for rented-GPU runs |
 
@@ -26,6 +28,7 @@ python scripts/run_experiment.py --config configs/stage0_debug.yaml      # sanit
 python scripts/run_experiment.py --config configs/stage1_baselines.yaml  # baselines, Qwen2.5-1.5B-Instruct
 python scripts/run_experiment.py --config configs/stage1_baselines_7b.yaml  # baselines, Qwen2.5-7B-Instruct
 python scripts/run_experiment.py --config configs/stage2_codebook_7b.yaml   # codebook cells, Qwen2.5-7B-Instruct
+python scripts/run_parallel.py --config configs/stage2b_sweep_7b.yaml --shards 3  # bits-matched d sweep + GGUF references
 python -m pytest tests -q
 ```
 
@@ -64,3 +67,14 @@ config skips runs already present in `results.csv`.
   repeated on 7B (`configs/stage1_baselines_7b.yaml`) so every comparison is
   within one model. The 1.5B Stage 1 results are kept for reference. On 7B
   the embedding and lm_head are untied and both count at 16 bits.
+- **GGUF reference points.** `method: gguf` takes only the 196 block linears
+  from a published llama.cpp GGUF (bartowski's imatrix quants of
+  Qwen2.5-7B-Instruct), dequantized with gguf-py; embedding, lm_head, norms
+  and biases stay 16-bit like every other method. Bits per weight are the
+  GGUF tensors' real storage over the block linears, so mixed-precision files
+  report their true average. A per-matrix relative-error guard (> 0.5 aborts)
+  catches any tensor-mapping mistake.
+- **Revised plan after Stage 2 (2026-11-02).** Next steps, in order:
+  GGUF references and a bits-matched d sweep (Stage 2b); activation-weighted
+  k-means; then shuffle and masks (spec Stages 3-4) under the weighted
+  objective; then codebook fine-tuning (Stage 5) on the best configuration.

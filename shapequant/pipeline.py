@@ -8,6 +8,7 @@ import time
 import torch
 
 from . import codebook as cb
+from . import gguf_ref
 from . import memory
 from .rtn import rtn_quantize, ternary_quantize
 
@@ -46,10 +47,17 @@ def unique_param_count(model) -> int:
     return total
 
 
-def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str):
+def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str, source=None):
     """Returns (decoded float32 matrix, rounded bits, ideal bits, extra stats)."""
     R, C = w.shape
     method = run["method"]
+    if method == "gguf":
+        out, bits, qtype = source.matrix(name, (R, C))
+        out = out.to(w.device)
+        rel = float(((out - w) ** 2).sum() / (w ** 2).sum())
+        if rel > gguf_ref.MAX_REL_MSE:
+            raise RuntimeError(f"{name}: GGUF rel MSE {rel:.3f} > {gguf_ref.MAX_REL_MSE}; tensor mapping is wrong")
+        return out, bits, bits, {"ggml_type": qtype}
     if method == "rtn":
         out = rtn_quantize(w, run["bits"], run.get("group", 32))
         rb, ib = memory.rtn_bits(R, C, run["bits"], run.get("group", 32))
@@ -93,10 +101,14 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
     rbits = ibits = 0.0
     se = sq = 0.0
     usage = []
+    qtypes: dict[str, int] = {}
+    source = gguf_ref.GGUFSource(gguf_ref.resolve(run)) if run["method"] == "gguf" else None
     with torch.no_grad():
         for i, (name, mod) in enumerate(linears):
             w = originals[name].to(mod.weight.device, torch.float32)
-            out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name)
+            out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source)
+            if "ggml_type" in stats:
+                qtypes[stats["ggml_type"]] = qtypes.get(stats["ggml_type"], 0) + w.numel()
             rbits += rb
             ibits += ib
             se += float(((out - w) ** 2).sum(dtype=torch.float64))
@@ -104,7 +116,7 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
             if "codebook_usage" in stats:
                 usage.append(stats["codebook_usage"])
             mod.weight.copy_(out.to(mod.weight.dtype))
-            if run["method"] == "codebook" and (i + 1) % 14 == 0:
+            if run["method"] in ("codebook", "gguf") and (i + 1) % 14 == 0:
                 log(f"  compressed {i + 1}/{len(linears)} matrices ({time.time() - t0:.0f}s)")
     if model.device.type == "cuda":
         torch.cuda.synchronize()
@@ -117,4 +129,5 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
         "recon_rel_mse": se / sq,
         "codebook_usage": (sum(usage) / len(usage)) if usage else None,
         "compress_seconds": time.time() - t0,
+        **({"ggml_type_fractions": {k: v / n_compressed for k, v in sorted(qtypes.items())}} if qtypes else {}),
     }
