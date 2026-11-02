@@ -116,6 +116,11 @@ DESTROY_RETRY_DELAY_SECONDS = 5
 DESTROY_VERIFY_MAX_ATTEMPTS = 3
 DESTROY_VERIFY_RETRY_DELAY_SECONDS = 5
 DESTROY_FOLLOWUP_ABSENT_SCANS = 2
+# Don't start a follow-up provider query with less than this much lease left:
+# a query bounded to a few seconds times out, records a spurious error, and the
+# lease then expires 'unverified' despite many clean absence scans (runs
+# s01_qwen_seed0_20261101a and ...c, 2026-11-02).
+DESTROY_FOLLOWUP_MIN_QUERY_SECONDS = 30
 DESTROY_RECONCILIATION_MIN_SECONDS = 60
 DESTROY_RECONCILIATION_POLL_SECONDS = 10
 # An uncertain create gets one provider query after its primary lease.  This
@@ -6477,7 +6482,7 @@ def _destroy_reconciliation(run_id: str) -> int:
         absent_scans = 0
         last_error: str | None = None
         last_absence_generation: int | None = None
-        while deadline - time.monotonic() >= 1:
+        while deadline - time.monotonic() >= DESTROY_FOLLOWUP_MIN_QUERY_SECONDS:
             try:
                 observation_generation = _cleanup_generation(run_id)
             except Exception as state_error:
