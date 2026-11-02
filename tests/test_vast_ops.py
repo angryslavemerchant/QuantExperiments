@@ -8670,3 +8670,34 @@ def test_purchase_reconciliation_binds_real_shaped_row_by_create_response_id() -
     assert not vast_ops._is_reconcilable_purchase_instance(
         _purchase_record(), {**row, "id": 4321}
     )
+
+
+def _offer(i: int, dph: float, reliability: float | None = None, **extra: object) -> dict[str, object]:
+    o: dict[str, object] = {
+        "id": i, "machine_id": 100 + i, "dph_total": dph,
+        "cpu_cores_effective": 8, "cpu_ram": 32 * 1024, "cpu_name": "AMD Ryzen 7 7700X",
+    }
+    if reliability is not None:
+        o["reliability2"] = reliability
+    o.update(extra)
+    return o
+
+
+def test_pick_offer_prefers_reliable_host_slightly_above_floor() -> None:
+    offers = [
+        _offer(1, 0.30, 0.90),   # floor price, flaky host
+        _offer(2, 0.33, 0.995),  # +10%, reliable -> chosen
+        _offer(3, 0.35, 0.99),   # +16.7%, a bit less reliable
+        _offer(4, 0.40, 0.999),  # +33%, outside the 20% band
+    ]
+    assert pick_offer(offers)["id"] == 2
+
+
+def test_pick_offer_band_zero_is_cheapest_first() -> None:
+    offers = [_offer(1, 0.30, 0.90), _offer(2, 0.33, 0.995)]
+    assert pick_offer(offers, price_band=0.0)["id"] == 1
+
+
+def test_pick_offer_price_breaks_reliability_ties_and_missing_reliability_ranks_last() -> None:
+    offers = [_offer(1, 0.31, 0.99), _offer(2, 0.30, 0.99), _offer(3, 0.30)]
+    assert pick_offer(offers)["id"] == 2

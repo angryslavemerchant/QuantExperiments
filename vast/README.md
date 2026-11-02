@@ -64,6 +64,10 @@ last-resort watchdog using only Vast's provider-injected per-container
   are preserved for future protocol work, but neither CLI path may control a
   paid campaign.
 - The default is one instance.
+- Offer selection avoids the cheapest-host lemons: among eligible offers it
+  considers those within `OFFER_PRICE_BAND` (20%) of the cheapest price and
+  picks the highest `reliability2`; price only breaks ties. `max_dph` and
+  `max_total_usd` still bound spend.
 - The local monitor reserves time and budget for recovery and termination.
 - At a hard TTL or spend boundary, a running job is first asked to package its
   latest atomic checkpoint and declared artifacts before the best-effort pull

@@ -88,6 +88,9 @@ DEFAULT_SSH_READY_TIMEOUT_SECONDS = 180
 # failed with sshd still refusing connections at 180 s). Still bounded by the
 # run's cleanup deadline.
 LAUNCH_SSH_READY_TIMEOUT_SECONDS = 600
+# Offer selection considers offers up to this fraction above the cheapest
+# eligible price and picks the most reliable among them (see pick_offer).
+OFFER_PRICE_BAND = 0.20
 _MAX_PROVIDER_JSON_BYTES = 4 * 1024 * 1024
 _MAX_PROVIDER_JSON_DEPTH = 24
 # Provider market snapshots legitimately contain many scalar fields. Bound
@@ -2136,8 +2139,13 @@ def search_offers(
 
 
 def pick_offer(
-    offers: list[dict[str, Any]], *, prefer_consumer_cpu: bool = True
+    offers: list[dict[str, Any]],
+    *,
+    prefer_consumer_cpu: bool = True,
+    price_band: float | None = None,
 ) -> dict[str, Any]:
+    if price_band is None:
+        price_band = OFFER_PRICE_BAND
     if not offers:
         raise OpsError("no offers satisfy the manifest limits")
     valid_offers = []
@@ -2150,28 +2158,38 @@ def pick_offer(
     if not valid_offers:
         raise OpsError("eligible offers did not report a finite hourly price")
 
-    def sort_key(offer: dict[str, Any]) -> tuple[float, int, float, float, float, int, int]:
-        try:
-            price = _finite_offer_number(offer, "dph_total")
-        except OpsError:
-            price = float("inf")
+    # Avoid lemons: the very cheapest offers are disproportionately unreliable
+    # hosts. Consider every offer within OFFER_PRICE_BAND of the cheapest eligible
+    # price and take the most reliable one; price only breaks ties. max_dph and
+    # max_total_usd still bound spend because offers were already filtered.
+    floor = min(_finite_offer_number(offer, "dph_total") for offer in valid_offers)
+    ceiling = floor * (1.0 + max(0.0, float(price_band)))
+    banded = [
+        offer for offer in valid_offers
+        if _finite_offer_number(offer, "dph_total") <= ceiling
+    ]
+
+    def sort_key(offer: dict[str, Any]) -> tuple[float, int, float, float, float, float, int, int]:
+        price = _finite_offer_number(offer, "dph_total")
         consumer_rank = (
             0 if not _is_server_cpu(offer) else 1
         ) if prefer_consumer_cpu else 0
         cores = _optional_finite_offer_number(offer, "cpu_cores_effective")
         ram = _optional_finite_offer_number(offer, "cpu_ram")
         reliability = _optional_finite_offer_number(offer, "reliability2")
+        inet_down = _optional_finite_offer_number(offer, "inet_down")
         return (
-            price,
+            -reliability,
             consumer_rank,
+            price,
+            -inet_down,
             -cores,
             -ram,
-            -reliability,
             _offer_identity_number(offer, "machine_id"),
             _offer_identity_number(offer, "id"),
         )
 
-    return min(valid_offers, key=sort_key)
+    return min(banded, key=sort_key)
 
 
 def validate_offer_for_purchase(
