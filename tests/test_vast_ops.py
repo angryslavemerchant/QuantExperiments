@@ -8701,3 +8701,16 @@ def test_pick_offer_band_zero_is_cheapest_first() -> None:
 def test_pick_offer_price_breaks_reliability_ties_and_missing_reliability_ranks_last() -> None:
     offers = [_offer(1, 0.31, 0.99), _offer(2, 0.30, 0.99), _offer(3, 0.30)]
     assert pick_offer(offers)["id"] == 2
+
+
+def test_pick_offer_enforces_per_gpu_price_caps() -> None:
+    offers = [
+        _offer(1, 0.45, 0.95, gpu_name="RTX 4090"),
+        _offer(2, 0.52, 0.999, gpu_name="RTX 4090"),  # over the $0.50 4090 cap
+    ]
+    assert pick_offer(offers)["id"] == 1
+    with pytest.raises(OpsError, match="per-GPU hourly price cap"):
+        pick_offer([_offer(3, 0.75, 0.99, gpu_name="RTX 5090")])  # over $0.70
+    assert pick_offer([_offer(4, 0.69, 0.99, gpu_name="RTX 5090")])["id"] == 4
+    # GPUs without a configured cap are only bounded by the manifest
+    assert pick_offer([_offer(5, 1.20, 0.99, gpu_name="H100 SXM")])["id"] == 5

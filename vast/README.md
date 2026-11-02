@@ -68,6 +68,8 @@ last-resort watchdog using only Vast's provider-injected per-container
   considers those within `OFFER_PRICE_BAND` (20%) of the cheapest price and
   picks the highest `reliability2`; price only breaks ties. `max_dph` and
   `max_total_usd` still bound spend.
+- Per-GPU hourly caps apply before the band (`OFFER_MAX_DPH_BY_GPU`):
+  RTX 4090 at most $0.50/h, RTX 5090 at most $0.70/h.
 - The local monitor reserves time and budget for recovery and termination.
 - At a hard TTL or spend boundary, a running job is first asked to package its
   latest atomic checkpoint and declared artifacts before the best-effort pull

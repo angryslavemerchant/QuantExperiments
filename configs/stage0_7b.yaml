@@ -1,0 +1,37 @@
+# Stage 0 sanity checks repeated on a larger model.
+# Qwen2.5-0.5B passed every check except Q4 near-lossless (mean KL 0.126,
+# ppl +12.8%), which looked like small-model fragility rather than a broken
+# quantizer. The user approved a larger sanity model (up to 8B) on 2026-11-02.
+stage: 0
+model: Qwen/Qwen2.5-7B
+reference_dtype: bfloat16
+seed: 0
+output_dir: artifacts/qwen_s01/stage0_7b
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: false
+
+kmeans:
+  iters: 25
+  max_fit_chunks: 1000000
+  assign_batch: 65536
+
+runs:
+  - {name: original, method: original}
+  - {name: q4_rtn, method: rtn, bits: 4, group: 32}
+
+stage0_checks:
+  q4_run: q4_rtn
+  q4_max_mean_kl: 0.1
+  q4_max_ppl_ratio: 1.10
+  decode_matrix: model.layers.0.mlp.down_proj
+  d: 8
+  K: 4096

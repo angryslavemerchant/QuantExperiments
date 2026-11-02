@@ -50,6 +50,10 @@ config skips runs already present in `results.csv`.
   bf16 weights; `q4` means to the Q4 RTN dequantized weights (codebook only).
 - **Memory.** MB = 10^6 bytes. Embedding/lm_head (tied in Qwen2.5-0.5B/1.5B,
   counted once), norms and biases count at 16 bits.
+- **Stage 0 on 0.5B.** Qwen2.5-0.5B passed every sanity check except Q4
+  near-lossless (mean KL 0.126, perplexity +12.8%); its Q4 weight error
+  (0.8% relative) is normal for 4-bit, so this reads as small-model
+  fragility. Stage 0 is repeated on Qwen2.5-7B (`configs/stage0_7b.yaml`).
 - **Spec deviation.** The d = 8, K = 65,536 Stage 2 cell is deliberately
   dropped: its per-matrix codebook alone adds ~1.25 bits/weight, and the K/V
   projections have fewer chunks than codewords.

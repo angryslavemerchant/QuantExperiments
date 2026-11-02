@@ -91,6 +91,9 @@ LAUNCH_SSH_READY_TIMEOUT_SECONDS = 600
 # Offer selection considers offers up to this fraction above the cheapest
 # eligible price and picks the most reliable among them (see pick_offer).
 OFFER_PRICE_BAND = 0.20
+# Hard per-GPU hourly ceilings applied before the band (user preference,
+# 2026-11-02). Keys are normalized GPU names (lowercase alphanumerics).
+OFFER_MAX_DPH_BY_GPU = {"rtx4090": 0.50, "rtx5090": 0.70}
 _MAX_PROVIDER_JSON_BYTES = 4 * 1024 * 1024
 _MAX_PROVIDER_JSON_DEPTH = 24
 # Provider market snapshots legitimately contain many scalar fields. Bound
@@ -2157,6 +2160,15 @@ def pick_offer(
         valid_offers.append(offer)
     if not valid_offers:
         raise OpsError("eligible offers did not report a finite hourly price")
+    valid_offers = [
+        offer for offer in valid_offers
+        if _finite_offer_number(offer, "dph_total")
+        <= OFFER_MAX_DPH_BY_GPU.get(
+            _normalized_hardware_name(offer.get("gpu_name", "")), float("inf")
+        )
+    ]
+    if not valid_offers:
+        raise OpsError("no eligible offers under the per-GPU hourly price cap")
 
     # Avoid lemons: the very cheapest offers are disproportionately unreliable
     # hosts. Consider every offer within OFFER_PRICE_BAND of the cheapest eligible
