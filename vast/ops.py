@@ -83,6 +83,11 @@ MACHINE_BLACKLIST_FILE = VAST_DIR / "blacklist.json"
 DEFAULT_MIN_CPU_CORES = 4
 DEFAULT_MIN_CPU_RAM_GB = 16
 DEFAULT_SSH_READY_TIMEOUT_SECONDS = 180
+# Ordinary launches wait longer: the vastai/pytorch image pull plus container
+# boot routinely exceeds 3 minutes (run s01_qwen_seed0_20261101b, 2026-11-02,
+# failed with sshd still refusing connections at 180 s). Still bounded by the
+# run's cleanup deadline.
+LAUNCH_SSH_READY_TIMEOUT_SECONDS = 600
 _MAX_PROVIDER_JSON_BYTES = 4 * 1024 * 1024
 _MAX_PROVIDER_JSON_DEPTH = 24
 # Provider market snapshots legitimately contain many scalar fields. Bound
@@ -8279,6 +8284,7 @@ def command_launch(args: argparse.Namespace) -> int:
         )
         connection = wait_for_ssh(
             instance_id,
+            timeout_seconds=LAUNCH_SSH_READY_TIMEOUT_SECONDS,
             require_watchdog_armed=True,
             expected_watchdog_deadline_epoch=parse_utc(
                 str(record["remote_watchdog_deadline_at"])
