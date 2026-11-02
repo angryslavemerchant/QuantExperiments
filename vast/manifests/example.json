@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "run_id": "v0_example_seed0",
+  "description": "Template only: replace every REPLACE_ value; do not launch unchanged.",
+  "source_commit": "REPLACE_WITH_GIT_HEAD",
+  "command": [
+    "python",
+    "scripts/REPLACE_WITH_ENTRYPOINT.py",
+    "--device",
+    "cuda",
+    "--seed",
+    "0",
+    "--output",
+    "artifacts/v0_example_seed0/report.json"
+  ],
+  "artifact_paths": [
+    "artifacts/v0_example_seed0"
+  ],
+  "max_artifact_archive_bytes": 67108864,
+  "max_artifact_unpacked_bytes": 268435456,
+  "gpu_name": "RTX_5090",
+  "num_gpus": 1,
+  "require_cuda": true,
+  "min_cpu_cores_effective": 4,
+  "min_cpu_ram_gb": 16,
+  "min_inet_down_mbps": 100,
+  "prefer_consumer_cpu": true,
+  "require_consumer_cpu": false,
+  "required_geolocation": null,
+  "avoid_machine_ids": [],
+  "max_dph": 0.5,
+  "max_total_usd": 3.0,
+  "ttl_hours": 5.0,
+  "failure_grace_minutes": 20,
+  "stall_minutes": 45,
+  "disk_gb": 30,
+  "poll_seconds": 60,
+  "seed_policy": "REPLACE: exact seeds used by the job",
+  "checkpoint_cadence": "REPLACE: how often the job writes checkpoints/metrics under artifacts/",
+  "data_policy": "REPLACE: where the job downloads data from at runtime and roughly how much",
+  "input_artifacts": {},
+  "success_policy": "destroy_after_verify"
+}

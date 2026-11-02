@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+artifacts/*
+!artifacts/.gitkeep
+
+# Vast.ai ops (local state + credentials never committed)
+.vast/
+vast/secrets.env
+vast/blacklist.json
+vast/manifests/*.json
+!vast/manifests/example.json
