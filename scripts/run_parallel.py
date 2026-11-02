@@ -91,6 +91,14 @@ def main() -> int:
     if not Path(cfg["model"]).is_dir():
         log(f"prefetching {cfg['model']}")
         snapshot_download(cfg["model"], allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"])
+    # GGUF files too: a shard crashed (malloc corruption) while downloading one
+    # concurrently with other shards' work in stage 2b, so nothing downloads mid-run.
+    from huggingface_hub import hf_hub_download
+
+    for run in cfg["runs"]:
+        if run["method"] == "gguf" and not run.get("path"):
+            log(f"prefetching {run['repo']}/{run['file']}")
+            hf_hub_download(run["repo"], run["file"])
 
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     procs = []

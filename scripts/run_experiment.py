@@ -35,7 +35,7 @@ from shapequant.pipeline import apply_run, compressible_linears, snapshot_origin
 from shapequant.plots import make_plots  # noqa: E402
 
 COLUMNS = [
-    "stage", "run_name", "method", "source", "model", "d", "K", "shuffle", "masks", "M", "finetune", "start",
+    "stage", "run_name", "method", "source", "model", "d", "K", "shuffle", "masks", "M", "finetune", "weighting", "start",
     "seed", "bits_per_weight_rounded", "bits_per_weight_ideal", "total_mb", "pct_of_original",
     "mean_kl", "p99_kl", "top1_agree", "perplexity", "gsm8k_acc", "codebook_usage",
     "recon_mse", "recon_rel_mse", "compress_seconds", "eval_tokens",
@@ -173,6 +173,14 @@ def main() -> int:
     gcfg = ecfg.get("gsm8k", {})
     problems = load_gsm8k(gcfg) if gcfg.get("enabled") else None
 
+    importance = None
+    if any(run.get("weighting", "none") in ("act", "act_row") for run in cfg["runs"]):
+        from shapequant.calibrate import column_importance, load_calibration_sequences
+        ccfg = cfg["calibration"]
+        seqs = load_calibration_sequences(tok, ccfg, seed)
+        log(f"calibration: {seqs.shape[0]} x {seqs.shape[1]} tokens from {ccfg['dataset']}")
+        importance = column_importance(model, seqs, ccfg.get("batch_size", 4))
+
     finished = done_runs(csv_path)
     rows: dict[str, dict] = {}
     for run in cfg["runs"]:
@@ -183,7 +191,7 @@ def main() -> int:
             continue
         log(f"=== run {name}: {run}")
         seed_everything(seed)
-        stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log)
+        stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance)
         log(f"  compressed in {stats['compress_seconds']:.1f}s; "
             f"{stats['bits_per_weight_rounded']:.3f} bpw; scoring wikitext")
         metrics = scorer.score(model)
@@ -198,6 +206,7 @@ def main() -> int:
             "model": cfg["model"], "d": run.get("d"), "K": run.get("K"),
             "shuffle": run.get("shuffle", False), "masks": run.get("masks", False), "M": run.get("M"),
             "finetune": run.get("finetune", False),
+            "weighting": run.get("weighting", "none") if run["method"] == "codebook" else None,
             "start": run.get("start", "q4") if run["method"] == "codebook" else "fp16",
             "source": (run.get("path") or f"{run['repo']}/{run['file']}") if run["method"] == "gguf" else None,
             "seed": seed, **stats, **metrics,

@@ -29,6 +29,7 @@ python scripts/run_experiment.py --config configs/stage1_baselines.yaml  # basel
 python scripts/run_experiment.py --config configs/stage1_baselines_7b.yaml  # baselines, Qwen2.5-7B-Instruct
 python scripts/run_experiment.py --config configs/stage2_codebook_7b.yaml   # codebook cells, Qwen2.5-7B-Instruct
 python scripts/run_parallel.py --config configs/stage2b_sweep_7b.yaml --shards 3  # bits-matched d sweep + GGUF references
+python scripts/run_parallel.py --config configs/stage2c_weighted_7b.yaml --shards 4  # importance-weighted k-means
 python -m pytest tests -q
 ```
 
@@ -78,3 +79,10 @@ config skips runs already present in `results.csv`.
   GGUF references and a bits-matched d sweep (Stage 2b); activation-weighted
   k-means; then shuffle and masks (spec Stages 3-4) under the weighted
   objective; then codebook fine-tuning (Stage 5) on the best configuration.
+- **Importance weighting (Stage 2c).** `weighting: act_row` fits k-means
+  on per-element weighted squared error with weight s_r² · h_c, where s_r is
+  the row scale and h_c = E[x_c²] is the input second moment per column
+  (`shapequant/calibrate.py`). That is the diagonal approximation of each
+  layer's output error, the same statistic as llama.cpp's imatrix. h comes from
+  128 × 2,048 tokens of FineWeb-Edu, never the WikiText-2 evaluation text.
+  Ablations: `row` (s_r² only, plain weight MSE) and `act` (h_c only).

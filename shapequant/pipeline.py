@@ -47,7 +47,11 @@ def unique_param_count(model) -> int:
     return total
 
 
-def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str, source=None):
+WEIGHTINGS = {"none": (False, False), "act": (True, False), "row": (False, True), "act_row": (True, True)}
+
+
+def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str, source=None,
+                    importance: dict | None = None):
     """Returns (decoded float32 matrix, rounded bits, ideal bits, extra stats)."""
     R, C = w.shape
     method = run["method"]
@@ -68,10 +72,14 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
         return out, rb, ib, {}
     if method == "codebook":
         src = w if run.get("start", "q4") == "fp16" else rtn_quantize(w, 4, 32)
+        use_act, use_row = WEIGHTINGS[run.get("weighting", "none")]
+        if use_act and (importance is None or name not in importance):
+            raise RuntimeError(f"{name}: weighting needs calibration statistics")
         cm, stats = cb.compress(
             src, run["d"], run["K"],
             iters=kcfg["iters"], max_fit_chunks=kcfg["max_fit_chunks"],
             seed=cb.layer_seed(seed, name), batch=kcfg["assign_batch"],
+            col_weight=importance[name] if use_act else None, row_weighted=use_row,
         )
         out = cb.decode(cm)
         rb, ib = memory.codebook_bits(R, C, run["d"], run["K"])
@@ -80,7 +88,7 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
 
 
 def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, seed: int,
-              log=print) -> dict:
+              log=print, importance: dict | None = None) -> dict:
     """Restore originals, then compress every block linear per `run`. Returns stats."""
     restore_originals(model, originals)
     linears = compressible_linears(model)
@@ -106,7 +114,7 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
     with torch.no_grad():
         for i, (name, mod) in enumerate(linears):
             w = originals[name].to(mod.weight.device, torch.float32)
-            out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source)
+            out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source, importance)
             if "ggml_type" in stats:
                 qtypes[stats["ggml_type"]] = qtypes.get(stats["ggml_type"], 0) + w.numel()
             rbits += rb
