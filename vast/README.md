@@ -244,3 +244,12 @@ package artifacts before recovery begins.
 - **Maintainability.** `ops.py` is one ~10.6k-line file; the disabled
   race/adopt code (~1.5k lines) is still reachable from `reconcile` for old
   records.
+
+## Host checks at bootstrap
+
+Before installing anything, `remote_bootstrap.sh` runs `vast/net_probe.py`: a
+30-second ranged download of a Qwen2.5-7B shard from the Hugging Face Hub.
+Below 25 MB/s (`QE_NET_PROBE_MIN_MB_PER_S`) bootstrap fails, and the launcher
+records a provisioning failure and destroys the box. Dependency install is
+capped at 360 s (`QE_SETUP_TIMEOUT_SECONDS`), and the whole bootstrap at
+`BOOTSTRAP_TIMEOUT_SECONDS` = 600 s (was 1,200 s).

@@ -34,13 +34,23 @@ fi
 # in requirements-remote.txt (installed with deps). A pyproject/setup.py, if
 # present, is installed editable without deps so it cannot replace torch.
 # Without either, the runner puts the repo on PYTHONPATH.
+#
+# Host checks first, so a slow host fails in about a minute rather than after a
+# 20-minute bootstrap timeout: a real download-speed probe, then a hard time
+# limit on dependency setup.
+if [[ -f "${REPO_PATH}/vast/net_probe.py" ]]; then
+    "${PYTHON_BIN}" "${REPO_PATH}/vast/net_probe.py" \
+        --min-mb-per-s "${QE_NET_PROBE_MIN_MB_PER_S:-25}" \
+        >> "${BOOTSTRAP_LOG}" 2>&1
+fi
+SETUP_TIMEOUT="${QE_SETUP_TIMEOUT_SECONDS:-360}"
 if [[ -f "${REPO_PATH}/requirements-remote.txt" ]]; then
-    "${PYTHON_BIN}" -m pip install --disable-pip-version-check \
+    timeout "${SETUP_TIMEOUT}" "${PYTHON_BIN}" -m pip install --disable-pip-version-check \
         -r "${REPO_PATH}/requirements-remote.txt" >> "${BOOTSTRAP_LOG}" 2>&1
 fi
 if [[ -f "${REPO_PATH}/pyproject.toml" || -f "${REPO_PATH}/setup.py" ]]; then
-    "${PYTHON_BIN}" -m pip install --disable-pip-version-check --no-deps -e "${REPO_PATH}" \
-        >> "${BOOTSTRAP_LOG}" 2>&1
+    timeout "${SETUP_TIMEOUT}" "${PYTHON_BIN}" -m pip install --disable-pip-version-check \
+        --no-deps -e "${REPO_PATH}" >> "${BOOTSTRAP_LOG}" 2>&1
 fi
 
 nohup "${PYTHON_BIN}" "${REPO_PATH}/vast/remote_runner.py" \

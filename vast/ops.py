@@ -88,6 +88,9 @@ DEFAULT_SSH_READY_TIMEOUT_SECONDS = 180
 # failed with sshd still refusing connections at 180 s). Still bounded by the
 # run's cleanup deadline.
 LAUNCH_SSH_READY_TIMEOUT_SECONDS = 600
+# Remote bootstrap (net probe + dependency install, then the runner starts in
+# the background). Setup should take minutes; a slow host fails fast instead.
+BOOTSTRAP_TIMEOUT_SECONDS = 600
 # Offer selection considers offers up to this fraction above the cheapest
 # eligible price and picks the most reliable among them (see pick_offer).
 OFFER_PRICE_BAND = 0.20
@@ -3660,7 +3663,9 @@ def start_remote_run(
     remote_exec(
         connection,
         command,
-        timeout=_deadline_timeout_seconds(deadline_monotonic, default=1200),
+        timeout=_deadline_timeout_seconds(
+            deadline_monotonic, default=BOOTSTRAP_TIMEOUT_SECONDS
+        ),
     )
 
 
