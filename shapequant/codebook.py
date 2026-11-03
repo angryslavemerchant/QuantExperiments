@@ -78,6 +78,7 @@ def kmeans(
     generator: torch.Generator,
     batch: int = 65536,
     wt: torch.Tensor | None = None,
+    init: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """k-means++ init then Lloyd iterations. Empty clusters are re-seeded from the
     chunks with the largest current error. Centroid sums accumulate in float64 so
@@ -90,6 +91,9 @@ def kmeans(
     if n < K:
         raise ValueError(f"k-means needs at least K={K} chunks, got {n}")
     dev = x.device
+    if init is not None:  # warm start (used by the mask fitting loop): skip k-means++
+        centers = init.to(dev, torch.float32).clone()
+        return _lloyd(x, centers, iters, batch, wt)
     centers = torch.empty(K, d, dtype=torch.float32, device=dev)
     first = torch.randint(n, (1,), generator=generator, device="cpu").item()
     centers[0] = x[first]
@@ -113,6 +117,13 @@ def kmeans(
         centers[k] = x[pick].reshape(d)
         dmin = torch.minimum(dmin, _d2(centers[k]))
 
+    return _lloyd(x, centers, iters, batch, wt)
+
+
+def _lloyd(x: torch.Tensor, centers: torch.Tensor, iters: int, batch: int,
+           wt: torch.Tensor | None) -> torch.Tensor:
+    K, d = centers.shape
+    dev = x.device
     for _ in range(iters):
         idx, err = assign(x, centers, batch, wt)
         sums = torch.zeros(K, d, dtype=torch.float64, device=dev)

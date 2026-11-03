@@ -174,7 +174,9 @@ def main() -> int:
     problems = load_gsm8k(gcfg) if gcfg.get("enabled") else None
 
     importance = None
-    if any(run.get("weighting", "none") in ("act", "act_row") for run in cfg["runs"]):
+    seqs = None
+    if any(run.get("weighting", "none") in ("act", "act_row") or run["method"] == "masked"
+           for run in cfg["runs"]):
         from shapequant.calibrate import column_importance, load_calibration_sequences
         ccfg = cfg["calibration"]
         seqs = load_calibration_sequences(tok, ccfg, seed)
@@ -192,29 +194,48 @@ def main() -> int:
         log(f"=== run {name}: {run}")
         seed_everything(seed)
         stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance)
+        fits = stats.pop("_fits", None)
         log(f"  compressed in {stats['compress_seconds']:.1f}s; "
             f"{stats['bits_per_weight_rounded']:.3f} bpw; scoring wikitext")
-        metrics = scorer.score(model)
-        log(f"  mean KL {metrics['mean_kl']:.5f}  p99 {metrics['p99_kl']:.4f}  "
-            f"top1 {metrics['top1_agree']:.2f}%  ppl {metrics['perplexity']:.3f}")
-        if problems is not None:
-            g = run_gsm8k(model, tok, problems, gcfg, out_dir / "gsm8k" / f"{name}.jsonl")
-            log(f"  GSM8K {g['gsm8k_acc']:.1f}% ({g['gsm8k_seconds']:.0f}s)")
-            metrics.update(g)
-        row = {
-            "stage": run.get("stage", cfg.get("stage")), "run_name": name, "method": run["method"],
-            "model": cfg["model"], "d": run.get("d"), "K": run.get("K"),
-            "shuffle": run.get("shuffle", False), "masks": run.get("masks", False), "M": run.get("M"),
-            "finetune": run.get("finetune", False),
-            "weighting": run.get("weighting", "none") if run["method"] == "codebook" else None,
-            "start": run.get("start", "q4") if run["method"] == "codebook" else "fp16",
-            "source": (run.get("path") or f"{run['repo']}/{run['file']}") if run["method"] == "gguf" else None,
-            "seed": seed, **stats, **metrics,
-        }
-        rows[name] = row
-        (out_dir / "runs" / f"{name}.json").write_text(json.dumps(row, indent=2))
-        append_row(csv_path, row)
-        make_plots(csv_path, out_dir)
+
+        def evaluate(row_name: str, ft: bool, extra: dict) -> dict:
+            metrics = scorer.score(model)
+            log(f"  [{row_name}] mean KL {metrics['mean_kl']:.5f}  p99 {metrics['p99_kl']:.4f}  "
+                f"top1 {metrics['top1_agree']:.2f}%  ppl {metrics['perplexity']:.3f}")
+            if problems is not None:
+                g = run_gsm8k(model, tok, problems, gcfg, out_dir / "gsm8k" / f"{row_name}.jsonl")
+                log(f"  [{row_name}] GSM8K {g['gsm8k_acc']:.1f}% ({g['gsm8k_seconds']:.0f}s)")
+                metrics.update(g)
+            row = {
+                "stage": run.get("stage", cfg.get("stage")), "run_name": row_name, "method": run["method"],
+                "model": cfg["model"], "d": run.get("d"), "K": run.get("K"),
+                "shuffle": run.get("shuffle", False), "masks": run.get("M", 1) > 1 if run["method"] == "masked" else run.get("masks", False),
+                "M": run.get("M"),
+                "finetune": ft,
+                "weighting": ("act_row" if run["method"] == "masked" else run.get("weighting", "none"))
+                if run["method"] in ("codebook", "masked") else None,
+                "start": run.get("start", "q4") if run["method"] == "codebook" else "fp16",
+                "source": (run.get("path") or f"{run['repo']}/{run['file']}") if run["method"] == "gguf" else None,
+                "seed": seed, **stats, **extra, **metrics,
+            }
+            rows[row_name] = row
+            (out_dir / "runs" / f"{row_name}.json").write_text(json.dumps(row, indent=2, default=str))
+            append_row(csv_path, row)
+            make_plots(csv_path, out_dir)
+            return row
+
+        evaluate(name, False, {})
+        if run.get("finetune"):
+            from transformers import AutoModelForCausalLM as _AM
+            from shapequant.finetune import finetune
+            log(f"  fine-tuning codebooks + row scales: {run['finetune']}")
+            teacher = _AM.from_pretrained(cfg["model"], dtype=dtype).to(args.device).eval()
+            d_by_name = {n: run["d"] for n in fits}
+            ft_stats = finetune(model, teacher, fits, d_by_name, seqs, run["finetune"], log=log)
+            del teacher, fits
+            torch.cuda.empty_cache()
+            log(f"  fine-tune KL {ft_stats['ft_kl_first']:.4f} -> {ft_stats['ft_kl_last']:.4f}")
+            evaluate(f"{name}_ft", True, ft_stats)
 
     if cfg.get("stage0_checks"):
         from shapequant.pipeline import restore_originals

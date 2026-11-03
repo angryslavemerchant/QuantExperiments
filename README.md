@@ -30,6 +30,7 @@ python scripts/run_experiment.py --config configs/stage1_baselines_7b.yaml  # ba
 python scripts/run_experiment.py --config configs/stage2_codebook_7b.yaml   # codebook cells, Qwen2.5-7B-Instruct
 python scripts/run_parallel.py --config configs/stage2b_sweep_7b.yaml --shards 3  # bits-matched d sweep + GGUF references
 python scripts/run_parallel.py --config configs/stage2c_weighted_7b.yaml --shards 2  # importance-weighted k-means
+python scripts/run_experiment.py --config configs/stage3_full_7b.yaml   # weighted + masks + fine-tune
 python -m pytest tests -q
 ```
 
@@ -86,3 +87,16 @@ config skips runs already present in `results.csv`.
   layer's output error, the same statistic as llama.cpp's imatrix. h comes from
   128 × 2,048 tokens of FineWeb-Edu, never the WikiText-2 evaluation text.
   Ablations: `row` (s_r² only, plain weight MSE) and `act` (h_c only).
+- **Masks and fine-tuning (Stage 3, `method: masked`).** Each matrix gets
+  M = 16 column orders: the identity plus 15 seeded random permutations,
+  regenerated from a 32-bit seed, so they cost no storage. Each row picks the
+  order with the least importance-weighted snap error, measured on a fixed 10% (pre-screen: 25%)
+  of its chunk positions, over 2 rounds of codebook refits (pre-screen: 5). Tag cost is
+  log2 M bits per row. The 0.5B pre-screen (`scripts/prescreen_masks.py`,
+  `shapequant/masks.py`) gave about 8% lower weighted error. Magnitude-sorted
+  orders, local block scales and plain residual codebooks all lost and are not
+  used. The fine-tune (`shapequant/finetune.py`) freezes tags and masks and trains
+  only the codebooks and per-row gains for KL against the original on the
+  calibration text. Masks are applied to the input activations, as inference
+  would. Everything is rounded back to fp16 before evaluation. The codebook
+  gradient uses atomic adds, so fine-tune results are not bit-reproducible.

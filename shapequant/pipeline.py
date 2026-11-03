@@ -9,6 +9,7 @@ import torch
 
 from . import codebook as cb
 from . import gguf_ref
+from . import masks as mk
 from . import memory
 from .rtn import rtn_quantize, ternary_quantize
 
@@ -70,6 +71,25 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
         out = ternary_quantize(w, run.get("group", 32))
         rb, ib = memory.ternary_bits(R, C, run.get("group", 32))
         return out, rb, ib, {}
+    if method == "masked":
+        # Stage 3/4 recipe: importance-weighted (s_r^2 h_c) codebook with M
+        # seeded random column orders per matrix; fitted from the 16-bit weights.
+        if importance is None or name not in importance:
+            raise RuntimeError(f"{name}: masked method needs calibration statistics")
+        M = run.get("M", 16)
+        fit = mk.compress_masked(
+            w, importance[name].to(w.device, torch.float32), run["d"], run["K"],
+            M=M, init="identity+random" if M > 1 else "identity",
+            rounds=run.get("rounds", 3), select_frac=run.get("select_frac", 0.25),
+            iters=kcfg["iters"], max_fit_chunks=kcfg["max_fit_chunks"],
+            seed=cb.layer_seed(seed, name), batch=kcfg["assign_batch"],
+            keep_tags=bool(run.get("finetune")),
+        )
+        bits = float(sum(fit.bits.values()))
+        out = fit.decoded
+        fit.decoded = None
+        usage = fit.stats["mask_usage"]
+        return out, bits, bits, {"fit": fit, "mask_nonidentity": 1.0 - usage[0] / max(1, sum(usage))}
     if method == "codebook":
         src = w if run.get("start", "q4") == "fp16" else rtn_quantize(w, 4, 32)
         use_act, use_row = WEIGHTINGS[run.get("weighting", "none")]
@@ -110,11 +130,18 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
     se = sq = 0.0
     usage = []
     qtypes: dict[str, int] = {}
+    fits: dict = {}
+    nonid = []
     source = gguf_ref.GGUFSource(gguf_ref.resolve(run)) if run["method"] == "gguf" else None
     with torch.no_grad():
         for i, (name, mod) in enumerate(linears):
             w = originals[name].to(mod.weight.device, torch.float32)
             out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source, importance)
+            if "fit" in stats:
+                f = stats.pop("fit")
+                if run.get("finetune"):
+                    fits[name] = f
+                nonid.append(stats.pop("mask_nonidentity"))
             if "ggml_type" in stats:
                 qtypes[stats["ggml_type"]] = qtypes.get(stats["ggml_type"], 0) + w.numel()
             rbits += rb
@@ -124,7 +151,7 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
             if "codebook_usage" in stats:
                 usage.append(stats["codebook_usage"])
             mod.weight.copy_(out.to(mod.weight.dtype))
-            if run["method"] in ("codebook", "gguf") and (i + 1) % 14 == 0:
+            if run["method"] in ("codebook", "gguf", "masked") and (i + 1) % 14 == 0:
                 log(f"  compressed {i + 1}/{len(linears)} matrices ({time.time() - t0:.0f}s)")
     if model.device.type == "cuda":
         torch.cuda.synchronize()
@@ -138,4 +165,6 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
         "codebook_usage": (sum(usage) / len(usage)) if usage else None,
         "compress_seconds": time.time() - t0,
         **({"ggml_type_fractions": {k: v / n_compressed for k, v in sorted(qtypes.items())}} if qtypes else {}),
+        **({"mask_nonidentity_frac": sum(nonid) / len(nonid)} if nonid else {}),
+        **({"_fits": fits} if fits else {}),
     }

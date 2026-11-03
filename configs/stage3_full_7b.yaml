@@ -1,0 +1,55 @@
+# Stage 3: the full recipe on Qwen2.5-7B-Instruct. Importance-weighted codebook
+# (s_r^2 h_c), M=16 seeded random column orders per matrix (masks; row picks the
+# best by weighted snap error on 10% of its chunks, 2 rounds), then the Stage 5
+# fine-tune of codebooks + row scales against the original (tags/masks frozen).
+# Each cell writes two rows: <name> (before fine-tune) and <name>_ft.
+# Run single-process: python scripts/run_experiment.py --config configs/stage3_full_7b.yaml
+stage: 3
+output_dir: artifacts/qwen_s01/stage3_full_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+# Column importance h_c = E[x_c^2] per block linear, from web text (never the
+# WikiText-2 evaluation text). 128 x 2,048 tokens, like a typical imatrix run.
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+# Fine-tune: 256 steps x 1,024 tokens = one pass over the 128 x 2,048 calibration
+# tokens (FineWeb-Edu; never WikiText-2 or GSM8K). Adam; codebooks lr 1e-4,
+# per-row log-gain lr 1e-3. Masked cells fit from the 16-bit weights (start fp16).
+runs:
+  - {name: original, method: original}
+  - {name: masked_d4_k1024, method: masked, d: 4, K: 1024, M: 16, rounds: 2, select_frac: 0.1,
+     finetune: {steps: 256, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 16}}   # 2.5
+  - {name: masked_d4_k4096, method: masked, d: 4, K: 4096, M: 16, rounds: 2, select_frac: 0.1,
+     finetune: {steps: 256, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 16}}   # 3.0
+  - {name: masked_d6_k4096, method: masked, d: 6, K: 4096, M: 16, rounds: 2, select_frac: 0.1,
+     finetune: {steps: 256, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 16}}   # 2.0
