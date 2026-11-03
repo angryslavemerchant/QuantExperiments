@@ -29,7 +29,7 @@ python scripts/run_experiment.py --config configs/stage1_baselines.yaml  # basel
 python scripts/run_experiment.py --config configs/stage1_baselines_7b.yaml  # baselines, Qwen2.5-7B-Instruct
 python scripts/run_experiment.py --config configs/stage2_codebook_7b.yaml   # codebook cells, Qwen2.5-7B-Instruct
 python scripts/run_parallel.py --config configs/stage2b_sweep_7b.yaml --shards 3  # bits-matched d sweep + GGUF references
-python scripts/run_parallel.py --config configs/stage2c_weighted_7b.yaml --shards 4  # importance-weighted k-means
+python scripts/run_parallel.py --config configs/stage2c_weighted_7b.yaml --shards 2  # importance-weighted k-means
 python -m pytest tests -q
 ```
 

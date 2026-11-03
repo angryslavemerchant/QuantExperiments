@@ -1,5 +1,6 @@
 # Stage 2c: importance-weighted k-means on Qwen2.5-7B-Instruct, plus the Q3_K_M
-# reference lost in stage 2b. Run with scripts/run_parallel.py --shards 4.
+# reference lost in stage 2b. Run with scripts/run_parallel.py --shards 2.
+# (K=4096 fitting is compute-bound on the GPU, so more shards do not help.)
 stage: 2c
 output_dir: artifacts/qwen_s01/stage2c_weighted_7b
 model: Qwen/Qwen2.5-7B-Instruct
@@ -38,16 +39,19 @@ kmeans:
   max_fit_chunks: 1000000
   assign_batch: 32768
 
-# weighting: none (stage 2/2b) | row (s_r^2: plain weight MSE) | act (h_c) | act_row (s_r^2 h_c,
+# weighting: none | row (s_r^2: plain weight MSE) | act (h_c) | act_row (s_r^2 h_c,
 # the diagonal approximation of layer-output error). Unweighted twins of every
-# cell are in stage2_codebook_7b / stage2b_sweep_7b with the same seed.
-# Order balances 4 shards (shard = index mod 4).
+# cell are in stage2_codebook_7b / stage2b_sweep_7b with the same seed, but they
+# used the pre-2c distance arithmetic; cb_d4_k4096_none reruns one twin with the
+# current code to measure k-means noise from that change.
+# Most important cells first; shard = index mod 2.
 runs:
   - {name: original, method: original}
   - {name: cb_d6_k4096_w, method: codebook, d: 6, K: 4096, weighting: act_row}    # 2.0
   - {name: cb_d4_k4096_w, method: codebook, d: 4, K: 4096, weighting: act_row}    # 3.0
-  - {name: cb_d4_k4096_act, method: codebook, d: 4, K: 4096, weighting: act}      # 3.0 ablation
-  - {name: cb_d8_k4096_w, method: codebook, d: 8, K: 4096, weighting: act_row}    # 1.5
-  - {name: gguf_q3_k_m, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-Q3_K_M.gguf}
-  - {name: cb_d4_k4096_row, method: codebook, d: 4, K: 4096, weighting: row}      # 3.0 ablation
   - {name: cb_d4_k1024_w, method: codebook, d: 4, K: 1024, weighting: act_row}    # 2.5
+  - {name: cb_d4_k4096_none, method: codebook, d: 4, K: 4096}                     # 3.0 noise control
+  - {name: cb_d8_k4096_w, method: codebook, d: 8, K: 4096, weighting: act_row}    # 1.5
+  - {name: cb_d4_k4096_act, method: codebook, d: 4, K: 4096, weighting: act}      # 3.0 ablation
+  - {name: cb_d4_k4096_row, method: codebook, d: 4, K: 4096, weighting: row}      # 3.0 ablation
+  - {name: gguf_q3_k_m, method: gguf, repo: bartowski/Qwen2.5-7B-Instruct-GGUF, file: Qwen2.5-7B-Instruct-Q3_K_M.gguf}

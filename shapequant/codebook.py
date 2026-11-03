@@ -37,12 +37,22 @@ def layer_seed(seed: int, name: str) -> int:
     return (seed * 1_000_003 + zlib.crc32(name.encode())) % (2**31 - 1)
 
 
-def _sq_dists(x: torch.Tensor, c: torch.Tensor, c_sq: torch.Tensor,
-              wt: torch.Tensor | None = None) -> torch.Tensor:
+def _assign_batch(x: torch.Tensor, c: torch.Tensor, c_sq: torch.Tensor,
+                  wt: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nearest codeword and its (weighted) squared error for one batch.
+
+    argmin_k ||x - c_k||^2 = argmin_k (c_sq_k - 2 x.c_k): one fused addmm writes
+    the only [batch, K] tensor; the per-row ||x||^2 term is added after the min.
+    Weighted: sum_i w_i (x_i - c_ki)^2 = sum w x^2 + [-2 w*x, w] . [c_k, c_k^2],
+    again a single matmul (inner dim 2d)."""
     if wt is None:
-        return (x * x).sum(1, keepdim=True) - 2.0 * (x @ c.T) + c_sq[None, :]
-    # Weighted: sum_i w_i (x_i - c_i)^2 = sum w x^2 - 2 (w*x).c + w.(c*c)
-    return (wt * x * x).sum(1, keepdim=True) - 2.0 * ((wt * x) @ c.T) + wt @ (c * c).T
+        d2 = torch.addmm(c_sq[None, :], x, c.T, alpha=-2.0)
+        m, i = d2.min(dim=1)
+        return i, (m + (x * x).sum(1)).clamp_min(0)
+    a = torch.cat([-2.0 * wt * x, wt], dim=1)
+    b = torch.cat([c, c * c], dim=1)
+    m, i = (a @ b.T).min(dim=1)
+    return i, (m + (wt * x * x).sum(1)).clamp_min(0)
 
 
 def assign(x: torch.Tensor, codebook: torch.Tensor, batch: int = 65536,
@@ -55,10 +65,9 @@ def assign(x: torch.Tensor, codebook: torch.Tensor, batch: int = 65536,
     idx = torch.empty(x.shape[0], dtype=torch.int64, device=x.device)
     err = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
     for s in range(0, x.shape[0], batch):
-        d2 = _sq_dists(x[s : s + batch], c, c_sq, None if wt is None else wt[s : s + batch])
-        m, i = d2.min(dim=1)
+        i, e = _assign_batch(x[s : s + batch], c, c_sq, None if wt is None else wt[s : s + batch])
         idx[s : s + batch] = i
-        err[s : s + batch] = m.clamp_min(0)
+        err[s : s + batch] = e
     return idx, err
 
 
@@ -96,10 +105,11 @@ def kmeans(
     for k in range(1, K):
         cdf = torch.cumsum(dmin.to(torch.float64), 0)
         total = cdf[-1]
-        if total <= 0:
-            pick = torch.clamp((uniforms[k] * n).long(), max=n - 1)
-        else:
-            pick = torch.clamp(torch.searchsorted(cdf, (uniforms[k] * total).reshape(1)), max=n - 1)
+        # No host sync: both candidates are computed on device and selected with
+        # torch.where (identical picks to the former `if total <= 0` branch).
+        uniform_pick = torch.clamp((uniforms[k] * n).long(), max=n - 1).reshape(1)
+        cdf_pick = torch.clamp(torch.searchsorted(cdf, (uniforms[k] * total).reshape(1)), max=n - 1)
+        pick = torch.where(total > 0, cdf_pick, uniform_pick)
         centers[k] = x[pick].reshape(d)
         dmin = torch.minimum(dmin, _d2(centers[k]))
 
