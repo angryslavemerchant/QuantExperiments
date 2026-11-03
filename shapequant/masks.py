@@ -283,3 +283,178 @@ def compress_masked(
 def weighted_rel_error(w: torch.Tensor, w_hat: torch.Tensor, h: torch.Tensor) -> float:
     """sum_c h_c (w - w^)^2 / sum_c h_c w^2: relative layer-output error proxy."""
     return float(((w - w_hat).pow(2) * h[None, :]).sum() / (w.pow(2) * h[None, :]).sum())
+
+
+def _row_profiles(u: torch.Tensor, q: int = 16) -> torch.Tensor:
+    """Per-row distribution shape: sorted |u| quantiles, unit-normalized.
+    Rows with heavy outliers vs. near-Gaussian rows land in different clusters."""
+    qs = torch.linspace(0.5 / q, 1 - 0.5 / q, q, device=u.device)
+    prof = torch.quantile(u.abs().float(), qs, dim=1).T          # [R, q]
+    return prof / prof.norm(dim=1, keepdim=True).clamp_min(1e-8)
+
+
+def compress_mixture(
+    w: torch.Tensor, h: torch.Tensor, d: int, K: int, *,
+    G: int, M: int = 1, rounds: int = 4, row_init: str = "profile",
+    iters: int = 25, refit_iters: int = 10, max_fit_chunks: int = 1_000_000,
+    seed: int = 0, batch: int = 65536, select_frac: float = 1.0,
+    joint: bool | None = None, keep_tags: bool = False,
+) -> Fit:
+    """Mixture of codebooks (switched VQ): G distinct codebooks per matrix, each
+    row picks one (log2 G bits per row). Optionally combined with M seeded
+    random column orders (identity + random); a row then picks the best
+    (codebook, order) pair. Alternation: rows pick, each codebook refits on its
+    rows (warm start), repeat.
+
+    row_init: 'profile' (rows k-means'd on their |u| quantile profile, so the
+    codebooks start specialized on distribution shape) or 'random'.
+    joint: rows search all G*M (codebook, order) pairs per round (default when
+    G*M <= 16); otherwise alternate, codebook given order then order given
+    codebook (G + M snaps per round).
+    keep_tags: return tags indexing the concatenation of the G codebooks
+    (stats['books'] = [that table]), the form the Stage 5 fine-tune takes."""
+    R, C = w.shape
+    dev = w.device
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    rs = _row_scale(w)
+    if M > 1:
+        rand = [torch.randperm(C, generator=gen).to(dev) for _ in range(M)]
+        rand[0] = torch.arange(C, device=dev)
+        perms = torch.stack(rand)
+    else:
+        perms = torch.arange(C, device=dev)[None]
+    row_mask = torch.zeros(R, dtype=torch.long, device=dev)
+    if row_init == "profile" and G > 1:
+        prof = _row_profiles(w / rs[:, None])
+        cent = cb.kmeans(prof, G, 15, gen, batch)
+        row_book, _ = cb.assign(prof, cent, batch)
+    elif row_init == "random" and G > 1:
+        row_book = torch.randint(G, (R,), generator=gen).to(dev)
+    else:
+        row_book = torch.zeros(R, dtype=torch.long, device=dev)
+
+    def sub(x, wt):
+        n = x.shape[0]
+        if n > max_fit_chunks:
+            s = torch.randperm(n, generator=gen)[:max_fit_chunks].to(dev)
+            return x[s], wt[s]
+        return x, wt
+
+    def rows_of(chunks, ew, sel):
+        nch = chunks.shape[0] // R
+        return chunks.view(R, nch, d)[sel].reshape(-1, d), ew.view(R, nch, d)[sel].reshape(-1, d)
+
+    chunks, ew, idx, pad, _ = _prepare(w, h, rs, perms, row_mask, d, None, 0)
+    fx, fw = sub(chunks, ew)
+    shared = cb.kmeans(fx, K, iters, gen, batch, fw)  # common start: one codebook on all rows
+    books = []
+    for g in range(G):
+        sel = row_book == g
+        x, wt = rows_of(chunks, ew, sel) if sel.any() else (chunks, ew)
+        x, wt = sub(x, wt)
+        books.append(cb.kmeans(x, K, refit_iters, gen, batch, wt, init=shared).to(torch.float16)
+                     if x.shape[0] >= K else shared.to(torch.float16))
+
+    nch = chunks.shape[0] // R
+    slots = None
+    if select_frac < 1.0:
+        k = max(1, math.ceil(select_frac * nch))
+        slots = torch.randperm(nch, generator=gen)[:k].sort().values.to(dev)
+
+    if joint is None:
+        joint = G * M <= 16
+
+    def sel_view(cm, em):
+        if slots is None:
+            return cm, em
+        return (cm.view(R, nch, d)[:, slots].reshape(-1, d), em.view(R, nch, d)[:, slots].reshape(-1, d))
+
+    def errs_under_mask(m, per_row_book):
+        """[R] error of every row under order m, each row with its own codebook."""
+        cm, em = sel_view(*_prepare(w, h, rs, perms, torch.full((R,), m, device=dev), d, None, 0)[:2])
+        per = cm.shape[0] // R
+        out = torch.empty(R, device=dev)
+        for g in range(G):
+            sel = per_row_book == g
+            if sel.any():
+                x = cm.view(R, per, d)[sel].reshape(-1, d)
+                wt = em.view(R, per, d)[sel].reshape(-1, d)
+                _, e = cb.assign(x, books[g], batch, wt)
+                out[sel] = e.view(-1, per).sum(1)
+        return out
+
+    history = []
+    for _ in range(rounds if (G > 1 or M > 1) and not joint else 0):
+        # (a) codebook given each row's current order
+        cm, em = sel_view(*_prepare(w, h, rs, perms, row_mask, d, None, 0)[:2])
+        eg = torch.stack([cb.assign(cm, books[g], batch, em)[1].view(R, -1).sum(1) for g in range(G)])
+        row_book = eg.argmin(0)
+        # (b) order given each row's codebook
+        if M > 1:
+            em_all = torch.stack([errs_under_mask(m, row_book) for m in range(M)])
+            row_mask = em_all.argmin(0)
+            history.append(float(em_all.min(0).values.sum()))
+        else:
+            history.append(float(eg.min(0).values.sum()))
+        chunks, ew, idx, pad, _ = _prepare(w, h, rs, perms, row_mask, d, None, 0)
+        for g in range(G):
+            sel = row_book == g
+            x, wt = rows_of(chunks, ew, sel)
+            if x.shape[0] >= K:
+                x, wt = sub(x, wt)
+                books[g] = cb.kmeans(x, K, refit_iters, gen, batch, wt, init=books[g]).to(torch.float16)
+
+    for _ in range(rounds if (G > 1 or M > 1) and joint else 0):
+        errs = []  # [(g, m)] -> [R]
+        for m in range(M):
+            cm, em = _prepare(w, h, rs, perms, torch.full((R,), m, device=dev), d, None, 0)[:2]
+            if slots is not None:
+                cm = cm.view(R, nch, d)[:, slots].reshape(-1, d)
+                em = em.view(R, nch, d)[:, slots].reshape(-1, d)
+            for g in range(G):
+                _, e = cb.assign(cm, books[g], batch, em)
+                errs.append(e.reshape(R, -1).sum(1))
+        errs = torch.stack(errs)                       # index = m * G + g
+        best = errs.argmin(0)
+        row_mask, row_book = best // G, best % G
+        history.append(float(errs.min(0).values.sum()))
+        chunks, ew, idx, pad, _ = _prepare(w, h, rs, perms, row_mask, d, None, 0)
+        for g in range(G):
+            sel = row_book == g
+            x, wt = rows_of(chunks, ew, sel)
+            if x.shape[0] >= K:
+                x, wt = sub(x, wt)
+                books[g] = cb.kmeans(x, K, refit_iters, gen, batch, wt, init=books[g]).to(torch.float16)
+
+    tags = torch.empty(chunks.shape[0], dtype=torch.long, device=dev)
+    flat = torch.empty(chunks.shape[0], d, dtype=torch.float32, device=dev)
+    rows_idx = torch.arange(chunks.shape[0], device=dev) // nch
+    for g in range(G):
+        selc = row_book[rows_idx] == g
+        if selc.any():
+            t, _ = cb.assign(chunks[selc], books[g], batch, ew[selc])
+            tags[selc] = t
+            flat[selc] = books[g].to(torch.float32)[t]
+    u = flat.reshape(R, -1)[:, :C]
+    decoded = torch.empty_like(u)
+    decoded.scatter_(1, idx, u)
+    decoded = decoded * rs[:, None]
+    bits = {
+        "tags": R * (nch) * math.ceil(math.log2(K)),
+        "codebook": G * K * d * 16,
+        "row_scales": R * 16,
+        "block_scales": 0,
+        "orders": 32 if M > 1 else 0,
+        "row_mask": R * math.ceil(math.log2(M)) if M > 1 else 0,
+        "row_book": R * math.ceil(math.log2(G)) if G > 1 else 0,
+    }
+    usage = torch.bincount(row_mask, minlength=M).tolist()
+    gtags = None
+    if keep_tags:
+        gtags = tags + row_book[rows_idx] * K           # index into cat(books)
+        gtags = gtags.to(torch.int16 if G * K <= 32767 else torch.int32)
+    return Fit(decoded, perms, row_mask, books[0], bits,
+               {"book_usage": torch.bincount(row_book, minlength=G).tolist(), "mask_usage": usage,
+                "round_errors": history, "books": [torch.cat(books)] if keep_tags else books,
+                "row_book": row_book},
+               tags=[gtags] if keep_tags else None, row_scale=rs, pad=pad)

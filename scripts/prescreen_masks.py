@@ -24,8 +24,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shapequant.calibrate import column_importance, load_calibration_sequences  # noqa: E402
 from shapequant import codebook as cb  # noqa: E402
-from shapequant.masks import compress_masked  # noqa: E402
+from shapequant.masks import compress_masked, compress_mixture  # noqa: E402
 from shapequant.pipeline import compressible_linears  # noqa: E402
+
+
+def mixture_variants(K: int):
+    """Round 4: mixture of codebooks (G per matrix, row picks one), alone and
+    with masks. Bits controls: K2x (+1 tag bit per chunk)."""
+    sf = dict(select_frac=0.25)
+    return [
+        ("base", dict()),
+        ("base_seed1", dict(seed_offset=1)),
+        ("base_K2x", dict(K=2 * K)),
+        ("masks16", dict(M=16, init="identity+random", rounds=2, **sf)),
+        ("mix2", dict(G=2)),
+        ("mix4", dict(G=4)),
+        ("mix8", dict(G=8)),
+        ("mix16", dict(G=16)),
+        ("mix4_randinit", dict(G=4, row_init="random")),
+        ("mix4_masks16", dict(G=4, M=16, rounds=3, **sf)),
+        ("mix16_masks16", dict(G=16, M=16, rounds=3, **sf)),
+        # controls: is the mask gain lost when rows choose on a chunk subset?
+        ("masks16_sf1", dict(M=16, init="identity+random", rounds=2)),
+        ("masks16_sf01", dict(M=16, init="identity+random", rounds=2, select_frac=0.1)),  # 7B setting
+        ("mix4_masks16_sf1", dict(G=4, M=16, rounds=3)),
+    ]
 
 
 def variants(K: int):
@@ -66,6 +89,7 @@ def main() -> int:
     ap.add_argument("--d", type=int, default=4)
     ap.add_argument("--K", type=int, default=256)
     ap.add_argument("--only", default="", help="comma-separated variant names")
+    ap.add_argument("--set", default="masks", choices=["masks", "mixture"])
     ap.add_argument("--out", default="artifacts/prescreen/masks_0p5b.csv")
     args = ap.parse_args()
 
@@ -89,7 +113,7 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     rows = []
-    for vname, kw in variants(args.K):
+    for vname, kw in (mixture_variants if args.set == "mixture" else variants)(args.K):
         if want and vname not in want:
             continue
         kw = dict(kw)
@@ -102,7 +126,10 @@ def main() -> int:
         n_weights = 0
         per = []
         for name, w, h in mats:
-            fit = compress_masked(w, h, d, K, seed=cb.layer_seed(seed_offset, name), **kw)
+            if "G" in kw:
+                fit = compress_mixture(w, h, d, K, seed=cb.layer_seed(seed_offset, name), **kw)
+            else:
+                fit = compress_masked(w, h, d, K, seed=cb.layer_seed(seed_offset, name), **kw)
             e = ((w - fit.decoded).pow(2) * h[None, :]).sum().item()
             s = (w.pow(2) * h[None, :]).sum().item()
             num += e
@@ -113,13 +140,15 @@ def main() -> int:
             n_weights += w.numel()
         bpw = {k: v / n_weights for k, v in bits.items()}
         core = sum(v for k, v in bpw.items() if k != "orders")
+        bpw.setdefault("row_book", 0.0)
         row = {"variant": vname, "d": d, "K": str(K), "pooled_wrel": num / den,
                "bpw_tags": bpw["tags"],
                "mean_wrel": sum(per) / len(per), "bpw_core": core, "bpw_orders": bpw["orders"],
-               "bpw_block_scales": bpw["block_scales"], "seconds": time.time() - t0}
+               "bpw_block_scales": bpw["block_scales"], "bpw_codebook": bpw["codebook"],
+               "bpw_row_tags": bpw["row_mask"] + bpw["row_book"], "seconds": time.time() - t0}
         rows.append(row)
         print(f"{vname:28s} tags {bpw['tags']:.3f}  pooled wrel {row['pooled_wrel']:.5f}  mean {row['mean_wrel']:.5f}  "
-              f"bpw core {core:.3f} (+orders {bpw['orders']:.3f})  {row['seconds']:.0f}s", flush=True)
+              f"bpw core {core:.3f} (cb {bpw['codebook']:.3f}, +orders {bpw['orders']:.3f})  {row['seconds']:.0f}s", flush=True)
         with open(out, "w", newline="") as f:
             wr = csv.DictWriter(f, fieldnames=list(rows[0]))
             wr.writeheader()

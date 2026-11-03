@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shapequant import codebook as cb  # noqa: E402
 from shapequant import memory  # noqa: E402
 from shapequant.evaluate import GSM8K_TEMPLATE, Scorer, load_gsm8k, load_wikitext_windows, run_gsm8k  # noqa: E402
-from shapequant.pipeline import apply_run, compressible_linears, snapshot_originals  # noqa: E402
+from shapequant.pipeline import apply_run, compressible_linears, restore_originals, snapshot_originals  # noqa: E402
 from shapequant.plots import make_plots  # noqa: E402
 
 COLUMNS = [
@@ -39,6 +39,7 @@ COLUMNS = [
     "seed", "bits_per_weight_rounded", "bits_per_weight_ideal", "total_mb", "pct_of_original",
     "mean_kl", "p99_kl", "top1_agree", "perplexity", "gsm8k_acc", "codebook_usage",
     "recon_mse", "recon_rel_mse", "compress_seconds", "eval_tokens",
+    "G", "alloc", "mean_log2K", "mask_nonidentity_frac", "ft_kl_first", "ft_kl_last",
 ]
 
 T0 = time.time()
@@ -175,7 +176,7 @@ def main() -> int:
 
     importance = None
     seqs = None
-    if any(run.get("weighting", "none") in ("act", "act_row") or run["method"] == "masked"
+    if any(run.get("weighting", "none") in ("act", "act_row") or run["method"] in ("masked", "stack")
            for run in cfg["runs"]):
         from shapequant.calibrate import column_importance, load_calibration_sequences
         ccfg = cfg["calibration"]
@@ -184,6 +185,39 @@ def main() -> int:
         importance = column_importance(model, seqs, ccfg.get("batch_size", 4))
 
     finished = done_runs(csv_path)
+    alloc_runs = [r for r in cfg["runs"] if r.get("alloc") and r["name"] not in finished]
+    if alloc_runs:
+        # Per-matrix codebook sizes: Fisher + light proxy fits once, then each
+        # run's allocation is solved against its own budget.
+        from shapequant import alloc as al
+        acfg = cfg["allocation"]
+        Ks = tuple(acfg["Ks"])
+        names = [n for n, _ in compressible_linears(model)]
+        fseqs = seqs[: acfg["fisher_sequences"]].reshape(-1, acfg["fisher_seq_len"])
+        log(f"allocation: Fisher on {fseqs.shape[0]} x {fseqs.shape[1]} calibration tokens")
+        fisher = al.fisher_diag(model, fseqs, log=log)
+        restore_originals(model, originals)
+        log(f"allocation: proxy fits d={acfg['d']} K in {Ks}")
+        err, bits = al.proxy_table(originals, importance, fisher, names, acfg["d"], Ks, seed,
+                                   acfg["proxy_iters"], acfg["proxy_fit_chunks"],
+                                   cfg["kmeans"]["assign_batch"], args.device, log=log)
+        del fisher
+        torch.cuda.empty_cache()
+        n_layers = model.config.num_hidden_layers
+        table = {"Ks": Ks, "names": names, "err": err, "bits": bits, "choices": {}}
+        for run in alloc_runs:
+            B = al.budget_bits(bits, Ks, run["budget"])
+            ch = (al.lagrangian(err, bits, B) if run["alloc"] == "fisher"
+                  else al.heuristic(names, bits, B, n_layers) if run["alloc"] == "heuristic"
+                  else None)
+            if ch is None:
+                raise ValueError(f"unknown alloc {run['alloc']!r}")
+            run["_K_by_name"] = {n: Ks[k] for n, k in zip(names, ch)}
+            table["choices"][run["name"]] = run["_K_by_name"]
+            hist = {K: ch.count(i) for i, K in enumerate(Ks)}
+            log(f"  {run['name']}: {run['alloc']} allocation at {run['budget']}: K histogram {hist}")
+        (out_dir / "allocation.json").write_text(json.dumps(table))
+
     rows: dict[str, dict] = {}
     for run in cfg["runs"]:
         name = run["name"]
@@ -191,9 +225,18 @@ def main() -> int:
             log(f"skip {name} (already in results.csv)")
             rows[name] = json.loads((out_dir / "runs" / f"{name}.json").read_text())
             continue
-        log(f"=== run {name}: {run}")
+        log(f"=== run {name}: { {k: v for k, v in run.items() if not k.startswith('_')} }")
         seed_everything(seed)
-        stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance)
+        try:
+            stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance)
+        except Exception as e:  # a broken external reference must not cost the whole run
+            if run["method"] not in ("gguf", "vptq"):
+                raise
+            import traceback
+            log(f"  REFERENCE FAILED {name}: {e!r}; skipping")
+            log(traceback.format_exc())
+            restore_originals(model, originals)
+            continue
         fits = stats.pop("_fits", None)
         log(f"  compressed in {stats['compress_seconds']:.1f}s; "
             f"{stats['bits_per_weight_rounded']:.3f} bpw; scoring wikitext")
@@ -202,20 +245,21 @@ def main() -> int:
             metrics = scorer.score(model)
             log(f"  [{row_name}] mean KL {metrics['mean_kl']:.5f}  p99 {metrics['p99_kl']:.4f}  "
                 f"top1 {metrics['top1_agree']:.2f}%  ppl {metrics['perplexity']:.3f}")
-            if problems is not None:
+            if problems is not None and run.get("gsm8k", True):
                 g = run_gsm8k(model, tok, problems, gcfg, out_dir / "gsm8k" / f"{row_name}.jsonl")
                 log(f"  [{row_name}] GSM8K {g['gsm8k_acc']:.1f}% ({g['gsm8k_seconds']:.0f}s)")
                 metrics.update(g)
             row = {
                 "stage": run.get("stage", cfg.get("stage")), "run_name": row_name, "method": run["method"],
                 "model": cfg["model"], "d": run.get("d"), "K": run.get("K"),
-                "shuffle": run.get("shuffle", False), "masks": run.get("M", 1) > 1 if run["method"] == "masked" else run.get("masks", False),
-                "M": run.get("M"),
+                "shuffle": run.get("shuffle", False), "masks": run.get("M", 1) > 1 if run["method"] in ("masked", "stack") else run.get("masks", False),
+                "M": run.get("M"), "G": run.get("G"), "alloc": run.get("alloc"),
                 "finetune": ft,
-                "weighting": ("act_row" if run["method"] == "masked" else run.get("weighting", "none"))
-                if run["method"] in ("codebook", "masked") else None,
+                "weighting": ("act_row" if run["method"] in ("masked", "stack") else run.get("weighting", "none"))
+                if run["method"] in ("codebook", "masked", "stack") else None,
                 "start": run.get("start", "q4") if run["method"] == "codebook" else "fp16",
-                "source": (run.get("path") or f"{run['repo']}/{run['file']}") if run["method"] == "gguf" else None,
+                "source": ((run.get("path") or f"{run['repo']}/{run['file']}") if run["method"] == "gguf"
+                           else run["repo"] if run["method"] == "vptq" else None),
                 "seed": seed, **stats, **extra, **metrics,
             }
             rows[row_name] = row
@@ -238,7 +282,6 @@ def main() -> int:
             evaluate(f"{name}_ft", True, ft_stats)
 
     if cfg.get("stage0_checks"):
-        from shapequant.pipeline import restore_originals
         restore_originals(model, originals)
         report = stage0_checks(cfg, model, rows, out_dir)
         for k, v in report.items():

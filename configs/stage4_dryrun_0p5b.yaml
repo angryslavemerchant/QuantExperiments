@@ -1,0 +1,30 @@
+# Local dry run of the Stage 4 stack code paths on 0.5B (tiny settings; numbers meaningless).
+stage: 4
+output_dir: artifacts/dryrun/stage4_0p5b
+model: Qwen/Qwen2.5-0.5B-Instruct
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 256
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 1024, num_windows: 3}
+  gsm8k: {enabled: true, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 8, context: 1024, batch_size: 4}
+allocation: {d: 4, Ks: [64, 256, 1024], fisher_sequences: 2, fisher_seq_len: 512, proxy_iters: 3, proxy_fit_chunks: 20000}
+kmeans: {iters: 3, refit_iters: 2, max_fit_chunks: 20000, assign_batch: 32768}
+runs:
+  - {name: original, method: original}
+  - {name: u256, method: stack, d: 4, K: 256, gsm8k: false}
+  - {name: fisher256, method: stack, d: 4, alloc: fisher, budget: "uniform:256", gsm8k: false}
+  - {name: heur256, method: stack, d: 4, alloc: heuristic, budget: "uniform:256", gsm8k: false}
+  - {name: mix4, method: stack, d: 4, K: 256, G: 4, gsm8k: false}
+  - {name: masks16, method: stack, d: 4, K: 256, M: 16, rounds: 1, gsm8k: false}
+  - name: full
+    method: stack
+    d: 4
+    alloc: fisher
+    budget: "uniform:256"
+    G: 4
+    M: 16
+    rounds: 1
+    finetune: {steps: 4, seq_len: 256, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 2}
+  - {name: vptq_bogus, method: vptq, repo: VPTQ-community/does-not-exist, gsm8k: false}

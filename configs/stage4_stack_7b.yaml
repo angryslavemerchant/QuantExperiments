@@ -1,0 +1,88 @@
+# Stage 4: the full stack on Qwen2.5-7B-Instruct at ~2.5 bpw, against VPTQ and
+# the IQ2/IQ1 GGUF ladder, with one-at-a-time ablations.
+#
+# Stack = importance-weighted (s_r^2 h_c) d=4 codebook fitted from the 16-bit
+# weights, plus:
+#   allocation : per-matrix K in {256, 1024, 4096} at the bit budget of uniform
+#                K=1024 (Fisher-weighted damage, Lagrangian) - screened -13% KL on 0.5B
+#   mixture    : G=4 codebooks per matrix, row picks one          - screened -6% (+0.025 bpw)
+#   masks      : M=16 seeded column orders, rows choose on ALL chunks
+#                (select_frac 1.0; the Stage 3 run used 0.1, which the 0.5B
+#                control shows removes the gain)                   - screened -8%
+#   fine-tune  : codebooks + row gains on KL vs the original, 512 steps (Stage 5)
+#
+# Order: headline rows first, external references next, ablations last, so a
+# short work window can only cost ablations. Single process.
+# Run: python scripts/run_experiment.py --config configs/stage4_stack_7b.yaml
+stage: 4
+output_dir: artifacts/qwen_s01/stage4_stack_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original}
+  # control: same fit as the stack with every addition off (also the clean
+  # fp16-start, no-mask twin that Stage 3 lacked)
+  - {name: s4_u1024, method: stack, d: 4, K: 1024, gsm8k: false}
+  - name: s4_full
+    method: stack
+    d: 4
+    alloc: fisher
+    budget: "uniform:1024"
+    G: 4
+    M: 16
+    rounds: 2
+    select_frac: 1.0
+    finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}
+  # external references (block linears only, real storage bits)
+  - {name: vptq_v8_k65536_0, method: vptq, repo: VPTQ-community/Qwen2.5-7B-Instruct-v8-k65536-0-woft}
+  - {name: vptq_v8_k256_256, method: vptq, repo: VPTQ-community/Qwen2.5-7B-Instruct-v8-k256-256-woft}
+  - {name: vptq_v16_k65536_65536, method: vptq, repo: VPTQ-community/Qwen2.5-7B-Instruct-v16-k65536-65536-woft}
+  - {name: gguf_i1_iq2_xxs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ2_XXS.gguf}
+  - {name: gguf_i1_iq2_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ2_XS.gguf}
+  - {name: gguf_i1_iq1_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ1_M.gguf, gsm8k: false}
+  # ablations: each addition alone on top of the control
+  - {name: s4_fisher, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", gsm8k: false}
+  - {name: s4_masks16, method: stack, d: 4, K: 1024, M: 16, rounds: 2, select_frac: 1.0, gsm8k: false}
+  - {name: s4_mix4, method: stack, d: 4, K: 1024, G: 4, gsm8k: false}
+  - {name: s4_heur, method: stack, d: 4, alloc: heuristic, budget: "uniform:1024", gsm8k: false}
