@@ -54,3 +54,18 @@ def test_mixture_tags_feed_the_finetune_wrapper_exactly():
         x = torch.randn(3, 40)
         assert torch.allclose(wrap(x), torch.nn.functional.linear(x, decoded, lin.bias), atol=1e-5), (G, M)
         assert torch.allclose(wrap.bake(), decoded, atol=1e-6), (G, M)
+
+
+def test_mixture_int32_tags_feed_the_finetune_wrapper():
+    # G*K > 32767 (Stage 5: K=16384, G=4) stores tags as int32
+    from torch import nn
+    from shapequant.finetune import CodebookLinear
+    w, h = _w(4, R=256, C=1024)
+    fit = compress_mixture(w, h, 4, 16384, G=4, M=2, rounds=1, iters=1, refit_iters=1,
+                           seed=1, keep_tags=True)
+    assert fit.tags[0].dtype == torch.int32 and int(fit.tags[0].max()) > 32767
+    lin = nn.Linear(1024, 256)
+    wrap = CodebookLinear(lin, fit, 4)
+    x = torch.randn(2, 1024)
+    assert torch.allclose(wrap(x), torch.nn.functional.linear(x, fit.decoded, lin.bias), atol=1e-4)
+    assert torch.allclose(wrap.bake(), fit.decoded, atol=1e-6)

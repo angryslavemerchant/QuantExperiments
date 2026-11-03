@@ -1,0 +1,82 @@
+# Stage 5: the Stage 4 stack moved up to ~3 bpw (budget of uniform d4/K4096,
+# per-matrix K in {1024, 4096, 16384}) to test against IQ3_XXS/IQ3_XS and the
+# ~3-bpw VPTQ checkpoint. Stage 4 at 2.52 bpw: KL 0.154 after fine-tune.
+# (Stage 4 header kept below for the recipe.)
+#
+#
+# Stack = importance-weighted (s_r^2 h_c) d=4 codebook fitted from the 16-bit
+# weights, plus:
+#   allocation : per-matrix K in {256, 1024, 4096} at the bit budget of uniform
+#                K=1024 (Fisher-weighted damage, Lagrangian) - screened -13% KL on 0.5B
+#   mixture    : G=4 codebooks per matrix, row picks one          - screened -6% (+0.025 bpw)
+#   masks      : M=16 seeded column orders, rows choose on ALL chunks
+#                (select_frac 1.0; the Stage 3 run used 0.1, which the 0.5B
+#                control shows removes the gain)                   - screened -8%
+#   fine-tune  : codebooks + row gains on KL vs the original, 512 steps (Stage 5)
+#
+# Order: headline rows first, external references next, ablations last, so a
+# short work window can only cost ablations. Single process.
+# Run: python scripts/run_experiment.py --config configs/stage5_stack3b_7b.yaml
+stage: 5
+output_dir: artifacts/qwen_s01/stage5_stack3b_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [1024, 4096, 16384]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original}
+  - {name: s5_u4096, method: stack, d: 4, K: 4096, gsm8k: false}
+  - name: s5_full
+    method: stack
+    d: 4
+    alloc: fisher
+    budget: "uniform:4096"
+    G: 4
+    M: 16
+    rounds: 2
+    select_frac: 1.0
+    finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}
+  - {name: vptq_v8_k65536_256, method: vptq, repo: VPTQ-community/Qwen2.5-7B-Instruct-v8-k65536-256-woft}
+  - {name: gguf_i1_iq3_xxs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_XXS.gguf}
+  - {name: gguf_i1_iq3_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_XS.gguf}
+  - {name: vptq_v8_k65536_65536, method: vptq, repo: VPTQ-community/Qwen2.5-7B-Instruct-v8-k65536-65536-woft, gsm8k: false}
+  - {name: gguf_i1_iq3_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_M.gguf, gsm8k: false}
