@@ -14,7 +14,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_gemv import SHAPES, synthetic, timeit  # noqa: E402
+from bench_gemv import SHAPES, clone_lin, copies_for, l2_bytes, synthetic, timeit  # noqa: E402
 from shapequant import masks as mk  # noqa: E402
 from shapequant.kernels import cuda_gemv, proto_formats as pf  # noqa: E402
 from shapequant.packed import pack_bits  # noqa: E402
@@ -44,18 +44,20 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bw", type=float, default=253.0)
     a = ap.parse_args()
-    print(f"{torch.cuda.get_device_name(0)}; ceiling {a.bw:.0f} GB/s; M={M}")
+    print(f"{torch.cuda.get_device_name(0)}; ceiling {a.bw:.0f} GB/s; L2 {l2_bytes() >> 20} MB "
+          f"(weights rotated over >= 4x L2); M={M}")
     print(f"{'matrix':13s} {'format':28s} {'bpw':>5s} {'us':>8s} {'GB/s':>6s} {'%ceil':>6s} {'vs fp16':>7s} {'rel err':>8s}")
     for label, (R, C) in SHAPES.items():
         g = torch.Generator().manual_seed(0)
         perms, rm, rs, x, xp = setup_common(R, C, g)
-        wd = torch.randn(R, C, device="cuda", dtype=torch.float16)
-        t16 = timeit(lambda: torch.mv(wd, x))
-        del wd
+        wds = [torch.randn(R, C, device="cuda", dtype=torch.float16) for _ in range(copies_for(R * C * 2))]
+        t16 = timeit([lambda w=w: torch.mv(w, x) for w in wds])
+        del wds
         y = torch.empty(R, device="cuda", dtype=torch.float16)
 
         def report(name, bpw, nbytes, fn, ref):
-            got = fn().float()
+            """fn: list of callables over distinct weight copies (first one is checked)."""
+            got = fn[0]().float()
             err = float((got - ref).abs().max() / ref.abs().max())
             t = timeit(fn)
             gbs = nbytes / t / 1e9
@@ -67,15 +69,19 @@ def main() -> int:
         q, sc, deq = pf.q4_pack(w0)
         q, sc = q.cuda(), sc.cuda()
         ref = deq.cuda() @ x.float()
-        report("Q4 reference (4.5 bpw)", 4.5, q.numel() * 4 + sc.numel() * 2,
-               lambda: pf.gemv_q4(q, sc, x, y, R, C), ref)
-        del w0, deq, q, sc
+        nb = q.numel() * 4 + sc.numel() * 2
+        qs = [(q, sc)] + [(q.clone(), sc.clone()) for _ in range(copies_for(nb) - 1)]
+        report("Q4 reference (4.5 bpw)", 4.5, nb,
+               [lambda c=c: pf.gemv_q4(c[0], c[1], x, y, R, C) for c in qs], ref)
+        del w0, deq, q, sc, qs
 
         # current format, 10-bit free codebook, G=1 (best existing kernel)
         lin = synthetic(R, C, 10, 1, M)
         ref = lin.dense() @ x.float()
-        report("current: free K=1024", 2.5, lin.stored_bytes(), lambda: cuda_gemv.gemv(lin, x, y), ref)
-        del lin
+        lins = [lin] + [clone_lin(lin) for _ in range(copies_for(lin.stored_bytes()) - 1)]
+        report("current: free K=1024", 2.5, lin.stored_bytes(),
+               [lambda l=l: cuda_gemv.gemv(l, x, y) for l in lins], ref)
+        del lin, lins
 
         # A: additive d4, 2 x 32
         nch = C // 4
@@ -89,18 +95,19 @@ def main() -> int:
         books_c = books.cuda()
         rm32 = rm.to(torch.int32)
         nbytes = R * nch * 10 // 8
+        wcopies = [words] + [words.clone() for _ in range(copies_for(nbytes) - 1)]
         for smem in (True, False):
             report(f"A: add 32+32 d4 ({'smem x32' if smem else 'shfl'})", 2.5, nbytes,
-                   lambda: pf.gemv_add(words, books_c, rs, rm32, xp, R, nch // 32, y, smem), ref)
+                   [lambda w=w: pf.gemv_add(w, books_c, rs, rm32, xp, R, nch // 32, y, smem) for w in wcopies], ref)
         for rows in (2, 4, 8):
             tiles = pf.row_tiles(rm, rows)
             report(f"A: add 32+32 d4 ({rows} rows/warp)", 2.5, nbytes,
-                   lambda: pf.gemv_add_rows(words, books_c, rs, tiles, xp, nch // 32, y, rows), ref)
+                   [lambda w=w: pf.gemv_add_rows(w, books_c, rs, tiles, xp, nch // 32, y, rows) for w in wcopies], ref)
         for rows in (1, 2, 4):
             tiles = pf.row_tiles(rm, rows)
             report(f"A: add 32+32 d4 (wide, {rows} rows)", 2.5, nbytes,
-                   lambda: pf.gemv_add_wide(words, books_c, rs, tiles, xp, nch, y, rows), ref)
-        del vals, tA, tB
+                   [lambda w=w: pf.gemv_add_wide(w, books_c, rs, tiles, xp, nch, y, rows) for w in wcopies], ref)
+        del vals, tA, tB, wcopies
 
         # B: d8, 2 x 256
         nch8 = C // 8
@@ -111,10 +118,11 @@ def main() -> int:
         tags16 = torch.where(t8 >= 32768, t8 - 65536, t8).to(torch.int16).cuda()
         books8_c = books8.cuda()
         nbytes = R * nch8 * 2
+        tcopies = [tags16] + [tags16.clone() for _ in range(copies_for(nbytes) - 1)]
         for rep in (1, 2, 4):
             report(f"B: 256+256 d8 (rep {rep})", 2.0, nbytes,
-                   lambda: pf.gemv_d8(tags16, books8_c, rs, rm32, xp, R, nch8, y, rep), ref)
-        del vals, t8
+                   [lambda t=t: pf.gemv_d8(t, books8_c, rs, rm32, xp, R, nch8, y, rep) for t in tcopies], ref)
+        del vals, t8, tcopies
     return 0
 
 
