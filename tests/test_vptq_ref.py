@@ -50,3 +50,28 @@ def test_decode_layout_matches_reference_construction():
     t["centroids.weight"] = cent.reshape(1, -1)
     t["res_centroids.weight"] = rcent.reshape(1, -1)
     assert torch.allclose(decode_linear(t, cfg), W, atol=1e-6)
+
+
+def test_source_reads_sharded_checkpoints(tmp_path, monkeypatch):
+    import json
+    import huggingface_hub
+    from safetensors.torch import save_file
+    from shapequant.vptq_ref import VPTQSource
+    a, b = torch.arange(6.0).view(2, 3), torch.ones(4)
+    save_file({"x.a": a}, str(tmp_path / "s1.safetensors"))
+    save_file({"y.b": b}, str(tmp_path / "s2.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"quantization_config": {"quant_method": "vptq", "config_for_layers": {}}}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"x.a": "s1.safetensors", "y.b": "s2.safetensors"}}))
+
+    def fake_download(repo, filename, revision=None):
+        p = tmp_path / filename
+        if not p.exists():
+            raise FileNotFoundError(filename)
+        return str(p)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    src = VPTQSource("fake/repo")
+    assert src.keys == {"x.a", "y.b"}
+    assert torch.equal(src.f.get_tensor("x.a"), a) and torch.equal(src.f.get_tensor("y.b"), b)

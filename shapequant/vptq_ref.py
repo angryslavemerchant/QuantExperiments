@@ -83,6 +83,19 @@ _PARTS = ("indices", "centroids.weight", "res_centroids.weight", "weight_scale",
           "outlier_indices", "outlier_centroids.weight", "perm")
 
 
+class _Sharded:
+    """get_tensor/keys over one or several safetensors files."""
+
+    def __init__(self, handles: dict, key_file: dict):
+        self.handles, self.key_file = handles, key_file
+
+    def keys(self):
+        return list(self.key_file)
+
+    def get_tensor(self, key):
+        return self.handles[self.key_file[key]].get_tensor(key)
+
+
 class VPTQSource:
     """Lazily opened VPTQ checkpoint; decodes one named block linear at a time."""
 
@@ -95,9 +108,21 @@ class VPTQSource:
         if qc.get("quant_method") != "vptq":
             raise ValueError(f"{repo} is not a VPTQ checkpoint")
         self.layers = qc["config_for_layers"]
-        self.f = safe_open(hf_hub_download(repo, "model.safetensors", revision=revision),
-                           framework="pt", device="cpu")
-        self.keys = set(self.f.keys())
+        try:
+            path = hf_hub_download(repo, "model.safetensors", revision=revision)
+            handles = {"model.safetensors": safe_open(path, framework="pt", device="cpu")}
+            key_file = {k: "model.safetensors" for k in handles["model.safetensors"].keys()}
+        except Exception as single_err:  # sharded checkpoint
+            try:
+                index = json.load(open(hf_hub_download(repo, "model.safetensors.index.json", revision=revision)))
+            except Exception:
+                raise single_err
+            key_file = index["weight_map"]
+            files = sorted(set(key_file.values()))
+            handles = {fn: safe_open(hf_hub_download(repo, fn, revision=revision), framework="pt", device="cpu")
+                       for fn in files}
+        self.f = _Sharded(handles, key_file)
+        self.keys = set(key_file)
 
     def matrix(self, hf_name: str, shape: tuple[int, int], device=None):
         """Returns (decoded float32 [R, C], storage bits, type label)."""

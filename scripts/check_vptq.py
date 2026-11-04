@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.machinery
 import importlib.util
 import json
 import subprocess
@@ -67,6 +68,11 @@ def load_vptq_ops(report: dict):
     r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "-q", VPTQ_WHEEL],
                        capture_output=True, text=True)
     report["pip"] = {"rc": r.returncode, "stderr": r.stderr[-2000:]}
+    # the real accelerate (a stub breaks transformers' own availability checks)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "accelerate"],
+                       capture_output=True, text=True)
+    report["pip_accelerate"] = {"rc": r.returncode, "stderr": r.stderr[-2000:]}
+    importlib.invalidate_caches()
     spec = importlib.util.find_spec("vptq")
     if spec is None:
         raise RuntimeError("vptq not importable after pip install")
@@ -76,12 +82,16 @@ def load_vptq_ops(report: dict):
     stubbed = []
     for top in ("accelerate", "sentence_transformers"):
         if not _installed(top):
-            sys.modules[top] = types.ModuleType(top)
+            m = types.ModuleType(top)
+            m.__spec__ = importlib.machinery.ModuleSpec(top, None)
+            sys.modules[top] = m
             stubbed.append(top)
     if "sentence_transformers" in stubbed:
-        sub = types.ModuleType("sentence_transformers.SentenceTransformer")
+        name = "sentence_transformers.SentenceTransformer"
+        sub = types.ModuleType(name)
+        sub.__spec__ = importlib.machinery.ModuleSpec(name, None)
         sub.SentenceTransformer = object
-        sys.modules["sentence_transformers.SentenceTransformer"] = sub
+        sys.modules[name] = sub
     report["stubbed"] = stubbed
     qg = importlib.import_module("vptq.ops.quant_gemm")
     report["cuda_kernels"] = bool(qg.__dict__.get("__cuda_ops_installed", False))
@@ -174,28 +184,9 @@ def main() -> int:
     def save():
         out.write_text(json.dumps(report, indent=1))
 
-    try:
-        qg = load_vptq_ops(report)
-    except Exception:
-        report["error"] = traceback.format_exc()
-        save()
-        log(report["error"])
-        return 0
-    log(f"vptq loaded; CUDA kernels: {report['cuda_kernels']}; stubbed {report['stubbed']}")
     dev = "cuda"
-    for repo in a.repos:
-        try:
-            report["repos"][repo] = layer_check(qg, repo, dev)
-        except Exception:
-            report["repos"][repo] = {"error": traceback.format_exc()}
-            log(report["repos"][repo]["error"])
-        save()
-    # bf16 activations and bf16 accumulation: agreement is ~1e-4 relative; a layout error is ~1.
-    report["layer_verdict"] = ("match" if all(r.get("max_rel_err", 1.0) < 1e-2 for r in report["repos"].values())
-                               else "MISMATCH or error")
-    log(f"layer verdict: {report['layer_verdict']}")
-    save()
-    if a.full:
+    model = None
+    if a.full:  # load transformers and the model before any vptq import or stub
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             cfg = yaml.safe_load(open(a.config))
@@ -210,7 +201,28 @@ def main() -> int:
             report["full_error"] = traceback.format_exc()
             save()
             log(report["full_error"])
-            return 0
+            model = None
+    try:
+        qg = load_vptq_ops(report)
+    except Exception:
+        report["error"] = traceback.format_exc()
+        save()
+        log(report["error"])
+        return 0
+    log(f"vptq loaded; CUDA kernels: {report['cuda_kernels']}; stubbed {report['stubbed']}")
+    for repo in a.repos:
+        try:
+            report["repos"][repo] = layer_check(qg, repo, dev)
+        except Exception:
+            report["repos"][repo] = {"error": traceback.format_exc()}
+            log(report["repos"][repo]["error"])
+        save()
+    # bf16 activations and bf16 accumulation: agreement is ~1e-4 relative; a layout error is ~1.
+    report["layer_verdict"] = ("match" if all(r.get("max_rel_err", 1.0) < 1e-2 for r in report["repos"].values())
+                               else "MISMATCH or error")
+    log(f"layer verdict: {report['layer_verdict']}")
+    save()
+    if model is not None:
         for repo in a.full:
             try:
                 report["full"][repo] = full_model(qg, repo, model, scorer, originals, dev)
