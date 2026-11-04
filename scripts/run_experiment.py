@@ -127,6 +127,16 @@ def stage0_checks(cfg: dict, model, rows: dict[str, dict], out_dir: Path) -> dic
     return report
 
 
+def export_packed(fits: dict, path: Path, cfg: dict, row_name: str, log) -> dict:
+    """Write the run's compressed matrices in the packed format (shapequant.packed)."""
+    from shapequant import packed
+    items = {n: packed.pack_matrix(f, **f.stats["pack"]) for n, f in fits.items()}
+    summary = packed.save(path, items, base_model=cfg["model"], extra={"run": row_name})
+    log(f"  exported {summary['matrices']} matrices to {path}: {summary['bpw']:.4f} bpw "
+        f"({path.stat().st_size / 1e6:.1f} MB)")
+    return summary
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -269,6 +279,8 @@ def main() -> int:
             return row
 
         evaluate(name, False, {})
+        if run.get("export") and not run.get("finetune"):
+            export_packed(fits, out_dir / "packed" / f"{name}.safetensors", cfg, name, log)
         if run.get("finetune"):
             from transformers import AutoModelForCausalLM as _AM
             from shapequant.finetune import finetune
@@ -276,6 +288,8 @@ def main() -> int:
             teacher = _AM.from_pretrained(cfg["model"], dtype=dtype).to(args.device).eval()
             d_by_name = {n: run["d"] for n in fits}
             ft_stats = finetune(model, teacher, fits, d_by_name, seqs, run["finetune"], log=log)
+            if run.get("export"):
+                export_packed(fits, out_dir / "packed" / f"{name}_ft.safetensors", cfg, f"{name}_ft", log)
             del teacher, fits
             torch.cuda.empty_cache()
             log(f"  fine-tune KL {ft_stats['ft_kl_first']:.4f} -> {ft_stats['ft_kl_last']:.4f}")

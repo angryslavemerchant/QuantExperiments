@@ -293,6 +293,17 @@ def _row_profiles(u: torch.Tensor, q: int = 16) -> torch.Tensor:
     return prof / prof.norm(dim=1, keepdim=True).clamp_min(1e-8)
 
 
+def seeded_perms(C: int, M: int, gen: torch.Generator) -> torch.Tensor:
+    """[M, C] int64 column orders: identity, then M-1 random permutations drawn
+    from `gen` (CPU). The packed format stores only the seed and regenerates
+    these, so this is the single source of the draw order."""
+    if M <= 1:
+        return torch.arange(C)[None]
+    rand = [torch.randperm(C, generator=gen) for _ in range(M)]
+    rand[0] = torch.arange(C)
+    return torch.stack(rand)
+
+
 def compress_mixture(
     w: torch.Tensor, h: torch.Tensor, d: int, K: int, *,
     G: int, M: int = 1, rounds: int = 4, row_init: str = "profile",
@@ -317,12 +328,7 @@ def compress_mixture(
     dev = w.device
     gen = torch.Generator(device="cpu").manual_seed(seed)
     rs = _row_scale(w)
-    if M > 1:
-        rand = [torch.randperm(C, generator=gen).to(dev) for _ in range(M)]
-        rand[0] = torch.arange(C, device=dev)
-        perms = torch.stack(rand)
-    else:
-        perms = torch.arange(C, device=dev)[None]
+    perms = seeded_perms(C, M, gen).to(dev)
     row_mask = torch.zeros(R, dtype=torch.long, device=dev)
     if row_init == "profile" and G > 1:
         prof = _row_profiles(w / rs[:, None])

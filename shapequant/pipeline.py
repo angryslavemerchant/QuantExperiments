@@ -106,8 +106,10 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
             select_frac=run.get("select_frac", 1.0), joint=run.get("joint"),
             iters=kcfg["iters"], refit_iters=kcfg.get("refit_iters", 10),
             max_fit_chunks=kcfg["max_fit_chunks"], seed=cb.layer_seed(seed, name),
-            batch=kcfg["assign_batch"], keep_tags=bool(run.get("finetune")),
+            batch=kcfg["assign_batch"], keep_tags=bool(run.get("finetune") or run.get("export")),
         )
+        fit.stats["pack"] = {"d": run["d"], "K": K, "G": run.get("G", 1), "M": run.get("M", 1),
+                             "seed": cb.layer_seed(seed, name)}
         bits = float(sum(fit.bits.values()))
         out = fit.decoded
         fit.decoded = None
@@ -168,7 +170,7 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
             out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source, importance)
             if "fit" in stats:
                 f = stats.pop("fit")
-                if run.get("finetune"):
+                if run.get("finetune") or run.get("export"):
                     fits[name] = f
                 nonid.append(stats.pop("mask_nonidentity"))
             if "log2K" in stats:

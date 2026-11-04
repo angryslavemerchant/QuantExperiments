@@ -114,6 +114,13 @@ class CodebookLinear(nn.Module):
         return out[self.unsort]
 
 
+def write_back(fit, wrap: "CodebookLinear") -> None:
+    """After bake(): store the trained (fp16-rounded) books and row scales in the
+    fit, in original row order, so the packed export carries them."""
+    fit.stats["books"] = [b.detach().half() for b in wrap.books]
+    fit.row_scale = wrap.rs[wrap.unsort].detach().clone()
+
+
 def _swap(model, fits: dict, d_by_name: dict):
     wrappers = {}
     for name, lin in compressible_linears(model):
@@ -174,6 +181,7 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
             for name, (parent, child, lin, wrap) in wrappers.items():
                 w = wrap.bake()
                 lin.weight.copy_(w.to(lin.weight.dtype))
+                write_back(fits[name], wrap)
                 setattr(parent, child, lin)
         for p in model.parameters():
             p.requires_grad_(False)
