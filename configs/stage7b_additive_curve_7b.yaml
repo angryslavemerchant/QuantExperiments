@@ -1,4 +1,4 @@
-# Stage 7b: format A's quality-vs-size curve ends (2.0 and 3.5 bpw), same recipe as Stage 7.
+# Stage 7b: format A at 2.0 bpw (the IQ2_XS/XXS regime), same recipe as Stage 7. (3.5 bpw dropped for budget.)
 #
 # Batch-1 GEMV profiling (scripts/bench_gemv.py, bench_formats.py) showed the
 # free 1024-16384-entry codebooks are limited by random table lookups (shared-
@@ -62,4 +62,3 @@ kmeans:
 runs:
   - {name: original, method: original}
   - {name: s7_alloc20, method: stack, d: 4, alloc: fisher, budget: "uniform:16x16", M: 16, rounds: 2, select_frac: 1.0, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
-  - {name: s7_alloc35, method: stack, d: 4, alloc: fisher, budget: "uniform:128x128", M: 16, rounds: 2, select_frac: 1.0, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
