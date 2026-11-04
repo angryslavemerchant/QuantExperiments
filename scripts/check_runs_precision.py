@@ -108,8 +108,7 @@ def main() -> int:
                 xh = X[t].half()
                 ref = Wd @ xh.float()
                 ymax = max(ymax, float(ref.abs().max()))
-                xp_all = xh[lin.perms_l].contiguous()
-                outs = {"runs": proto_runs.gemv(rl, xh, xp=xp_all).float(),
+                outs = {"runs": proto_runs.gemv(rl, xh).float(),
                         "cur": cuda_gemv.gemv(lin, xh).float(),
                         "fp16": torch.mv(Wd.half(), xh).float()}
                 for k, y in outs.items():

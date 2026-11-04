@@ -30,8 +30,9 @@ extern "C" __global__ void __launch_bounds__(THREADS)
 gemv_packed(const u32* __restrict__ words, const uint2* __restrict__ table,
             const __half* __restrict__ row_scale, const int* __restrict__ book_off,
             const int* __restrict__ row_mask, const uint2* __restrict__ xp,
-            __half* __restrict__ y, int R, int NG, int table_n)
+            __half* __restrict__ y, int R, int NG, int table_n, const float* __restrict__ yscale)
 {
+    const float ys = yscale[0];
     extern __shared__ uint2 stab[];
 #if SMEM
     for (int i = threadIdx.x; i < table_n; i += blockDim.x) stab[i] = table[i];
@@ -105,7 +106,7 @@ gemv_packed(const u32* __restrict__ words, const uint2* __restrict__ table,
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-        if (lane == 0) y[row] = __float2half(acc * __half2float(row_scale[row]));
+        if (lane == 0) y[row] = __float2half(acc * ys * __half2float(row_scale[row]));
     }
 }
 """
@@ -125,6 +126,21 @@ def _kernel(bits: int, smem: bool, has_mask: bool, unroll: int = 4, threads: int
     return _modules[key]
 
 
+TABLE_MAX = 0.5   # |codeword| bound after scaling: 2 products of |x| <= 65504 per half lane stay finite
+
+
+def _scaled_table(lin):
+    """Power-of-two-scaled copy of lin.table (max|codeword| <= TABLE_MAX) and the 1-element
+    fp32 y scale undoing it; cached on lin. Normalized codewords times outlier activations
+    otherwise overflow the fp16 products (seen on Qwen2.5-7B layer 26 down_proj, |x| = 5536)."""
+    cached = lin.__dict__.get("_scaled_table")
+    if cached is None or cached[0] is not lin.table:
+        from .proto_runs import scaled_table
+        cached = (lin.table, *scaled_table(lin.table, TABLE_MAX))
+        lin.__dict__["_scaled_table"] = cached
+    return cached[1], cached[2]
+
+
 def supported(lin) -> bool:
     return lin.d == 4 and lin.nch % 32 == 0 and lin.W == lin.nch * lin.bits // 32
 
@@ -139,6 +155,7 @@ def gemv(lin, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: i
         raise ValueError("x must be fp16")
     y = out if out is not None else torch.empty(lin.R, dtype=torch.float16, device=x.device)
     xp = (x[lin.perms_l] if lin.has_mask else x[None]).contiguous()
+    table, yscale = _scaled_table(lin)
     table_bytes = lin.table.numel() * 2
     smem = table_bytes <= SMEM_LIMIT
     fn = _kernel(lin.bits, smem, lin.has_mask, unroll, threads)
@@ -147,9 +164,9 @@ def gemv(lin, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: i
     grid = min(sms * blocks_per_sm, math.ceil(lin.R / warps))
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
         fn((grid,), (threads,),
-           (cp.uint64(lin.words.data_ptr()), cp.uint64(lin.table.data_ptr()),
+           (cp.uint64(lin.words.data_ptr()), cp.uint64(table.data_ptr()),
             cp.uint64(lin.row_scale.data_ptr()), cp.uint64(lin.book_off.data_ptr()),
             cp.uint64(lin.row_mask.data_ptr()), cp.uint64(xp.data_ptr()), cp.uint64(y.data_ptr()),
-            cp.int32(lin.R), cp.int32(lin.nch // 32), cp.int32(lin.table.shape[0])),
+            cp.int32(lin.R), cp.int32(lin.nch // 32), cp.int32(lin.table.shape[0]), cp.uint64(yscale.data_ptr())),
            shared_mem=table_bytes if smem else 0)
     return y

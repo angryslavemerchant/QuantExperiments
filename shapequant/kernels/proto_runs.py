@@ -28,11 +28,13 @@ _SRC = r"""
 #include <cuda_fp16.h>
 typedef unsigned int u32;
 #define NWB (BITS / 2)                       // words per lane per full batch (16 tags)
-#define NWT ((JT * 2 * BITS + 31) / 32)      // words per lane in the tail
-#define WROW (NFULL * 32 * NWB + 32 * NWT)
+#define NWT ((JT * 2 * BITS + 31) / 32)      // aligned words per lane in the tail (after realignment)
+#define WROW (NFULL * 32 * NWB + JT * 2 * BITS)   // tail: one unpadded bitstream, 32 lanes x JT*2*BITS bits
 
-// one batch of NT tags per lane for RU rows sharing the same x (same column order)
-template <int NT, int NWD>
+// one batch of NT tags per lane for RU rows sharing the same x (same column order).
+// TAIL: the lanes' tags form one contiguous bitstream (no per-lane padding); each lane
+// loads NWD+1 words and realigns them with a funnel shift by its bit offset.
+template <int NT, int NWD, bool TAIL>
 __device__ __forceinline__ void batch(const u32* const* __restrict__ wrow, int off, const uint4* __restrict__ x0,
                                       const uint2* const* __restrict__ tbr, int lane, float* acc)
 {
@@ -40,15 +42,31 @@ __device__ __forceinline__ void batch(const u32* const* __restrict__ wrow, int o
     uint4 xv[NT / 2];
     #pragma unroll
     for (int i = 0; i < NT / 2; ++i) xv[i] = __ldg(x0 + i * 32 + lane);
-    u32 w[RU][NWD + 1];
-    #pragma unroll
-    for (int r = 0; r < RU; ++r) {
+    // full batches: all rows' words are loaded up front (memory-level parallelism);
+    // tail: rows are loaded and decoded one at a time (the realignment needs extra registers)
+    constexpr int RW = TAIL ? 1 : RU;
+    u32 w[RW][NWD + 1];
+    if constexpr (!TAIL) {
         #pragma unroll
-        for (int i = 0; i < NWD; ++i) w[r][i] = wrow[r] ? __ldg(wrow[r] + off + lane * NWD + i) : 0u;
-        w[r][NWD] = 0u;
+        for (int r = 0; r < RU; ++r) {
+            #pragma unroll
+            for (int i = 0; i < NWD; ++i) w[r][i] = wrow[r] ? __ldg(wrow[r] + off + lane * NWD + i) : 0u;
+            w[r][NWD] = 0u;
+        }
     }
     #pragma unroll
     for (int r = 0; r < RU; ++r) {
+        const int ri = TAIL ? 0 : r;
+        if constexpr (TAIL) {
+            const int start = lane * NT * BITS, w0 = start >> 5, sh0 = start & 31;
+            u32 raw[NWD + 1];
+            #pragma unroll
+            for (int i = 0; i <= NWD; ++i)
+                raw[i] = (wrow[r] && w0 + i < NT * BITS) ? __ldg(wrow[r] + off + w0 + i) : 0u;
+            #pragma unroll
+            for (int i = 0; i < NWD; ++i) w[0][i] = __funnelshift_r(raw[i], raw[i + 1], sh0);
+            w[0][NWD] = 0u;
+        }
         #pragma unroll
         for (int q = 0; q < (NT + 3) / 4; ++q) {
             __half2 a = __float2half2_rn(0.f);
@@ -57,7 +75,7 @@ __device__ __forceinline__ void batch(const u32* const* __restrict__ wrow, int o
                 const int j = q * 4 + jj;
                 if (j >= NT) break;
                 const int bit = j * BITS, wi = bit >> 5, sh = bit & 31;
-                const u32 v = ((sh + BITS <= 32) ? (w[r][wi] >> sh) : __funnelshift_r(w[r][wi], w[r][wi + 1], sh)) & MASK;
+                const u32 v = ((sh + BITS <= 32) ? (w[ri][wi] >> sh) : __funnelshift_r(w[ri][wi], w[ri][wi + 1], sh)) & MASK;
                 const uint2 t = tbr[r][v];
                 const uint4 X = xv[j >> 1];
                 const u32 x0v = (j & 1) ? X.z : X.x, x1v = (j & 1) ? X.w : X.y;
@@ -74,8 +92,10 @@ extern "C" __global__ void __launch_bounds__(THREADS)
 gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
           const __half* __restrict__ row_scale, const int* __restrict__ book_off,
           const int* __restrict__ row_mask, const uint4* __restrict__ xp,
-          __half* __restrict__ y, const int* __restrict__ tiles, int ntiles, int table_n)
+          __half* __restrict__ y, const int* __restrict__ tiles, int ntiles, int table_n,
+          const float* __restrict__ yscale)
 {
+    const float ys = yscale[0];
     extern __shared__ uint2 stab[];
 #if SMEM
     for (int i = threadIdx.x; i < table_n; i += blockDim.x) stab[i] = table[i];
@@ -107,16 +127,16 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
         for (int r = 0; r < RU; ++r) acc[r] = 0.f;
         #pragma unroll 1
         for (int b = 0; b < NFULL; ++b)
-            batch<16, NWB>(wrow, b * 32 * NWB, xr + b * 8 * 32, tbr, lane, acc);
+            batch<16, NWB, false>(wrow, b * 32 * NWB, xr + b * 8 * 32, tbr, lane, acc);
 #if JT > 0
-        batch<JT * 2, NWT>(wrow, NFULL * 32 * NWB, xr + NFULL * 8 * 32, tbr, lane, acc);
+        batch<JT * 2, NWT, true>(wrow, NFULL * 32 * NWB, xr + NFULL * 8 * 32, tbr, lane, acc);
 #endif
         #pragma unroll
         for (int r = 0; r < RU; ++r) {
             float s = acc[r];
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-            if (lane == 0 && rows[r] >= 0) y[rows[r]] = __float2half(s * __half2float(row_scale[rows[r]]));
+            if (lane == 0 && rows[r] >= 0) y[rows[r]] = __float2half(s * ys * __half2float(row_scale[rows[r]]));
         }
     }
 }
@@ -135,7 +155,7 @@ def geometry(nch: int):
 
 def words_per_row(nch: int, bits: int) -> int:
     nfull, jt = geometry(nch)
-    return nfull * 32 * (bits // 2) + 32 * ((jt * 2 * bits + 31) // 32)
+    return nfull * 32 * (bits // 2) + jt * 2 * bits          # = nch * bits / 32: no padding
 
 
 def _pack_segments(t: torch.Tensor, bits: int) -> torch.Tensor:
@@ -164,9 +184,23 @@ def pack_lane_major(tags: torch.Tensor, bits: int) -> torch.Tensor:
         tf = t[:, :, :nfull * 8].reshape(R, 32, nfull, 16).transpose(1, 2)   # [R, b, lane, 16]
         parts.append(_pack_segments(tf.reshape(-1, 16), bits).view(R, -1))
     if jt:
-        tt = t[:, :, nfull * 8:].reshape(R * 32, jt * 2)
+        tt = t[:, :, nfull * 8:].reshape(R, 32 * jt * 2)                    # one lane-major stream per row
         parts.append(_pack_segments(tt, bits).view(R, -1))
+    assert sum(p.shape[1] for p in parts) == words_per_row(nch, bits)
     return torch.cat(parts, 1).contiguous()
+
+
+TABLE_MAX = 0.125   # |codeword| bound after scaling: 8 products of |x| <= 65504 sum to <= 65504 (half2 lane)
+
+
+def scaled_table(table: torch.Tensor, limit: float):
+    """Scale a codebook by a power of two so max|codeword| <= limit; the kernel multiplies
+    y by the returned 1-element fp32 tensor. With the bound, the fp16 partial sums cannot
+    overflow for any fp16 input (normalized codewords x outlier activations otherwise can)."""
+    cmax = float(table.float().abs().max())
+    k = 0 if cmax == 0 else int(torch.ceil(torch.log2(torch.tensor(cmax / limit))))
+    t = (table.float() * 2.0 ** -k).half()
+    return t, torch.tensor([2.0 ** k], dtype=torch.float32, device=table.device)
 
 
 def make_tiles(row_mask: torch.Tensor, ru: int) -> torch.Tensor:
@@ -202,6 +236,7 @@ class RunsLinear:
         self.words = pack_lane_major(tags.to(lin.table.device), lin.bits)
         self.table, self.row_scale, self.book_off = lin.table, lin.row_scale, lin.book_off
         self.row_mask, self.perms_l, self.has_mask = lin.row_mask, lin.perms_l, lin.has_mask
+        self.table, self.yscale = scaled_table(lin.table, TABLE_MAX)
 
     def clone(self):
         new = object.__new__(RunsLinear)
@@ -213,12 +248,18 @@ class RunsLinear:
         return self.words.numel() * 4
 
 
+def prep_x(rl: RunsLinear, x: torch.Tensor) -> torch.Tensor:
+    """The M permuted copies of x; shareable by every matrix reading the same x with the same perms."""
+    return (x[rl.perms_l] if rl.has_mask else x[None]).contiguous()
+
+
 def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: int = 4,
          threads: int = 256, xp: torch.Tensor | None = None) -> torch.Tensor:
     import cupy as cp
     y = out if out is not None else torch.empty(rl.R, dtype=torch.float16, device=x.device)
     if xp is None:
-        xp = (x[rl.perms_l] if rl.has_mask else x[None]).contiguous()
+        xp = prep_x(rl, x)
+    yscale = rl.yscale
     table_bytes = rl.table.numel() * 2
     smem = table_bytes <= SMEM_LIMIT
     fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru)
@@ -230,6 +271,7 @@ def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, block
            (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()),
             cp.uint64(rl.row_scale.data_ptr()), cp.uint64(rl.book_off.data_ptr()),
             cp.uint64(rl.row_mask.data_ptr()), cp.uint64(xp.data_ptr()), cp.uint64(y.data_ptr()),
-            cp.uint64(rl.tiles.data_ptr()), cp.int32(nt), cp.int32(rl.table.shape[0])),
+            cp.uint64(rl.tiles.data_ptr()), cp.int32(nt), cp.int32(rl.table.shape[0]),
+            cp.uint64(yscale.data_ptr())),
            shared_mem=table_bytes if smem else 0)
     return y

@@ -61,6 +61,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bits", default="10,12")
     ap.add_argument("--ru", default="1,2,4")
+    ap.add_argument("--cfgs", default="256x4", help="launch configs THREADSxBLOCKS_PER_SM, comma-separated")
     a = ap.parse_args()
     print(f"{torch.cuda.get_device_name(0)}; M={M}; times are per call (CUDA graph, weights rotated over >= 4x L2)")
     print(f"{'matrix':13s} {'kernel':26s} {'us':>8s} {'vs Q4':>7s} {'vs fp16':>8s} {'rel err':>8s}")
@@ -103,11 +104,15 @@ def main() -> int:
                     for ru in [int(v) for v in a.ru.split(",")]:
                         rl = proto_runs.RunsLinear(lin, tags, ru)
                         lins = [rl] + [rl.clone() for _ in range(copies_for(rl.stored_bytes()) - 1)]
-                        y.zero_()
-                        got = proto_runs.gemv(lins[0], x, y, xp=xp).float()
-                        err = float((got - ref).abs().max() / ref.abs().max())
-                        t = timeit([lambda l=l: proto_runs.gemv(l, x, y, xp=xp) for l in lins])
-                        report(f"K{K} runs+xp RU{ru} {pat}", t, err)
+                        for cfg in a.cfgs.split(","):
+                            th, bps = (int(v) for v in cfg.split("x"))
+                            y.zero_()
+                            got = proto_runs.gemv(lins[0], x, y, xp=xp, threads=th, blocks_per_sm=bps).float()
+                            err = float((got - ref).abs().max() / ref.abs().max())
+                            t = timeit([lambda l=l: proto_runs.gemv(l, x, y, xp=xp, threads=th, blocks_per_sm=bps)
+                                        for l in lins])
+                            tag = "" if cfg == "256x4" else f" {cfg}"
+                            report(f"K{K} runs+xp RU{ru}{tag} {pat}", t, err)
                         del rl, lins
                     del lin
         torch.cuda.empty_cache()
