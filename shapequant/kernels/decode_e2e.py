@@ -237,15 +237,16 @@ class Q4Lin:
 class RunsLin:
     """Lane-interleaved run kernel (proto_runs). threads = 0: one block per SM (small matrices)."""
 
-    def __init__(self, rl, threads=512, blocks_per_sm=1, pipe=True):
+    def __init__(self, rl, threads=512, blocks_per_sm=1, pipe=False):
         self.rl, self.R, self.C = rl, rl.R, rl.nch * 4
         assert self.C < 32768
         self.perms = rl.perms_l.to(torch.int16).contiguous() if rl.has_mask else None   # read as uint16
         self.threads, self.bps, self.pipe = threads, blocks_per_sm, pipe
 
     @classmethod
-    def random(cls, R, C, bits, perms, g: torch.Generator, ru=1, dev="cuda", **launch):
-        """Random tags/codebook (speed only). perms: int64 [M, C] column orders (shared within a group)."""
+    def random(cls, R, C, bits, perms, g: torch.Generator, ru=1, dev="cuda", G=1, **launch):
+        """Random tags/codebook (speed only). perms: int64 [M, C] column orders (shared within a group).
+        G: mixture books (table G*K rows, each row picks one)."""
         from . import proto_runs as pr
         M = perms.shape[0]
         K = 1 << bits
@@ -253,10 +254,10 @@ class RunsLin:
         rl.ru, rl.R, rl.nch, rl.bits = ru, R, C // 4, bits
         rl.words = torch.randint(-2 ** 31, 2 ** 31 - 1, (R, pr.words_per_row(C // 4, bits)), dtype=torch.int32,
                                  device=dev, generator=g)
-        rl.table, rl.yscale = pr.scaled_table((torch.randn(K, 4, device=dev, generator=g) * 0.5).half(),
+        rl.table, rl.yscale = pr.scaled_table((torch.randn(G * K, 4, device=dev, generator=g) * 0.5).half(),
                                               pr.TABLE_MAX)
         rl.row_scale = (torch.rand(R, device=dev, generator=g) * 0.02 + 0.01).half()
-        rl.book_off = torch.zeros(R, dtype=torch.int32, device=dev)
+        rl.book_off = (torch.randint(0, G, (R,), device=dev, generator=g) * K).to(torch.int32)
         rl.has_mask = M > 1
         rl.row_mask = (torch.randint(0, M, (R,), device=dev, generator=g) if M > 1
                        else torch.zeros(R, dtype=torch.int64, device=dev)).to(torch.int32)
@@ -269,7 +270,7 @@ class RunsLin:
         pr.gemv(self.rl, xp, y, xp=xp, threads=self.threads, blocks_per_sm=self.bps, pipe=self.pipe)
 
     def nbytes(self):
-        return self.rl.stored_bytes() + self.rl.R * 2
+        return self.rl.stored_bytes() + self.rl.R * 2 + self.rl.table.numel() * 2
 
 
 # ---------------------------------------------------------------- engine
@@ -441,22 +442,29 @@ class DecodeEngine:
 # ---------------------------------------------------------------- builders
 
 def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int = 1, large=(512, 1),
-                  small=(0, 1), pipe=True, embed_rows: int = 32768, seed: int = 0, dev="cuda") -> DecodeEngine:
+                  small=(0, 1), pipe=False, embed_rows: int = 32768, seed: int = 0, dev="cuda",
+                  G: int = 1, alloc: dict | None = None, head_bits: int | None = None) -> DecodeEngine:
     """Random-weight engine (speed only). kind: fp16 | q4 | runs. Column orders are shared within
     q/k/v and gate/up; each layer/group draws its own. embed_rows: the token embedding is only read
-    one row per step, so a truncated table (tok % rows) keeps memory down without changing speed."""
+    one row per step, so a truncated table (tok % rows) keeps memory down without changing speed.
+    runs only: G mixture books per matrix; alloc {"model.layers.i.self_attn.q_proj": K, ...} gives
+    per-matrix K (missing -> `bits`); head_bits: lm_head tag bits (default `bits`, always G=1)."""
     from .. import masks as mk
     g = torch.Generator(device=dev).manual_seed(seed)
     gc = torch.Generator().manual_seed(seed + 1)
     H, I, NH, NKV, HD = cfg.hidden, cfg.inter, cfg.n_heads, cfg.n_kv, cfg.head_dim
 
-    def lin(R, C, perms):
+    def lin(R, C, perms, name=None):
         if kind == "fp16":
             return DenseLin(torch.randn(R, C, device=dev, generator=g, dtype=torch.float16) * 0.02)
         if kind == "q4":
             return Q4Lin.random(R, C, g, dev)
         th, bps = small if R <= 4096 else large
-        return RunsLin.random(R, C, bits, perms, g, ru=ru, dev=dev, threads=th, blocks_per_sm=bps, pipe=pipe)
+        if name is None:
+            b, gg = head_bits or bits, 1
+        else:
+            b, gg = (int(alloc[name]).bit_length() - 1 if alloc and name in alloc else bits), G
+        return RunsLin.random(R, C, b, perms, g, ru=ru, dev=dev, threads=th, blocks_per_sm=bps, pipe=pipe, G=gg)
 
     def perms(C):
         return mk.seeded_perms(C, M, gc) if kind == "runs" else None
@@ -465,11 +473,14 @@ def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int =
         return (torch.randn(n, device=dev, generator=g) * s + base).half()
 
     layers = []
-    for _ in range(cfg.layers):
+    for i in range(cfg.layers):
         pa, po, pg, pd = perms(H), perms(H), perms(H), perms(I)
+        a, m = f"model.layers.{i}.self_attn.", f"model.layers.{i}.mlp."
         layers.append(dict(ln1=vec(H, 0.1, 1.0), ln2=vec(H, 0.1, 1.0),
-                           q=lin(NH * HD, H, pa), k=lin(NKV * HD, H, pa), v=lin(NKV * HD, H, pa),
-                           o=lin(H, NH * HD, po), gate=lin(I, H, pg), up=lin(I, H, pg), down=lin(H, I, pd),
+                           q=lin(NH * HD, H, pa, a + "q_proj"), k=lin(NKV * HD, H, pa, a + "k_proj"),
+                           v=lin(NKV * HD, H, pa, a + "v_proj"), o=lin(H, NH * HD, po, a + "o_proj"),
+                           gate=lin(I, H, pg, m + "gate_proj"), up=lin(I, H, pg, m + "up_proj"),
+                           down=lin(H, I, pd, m + "down_proj"),
                            bq=vec(NH * HD, 0.1), bk=vec(NKV * HD, 0.1), bv=vec(NKV * HD, 0.1)))
         torch.cuda.empty_cache()
     head = lin(cfg.vocab, H, perms(H))

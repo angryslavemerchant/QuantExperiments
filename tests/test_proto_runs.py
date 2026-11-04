@@ -48,6 +48,20 @@ def test_mixture_books():
     assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3
 
 
+@pytest.mark.parametrize("bits", [8, 10, 12, 14])
+@pytest.mark.parametrize("R,C", [(512, 3584), (256, 18944)])
+def test_stack_bits_with_four_books(R, C, bits):
+    """The real stacks' per-matrix K (256..16384) with G = 4: tables of 8 KB..512 KB, the
+    larger ones read through L1 (global path)."""
+    lin, tags = _lin(R, C, bits, G=4)
+    rl = proto_runs.RunsLinear(lin, tags, 1)
+    x = torch.randn(C, device="cuda").half()
+    ref = lin.dense() @ x.float()
+    for cfg in ((512, 1), (0, 1)):
+        y = proto_runs.gemv(rl, x, threads=cfg[0], blocks_per_sm=cfg[1]).float()
+        assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3, cfg
+
+
 @pytest.mark.parametrize("kernel", ["runs", "cur"])
 def test_outlier_activation_does_not_overflow(kernel):
     lin, tags = _lin(256, 3584, 10)

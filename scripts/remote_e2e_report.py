@@ -4,7 +4,7 @@
 2. scripts/bench_e2e.py (greedy decode tg128 on Qwen2.5-7B shapes, random
    weights, one CUDA graph per token): fp16 / our Q4 reference / runs at 2.5
    and 3 bpw, for a few launch configs (RU, large-matrix config, software
-   pipeline on/off). Small matrices use one block per SM (threads=0).
+   pipeline on/off; off by default since s11). Small matrices use one block per SM (threads=0).
 3. scripts/bench_runs.py per-shape sweep of the same configs (random tags).
 4. llama-bench tg128 on the same box for Q4_0 and IQ2_M (bartowski GGUFs), so
    the comparison does not depend on a different host's clocks.
@@ -31,9 +31,8 @@ from remote_runs_report import llama_step, run  # noqa: E402
 ROOT = Path(__file__).resolve().parent
 E2E_CONFIGS = [  # name, variants, extra args
     ("ru1_512x2", "q4,runs10,runs12,fp16", ["--ru", "1", "--large", "512x2"]),
-    ("ru1_512x2_nopipe", "runs10,runs12", ["--ru", "1", "--large", "512x2", "--no-pipe"]),
+    ("ru1_512x2_pipe", "runs10,runs12", ["--ru", "1", "--large", "512x2", "--pipe"]),
     ("ru1_1024x1", "runs10,runs12", ["--ru", "1", "--large", "1024x1"]),
-    ("ru1_1024x1_nopipe", "runs10,runs12", ["--ru", "1", "--large", "1024x1", "--no-pipe"]),
     ("ru2_512x2", "runs10,runs12", ["--ru", "2", "--large", "512x2"]),
     ("ru1_256x4_small256x4", "runs10,runs12", ["--ru", "1", "--large", "256x4", "--small", "256x4"]),
 ]

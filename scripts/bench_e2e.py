@@ -4,7 +4,10 @@ Comparable to `llama-bench -n 128 -p 0` (tg128): batch 1, generation from an
 empty context, whole step in one CUDA graph. Variants:
   fp16    cuBLAS GEMV (needs ~16 GB)
   q4      our Q4_0-like reference kernel (4.5 bpw, same matmul efficiency as llama.cpp Q4_0 on the 5090)
-  runsB   the lane-interleaved run kernel, B-bit tags per 4 weights (10 -> 2.5 bpw, 12 -> 3 bpw)
+  runsB   the lane-interleaved run kernel, B-bit tags per 4 weights (10 -> 2.5 bpw, 12 -> 3 bpw), G=1
+  s4, s5  the real quality stacks' structure: per-matrix K from the s04 (2.5 bpw) / s05 (3 bpw)
+          Fisher allocation, G=4 mixture books (tables over 48 KB read through L1); lm_head
+          uses --head-bits, G=1 (the KL evals kept lm_head unquantized)
 Also times the linears alone (same kernels, same order) to split GEMV vs the rest.
 The lm_head uses the variant's format too (llama.cpp Q4_0 models keep it at Q6_K / Q8_0).
 
@@ -23,6 +26,50 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shapequant.kernels import decode_e2e as de  # noqa: E402
 
+ALLOC = {
+    "s4": ("artifacts/remote/s04_qwen7b_stack_seed0_20261103a/extracted/artifacts/qwen_s01/stage4_stack_7b/"
+           "allocation.json", "s4_full"),
+    "s5": ("artifacts/remote/s05_qwen7b_stack3b_seed0_20261103a/extracted/artifacts/qwen_s01/stage5_stack3b_7b/"
+           "allocation.json", "s5_full"),
+}
+TYPES = ("q", "k", "v", "o", "gate", "up", "down")
+
+
+def load_alloc(path, run):
+    """{matrix name: K} chosen for `run` (allocation.json is written by the quantizer)."""
+    return json.loads((Path(__file__).resolve().parents[1] / path).read_text())["choices"][run]
+
+
+def breakdown(eng, reps=20):
+    """us per token spent in each linear type (all layers), each type captured in its own graph."""
+    ys = dict(q=eng.yq, k=eng.yk, v=eng.yv, o=eng.yo, gate=eng.yg, up=eng.yu, down=eng.yd)
+    out = {}
+    for n in TYPES + ("head",):
+        def body():
+            if n == "head":
+                eng.lm_head.run(eng.xp, eng.logits)
+            else:
+                for L in eng.layers:
+                    L[n].run(eng.xp, ys[n])
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            body()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            body()
+        ts = []
+        for _ in range(3):
+            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            a.record()
+            for _ in range(reps):
+                g.replay()
+            b.record()
+            torch.cuda.synchronize()
+            ts.append(a.elapsed_time(b) * 1e3 / reps)
+        out[n] = sorted(ts)[1]
+    return out
+
 
 def cfg_pair(s):
     th, bps = (int(v) for v in s.split("x"))
@@ -37,19 +84,26 @@ def main() -> int:
     ap.add_argument("--ru", type=int, default=1)
     ap.add_argument("--large", default="512x2", help="launch config THREADSxBLOCKS_PER_SM for matrices with > 4096 rows")
     ap.add_argument("--small", default="0x1", help="launch config for the rest (0 = one block per SM, auto size)")
-    ap.add_argument("--no-pipe", action="store_true")
+    ap.add_argument("--pipe", action="store_true", help="software pipeline (slower on the 2060 and the 5090)")
+    ap.add_argument("--G", type=int, default=4, help="mixture books for s4/s5")
+    ap.add_argument("--head-bits", type=int, default=0, help="lm_head bits for s4/s5 (0: 10 for s4, 12 for s5)")
+    ap.add_argument("--breakdown", action="store_true", help="also time each linear type alone (us/token)")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     cfg = de.Cfg(layers=a.layers)
     print(f"{torch.cuda.get_device_name(0)}; Qwen2.5-7B shapes, {a.layers} layers, tg{a.tokens}, "
-          f"runs: RU{a.ru} large {a.large} small {a.small} pipe {not a.no_pipe}", flush=True)
+          f"runs: RU{a.ru} large {a.large} small {a.small} pipe {a.pipe}", flush=True)
     print(f"{'variant':10s} {'weights GB':>10s} {'tok/s':>8s} {'ms/tok':>8s} {'GEMV ms':>8s} {'other ms':>9s} {'GEMV GB/s':>10s}")
     rows = []
     for v in a.variants.split(","):
         kind, bits = ("runs", int(v[4:])) if v.startswith("runs") else (v, 0)
+        extra = {}
+        if v in ALLOC:
+            kind, bits = "runs", 10 if v == "s4" else 12
+            extra = dict(alloc=load_alloc(*ALLOC[v]), G=a.G, head_bits=a.head_bits or bits)
         try:
             eng = de.random_engine(cfg, kind, bits=bits or 10, ru=a.ru, large=cfg_pair(a.large),
-                                   small=cfg_pair(a.small), pipe=not a.no_pipe)
+                                   small=cfg_pair(a.small), pipe=a.pipe, **extra)
         except torch.OutOfMemoryError:
             print(f"{v:10s} out of memory", flush=True)
             torch.cuda.empty_cache()
@@ -64,6 +118,9 @@ def main() -> int:
         rows.append(r)
         print(f"{v:10s} {gb:10.2f} {1 / t:8.1f} {t * 1e3:8.3f} {tl * 1e3:8.3f} {(t - tl) * 1e3:9.3f} {gb / tl:10.0f}",
               flush=True)
+        if a.breakdown:
+            r["breakdown_us"] = bd = breakdown(eng)
+            print("           us/token: " + " ".join(f"{k} {x:.0f}" for k, x in bd.items()), flush=True)
         del eng
         torch.cuda.empty_cache()
     if a.json:

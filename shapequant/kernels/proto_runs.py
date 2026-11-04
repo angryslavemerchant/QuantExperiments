@@ -308,7 +308,7 @@ def prep_x(rl: RunsLinear, x: torch.Tensor) -> torch.Tensor:
 
 
 def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: int = 4,
-         threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = True) -> torch.Tensor:
+         threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = False) -> torch.Tensor:
     """table: "smem" copies the codebook into shared memory per block, "global" reads it through
     L1 (no per-block copy: cheaper for small matrices, where the copies dominate), "auto" = smem
     when it fits. threads=0: one block per SM sized to cover all tiles in one round (small
