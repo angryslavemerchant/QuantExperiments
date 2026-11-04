@@ -80,3 +80,23 @@ def test_probe_sends_token_unredirected_to_hf_only(monkeypatch, url, authed):
     req = seen["req"]
     assert "Authorization" not in req.headers                 # never forwarded on redirects
     assert (req.unredirected_hdrs.get("Authorization") == "Bearer hf_abc") == authed
+
+
+def test_diagnostic_tail_makes_progress_output_readable():
+    raw = "Cloning into 'repo'...\rReceiving objects:  50%\rReceiving objects: 100%\r\n\x1b[31mERROR: boom\x1b[0m\n"
+    out = ops._diagnostic_tail(raw)
+    assert "\r" not in out and "\x1b" not in out
+    assert out.endswith("ERROR: boom")
+    assert ops._redacted_diagnostic_text(out) == out          # no longer withheld wholesale
+
+
+def test_diagnostic_tail_keeps_only_the_end():
+    out = ops._diagnostic_tail("x" * 10_000 + "\nlast line", limit=100)
+    assert len(out) == 100 and out.endswith("last line")
+
+
+def test_secrets_still_redacted_after_normalizing(monkeypatch):
+    monkeypatch.setattr(ops, "load_secrets", lambda: {"HF_TOKEN": "hf_supersecretvalue123", "VAST_API_KEY": "vk_abcdef0123456789"})
+    raw = "progress\rauth hf_supersecretvalue123 failed\r\nkey vk_abcdef0123456789\n"
+    out = ops._redacted_diagnostic_text(ops._diagnostic_tail(raw))
+    assert "hf_supersecretvalue123" not in out and "vk_abcdef0123456789" not in out

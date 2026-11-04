@@ -3414,9 +3414,29 @@ def remote_exec(
     if check and process.returncode != 0:
         raise OpsError(
             "remote command failed: "
-            + _redacted_diagnostic_text(process.stderr.strip())
+            + _redacted_diagnostic_text(_diagnostic_tail(process.stderr))
         )
     return process
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
+DIAGNOSTIC_TAIL_CHARACTERS = 2000
+
+
+def _diagnostic_tail(text: str, limit: int = DIAGNOSTIC_TAIL_CHARACTERS) -> str:
+    """Make remote tool output (git/pip progress bars, colors) redactable.
+
+    Progress output uses carriage returns and ANSI escapes, which made the
+    redactor withhold whole messages. Normalize CR to newline, drop ANSI
+    escapes and remaining control characters (keeping newline and tab), and
+    keep only the last `limit` characters. Callers still pass the result
+    through _redacted_diagnostic_text, which strips secrets.env values.
+    """
+
+    text = _ANSI_ESCAPE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = "".join(c for c in text if c in "\n\t" or (32 <= ord(c) < 127) or ord(c) > 159)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    return text[-limit:]
 
 
 def wait_for_ssh(
@@ -3697,14 +3717,34 @@ def start_remote_run(
             install,
             timeout=_deadline_timeout_seconds(deadline_monotonic, default=1200),
         )
-    remote_exec(
-        connection,
-        command,
-        timeout=_deadline_timeout_seconds(
-            deadline_monotonic, default=BOOTSTRAP_TIMEOUT_SECONDS
-        ),
-        stdin_text=_hf_token_stdin(),
-    )
+    try:
+        remote_exec(
+            connection,
+            command,
+            timeout=_deadline_timeout_seconds(
+                deadline_monotonic, default=BOOTSTRAP_TIMEOUT_SECONDS
+            ),
+            stdin_text=_hf_token_stdin(),
+        )
+    except OpsError as bootstrap_error:
+        # The bootstrap sends its tools' output to bootstrap.log, so the SSH
+        # error alone says nothing. Attach the log tail (sanitized + redacted);
+        # best effort and short, so it never delays cleanup materially.
+        raise OpsError(f"{bootstrap_error} | bootstrap.log tail: {_bootstrap_log_tail(connection)}") from None
+
+
+def _bootstrap_log_tail(connection: tuple[str, str, int]) -> str:
+    try:
+        process = remote_exec(
+            connection,
+            f"tail -c 6000 {REMOTE_OPS}/bootstrap.log 2>/dev/null; "
+            f"tail -n 3 {REMOTE_OPS}/events.jsonl 2>/dev/null",
+            check=False,
+            timeout=20,
+        )
+        return _redacted_diagnostic_text(_diagnostic_tail(process.stdout))
+    except Exception:
+        return "[unavailable]"
 
 
 def start_remote_session_stage(
