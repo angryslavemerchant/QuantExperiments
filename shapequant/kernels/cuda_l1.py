@@ -66,10 +66,9 @@ def _kernel(bits: int, has_mask: bool, threads: int, unroll: int):
     import cupy as cp
     key = (bits, has_mask, threads, unroll)
     if key not in _modules:
-        major, minor = torch.cuda.get_device_capability()
         defs = {"BITS": bits, "HAS_MASK": int(has_mask), "THREADS": threads, "UNROLL": unroll}
         src = "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _SRC
-        mod = cp.RawModule(code=src, options=(f"-arch=sm_{major}{minor}", "-std=c++17", "--use_fast_math"))
+        mod = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math"))
         _modules[key] = mod.get_function("gemv_l1")
     return _modules[key]
 

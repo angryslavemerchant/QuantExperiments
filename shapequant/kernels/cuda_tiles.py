@@ -88,10 +88,9 @@ def _kernel(bits: int, smem_table: bool, threads: int, unroll: int):
     import cupy as cp
     key = (bits, smem_table, threads, unroll)
     if key not in _modules:
-        major, minor = torch.cuda.get_device_capability()
         src = (f"#define BITS {bits}\n#define SMEM_TABLE {int(smem_table)}\n#define THREADS {threads}\n"
                f"#define UNROLL {unroll}\n") + _SRC
-        mod = cp.RawModule(code=src, options=(f"-arch=sm_{major}{minor}", "-std=c++17", "--use_fast_math"))
+        mod = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math"))
         _modules[key] = mod.get_function("gemv_tiles")
     return _modules[key]
 

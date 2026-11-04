@@ -36,8 +36,7 @@ def read_bandwidth(seconds: float = 6.0) -> float:
 
 _PROBE = (
     "import cupy as cp, torch\n"
-    "k = cp.RawKernel(r'extern \"C\" __global__ void f(float* x){x[threadIdx.x] += 1.f;}', 'f',\n"
-    "                 options=('-arch=sm_%d%d' % torch.cuda.get_device_capability(),))\n"
+    "k = cp.RawKernel(r'extern \"C\" __global__ void f(float* x){x[threadIdx.x] += 1.f;}', 'f')\n"
     "x = torch.zeros(32, device='cuda')\n"
     "k((1,), (32,), (cp.uint64(x.data_ptr()),)); torch.cuda.synchronize(); assert float(x.sum()) == 32\n"
 )
@@ -51,7 +50,7 @@ def ensure_cupy(log: list) -> bool:
             r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], capture_output=True, text=True)
             log.append({"pip": pkgs, "rc": r.returncode, "stderr": r.stderr[-1500:]})
         r = subprocess.run([sys.executable, "-c", _PROBE], capture_output=True, text=True)
-        log.append({"probe_rc": r.returncode, "stderr": r.stderr[-1500:]})
+        log.append({"probe_rc": r.returncode, "stderr": r.stderr[-4000:]})
         if r.returncode == 0:
             return True
     return False

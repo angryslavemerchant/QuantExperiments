@@ -91,11 +91,10 @@ def _kernel(bits: int, smem: bool, has_mask: bool, threads: int, U: int, table_p
     import cupy as cp
     key = (bits, smem, has_mask, threads, U, table_pad)
     if key not in _modules:
-        major, minor = torch.cuda.get_device_capability()
         defs = {"BITS": bits, "SMEM": int(smem), "HAS_MASK": int(has_mask), "THREADS": threads,
                 "U": U, "WBUF": _wbuf_words(bits, U), "TABLE_PAD": table_pad}
         src = "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _SRC
-        mod = cp.RawModule(code=src, options=(f"-arch=sm_{major}{minor}", "-std=c++17", "--use_fast_math"))
+        mod = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math"))
         _modules[key] = mod.get_function("gemv_slab")
     return _modules[key]
 

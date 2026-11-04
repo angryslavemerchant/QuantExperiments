@@ -120,9 +120,8 @@ def _fn(name: str, src: str, defs: dict):
     import cupy as cp
     key = (name, tuple(sorted(defs.items())))
     if key not in _mods:
-        major, minor = torch.cuda.get_device_capability()
         code = "".join(f"#define {k} {v}\n" for k, v in defs.items()) + src
-        _mods[key] = cp.RawModule(code=code, options=(f"-arch=sm_{major}{minor}", "--use_fast_math")).get_function(name)
+        _mods[key] = cp.RawModule(code=code, options=("--use_fast_math",)).get_function(name)
     return _mods[key]
 
 
