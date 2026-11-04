@@ -201,7 +201,7 @@ def main() -> int:
         # run's allocation is solved against its own budget.
         from shapequant import alloc as al
         acfg = cfg["allocation"]
-        Ks = tuple(acfg["Ks"])
+        Ks = tuple(tuple(k) if isinstance(k, (list, tuple)) else k for k in acfg["Ks"])
         names = [n for n, _ in compressible_linears(model)]
         fseqs = seqs[: acfg["fisher_sequences"]].reshape(-1, acfg["fisher_seq_len"])
         log(f"allocation: Fisher on {fseqs.shape[0]} x {fseqs.shape[1]} calibration tokens")
@@ -224,7 +224,7 @@ def main() -> int:
                 raise ValueError(f"unknown alloc {run['alloc']!r}")
             run["_K_by_name"] = {n: Ks[k] for n, k in zip(names, ch)}
             table["choices"][run["name"]] = run["_K_by_name"]
-            hist = {K: ch.count(i) for i, K in enumerate(Ks)}
+            hist = {str(K): ch.count(i) for i, K in enumerate(Ks)}
             log(f"  {run['name']}: {run['alloc']} allocation at {run['budget']}: K histogram {hist}")
         (out_dir / "allocation.json").write_text(json.dumps(table))
 

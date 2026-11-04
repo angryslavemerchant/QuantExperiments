@@ -173,5 +173,6 @@ def budget_bits(bits: list[list[float]], Ks: tuple[int, ...], spec) -> float:
     kind, val = str(spec).split(":")
     if kind != "uniform":
         raise ValueError(f"budget spec {spec!r}")
-    k = Ks.index(int(val))
+    key = tuple(int(v) for v in val.split("x")) if "x" in val else int(val)
+    k = Ks.index(key)
     return sum(b[k] for b in bits)

@@ -100,6 +100,28 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
         if importance is None or name not in importance:
             raise RuntimeError(f"{name}: stack method needs calibration statistics")
         K = run.get("_K_by_name", {}).get(name, run.get("K"))
+        if isinstance(K, (list, tuple)):
+            # additive codebook: codeword = sum of one entry per book (kernel-
+            # friendly tiny books); masks as seeded orders, rows choose on all chunks
+            if run.get("G", 1) != 1:
+                raise ValueError("additive books do not combine with the mixture (G must be 1)")
+            Kt = tuple(int(k) for k in K)
+            M = run.get("M", 1)
+            fit = mk.compress_masked(
+                w, importance[name].to(w.device, torch.float32), run["d"], Kt, M=M,
+                init="identity+random" if M > 1 else "identity", rounds=run.get("rounds", 2),
+                select_frac=run.get("select_frac", 1.0), iters=kcfg["iters"],
+                refit_iters=kcfg.get("refit_iters", 10), max_fit_chunks=kcfg["max_fit_chunks"],
+                seed=cb.layer_seed(seed, name), batch=kcfg["assign_batch"],
+                keep_tags=bool(run.get("finetune") or run.get("export")),
+            )
+            fit.stats["pack"] = {"d": run["d"], "K": Kt, "G": 1, "M": M, "seed": cb.layer_seed(seed, name)}
+            bits = float(sum(fit.bits.values()))
+            out = fit.decoded
+            fit.decoded = None
+            usage = fit.stats["mask_usage"]
+            return out, bits, bits, {"fit": fit, "mask_nonidentity": 1.0 - usage[0] / max(1, sum(usage)),
+                                     "log2K": sum(math.log2(k) for k in Kt), "numel": R * C}
         fit = mk.compress_mixture(
             w, importance[name].to(w.device, torch.float32), run["d"], K,
             G=run.get("G", 1), M=run.get("M", 1), rounds=run.get("rounds", 2),

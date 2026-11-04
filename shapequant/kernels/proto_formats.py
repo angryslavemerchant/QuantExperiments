@@ -334,3 +334,75 @@ def gemv_add_wide(words, books, row_scale, tiles, xp, nch, y, rows: int):
                                  cp.uint64(tile_rows.data_ptr()), cp.uint64(xp.data_ptr()),
                                  cp.uint64(y.data_ptr()), cp.int32(T), cp.int32(nch)))
     return y
+
+
+# Q4 reference (llama.cpp Q4_0-like, 4.5 bpw): blocks of 32 weights = 16 bytes of
+# nibbles + one fp16 scale; w = (nibble - 8) * scale. Nibble -> half via the
+# 0x6400 exponent trick (one LOP3 per weight pair), so decode is cheap arithmetic.
+# Packing per 32-bit word (8 weights): weight pair (2k, 2k+1) = nibble k of the
+# low / high half-word.
+_SRC_Q4 = r"""
+#include <cuda_fp16.h>
+typedef unsigned int u32;
+extern "C" __global__ void __launch_bounds__(256)
+gemv_q4(const uint4* __restrict__ q, const __half* __restrict__ scales, const uint4* __restrict__ x,
+        __half* __restrict__ y, int R, int NB)
+{
+    const int lane = threadIdx.x & 31;
+    const __half2 k1032 = __float2half2_rn(1032.f);
+    for (int row = blockIdx.x * 8 + (threadIdx.x >> 5); row < R; row += gridDim.x * 8) {
+        const uint4* qr = q + (size_t)row * NB;
+        const __half* sr = scales + (size_t)row * NB;
+        float acc = 0.f;
+        #pragma unroll 2
+        for (int b = lane; b < NB; b += 32) {
+            const uint4 qq = __ldg(qr + b);
+            const __half2 s = __half2half2(sr[b]);
+            const u32 w[4] = {qq.x, qq.y, qq.z, qq.w};
+            __half2 part = __float2half2_rn(0.f);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint4 xv = __ldg(x + b * 4 + j);       // 8 inputs for word j
+                const __half2* xh = (const __half2*)&xv;
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    u32 v = ((w[j] >> (4 * k)) & 0x000F000Fu) | 0x64006400u;
+                    __half2 wv = __hsub2(*(__half2*)&v, k1032);
+                    part = __hfma2(wv, xh[k], part);
+                }
+            }
+            const float2 f = __half22float2(__hmul2(part, s));
+            acc += f.x + f.y;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) y[row] = __float2half(acc);
+    }
+}
+"""
+
+
+def q4_pack(w: torch.Tensor):
+    """w [R, C] float -> (q int32 [R, C/8], scales fp16 [R, C/32], dequantized fp32)."""
+    R, C = w.shape
+    blocks = w.reshape(R, C // 32, 32).float()
+    amax = blocks.abs().amax(-1).clamp_min(1e-8)
+    scale = (amax / 7.0).half().float()
+    n = (blocks / scale[..., None]).round().clamp(-8, 7) + 8               # 0..15
+    deq = ((n - 8) * scale[..., None]).reshape(R, C)
+    words8 = n.reshape(R, C // 8, 8).to(torch.int64)                       # 8 weights per word
+    word = torch.zeros(R, C // 8, dtype=torch.int64)
+    for k in range(4):
+        word |= words8[..., 2 * k] << (4 * k)                              # low half-word, nibble k
+        word |= words8[..., 2 * k + 1] << (16 + 4 * k)                     # high half-word, nibble k
+    word = torch.where(word >= (1 << 31), word - (1 << 32), word).to(torch.int32)
+    return word, scale.half(), deq
+
+
+def gemv_q4(q, scales, x, y, R, C):
+    import cupy as cp
+    fn = _fn("gemv_q4", _SRC_Q4, {})
+    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+        fn((_grid(R),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
+                                 cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R), cp.int32(C // 32)))
+    return y

@@ -62,6 +62,15 @@ def main() -> int:
             print(f"{label:13s} {name:28s} {bpw:5.2f} {t * 1e6:8.1f} {gbs:6.0f} {100 * gbs / a.bw:5.0f}% "
                   f"{t16 / t:6.2f}x {err:8.1e}")
 
+        # Q4 reference (llama.cpp Q4_0-like, 4.5 bpw)
+        w0 = torch.randn(R, C, generator=g) * 0.02
+        q, sc, deq = pf.q4_pack(w0)
+        q, sc = q.cuda(), sc.cuda()
+        ref = deq.cuda() @ x.float()
+        report("Q4 reference (4.5 bpw)", 4.5, q.numel() * 4 + sc.numel() * 2,
+               lambda: pf.gemv_q4(q, sc, x, y, R, C), ref)
+        del w0, deq, q, sc
+
         # current format, 10-bit free codebook, G=1 (best existing kernel)
         lin = synthetic(R, C, 10, 1, M)
         ref = lin.dense() @ x.float()
