@@ -119,6 +119,8 @@ def profile_step(out: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--skip-precision", action="store_true",
+                    help="skip the 7B precision check (needs a 15 GB HF download)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -142,6 +144,8 @@ def main() -> int:
     except Exception as e:
         (out / "profile_error.txt").write_text(repr(e))
         print("profile step failed:", repr(e), flush=True)
+    if a.skip_precision:
+        return 0
     run_to([sys.executable, str(ROOT / "check_runs_precision.py"), "--tokens", "64", "--capture-device", "cuda",
             "--out", str(out / "precision_7b.txt")], out / "precision_7b_log.txt")
     return 0

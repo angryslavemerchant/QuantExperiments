@@ -259,6 +259,9 @@ class RunManifest:
     interaction_budget: str = ""
     intervention_suite: str = ""
     stall_minutes: int = 45
+    # Bootstrap download-speed guard (HF Hub). Lower it only for runs without
+    # large HF downloads; the bootstrap's default is 25 MB/s.
+    net_probe_min_mb_per_s: float = 25.0
     num_gpus: int = 1
     post_commands: list[list[str]] = field(default_factory=list)
     require_cuda: bool = True
@@ -434,6 +437,9 @@ class RunManifest:
             raise OpsError("stall_minutes must be 0 (disabled) or in [15, 1440]")
         if self.poll_seconds < 15 or self.poll_seconds > 600:
             raise OpsError("poll_seconds must be in [15, 600]")
+        _manifest_number(self.net_probe_min_mb_per_s, "net_probe_min_mb_per_s")
+        if not 1 <= self.net_probe_min_mb_per_s <= 1000:
+            raise OpsError("net_probe_min_mb_per_s must be in [1, 1000]")
         if self.success_policy not in {
             "destroy_after_verify",
             "keep_alive_after_verify",
@@ -3691,8 +3697,16 @@ def start_remote_run(
     # HF_TOKEN (user-approved 2026-11-04, read-only token) reaches the box only
     # through SSH stdin into the bootstrap's environment: never a command-line
     # argument, file, or log line. The runner and job inherit it.
+    probe_min = resolved_manifest.get("net_probe_min_mb_per_s", 25.0)
+    if (
+        isinstance(probe_min, bool)
+        or not isinstance(probe_min, (int, float))
+        or not 1 <= float(probe_min) <= 1000
+    ):
+        raise OpsError("resolved manifest net_probe_min_mb_per_s is invalid")
     command = (
-        f"{_HF_TOKEN_FROM_STDIN} bash {REMOTE_REPO}/vast/remote_bootstrap.sh "
+        f"{_HF_TOKEN_FROM_STDIN} QE_NET_PROBE_MIN_MB_PER_S={float(probe_min):g} "
+        f"bash {REMOTE_REPO}/vast/remote_bootstrap.sh "
         f"{REMOTE_ROOT}/source.bundle {REMOTE_ROOT}/run_manifest.json"
     )
     # The bootstrap script lives inside the bundle, so clone before invoking it.

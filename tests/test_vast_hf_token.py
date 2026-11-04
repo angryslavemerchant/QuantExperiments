@@ -108,3 +108,28 @@ def test_json_first_line_is_not_withheld():
     raw = '{"event": "net_probe", "ok": false, "mb_per_s": 3.1}\nERROR: setup failed\n'
     out = ops._redacted_diagnostic_text(ops._diagnostic_tail(raw))
     assert "net_probe" in out and "ERROR: setup failed" in out
+
+
+def _example_manifest(**over):
+    import json
+    from pathlib import Path
+    raw = json.loads((Path(__file__).resolve().parents[1] / "vast" / "manifests" / "example.json").read_text())
+    raw["source_commit"] = "0" * 40
+    raw.update(over)
+    return raw
+
+
+@pytest.mark.parametrize("value,ok", [(5, True), (25.0, True), (0.5, False), (5000, False), (True, False)])
+def test_net_probe_threshold_manifest_field(value, ok):
+    raw = _example_manifest(net_probe_min_mb_per_s=value)
+    if ok:
+        assert ops.RunManifest.from_dict(raw).net_probe_min_mb_per_s == value
+    else:
+        with pytest.raises(ops.OpsError, match="net_probe_min_mb_per_s"):
+            ops.RunManifest.from_dict(raw)
+
+
+def test_net_probe_threshold_defaults_to_25():
+    raw = _example_manifest()
+    raw.pop("net_probe_min_mb_per_s", None)
+    assert ops.RunManifest.from_dict(raw).net_probe_min_mb_per_s == 25.0
