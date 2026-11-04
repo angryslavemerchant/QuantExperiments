@@ -168,16 +168,22 @@ class PackedFile:
         """Reference dense float32 [R, C] weight (original row and column order)."""
         m = self.meta[name]
         t = {k: v.to(device) for k, v in self.tensors(name).items()}
-        R, C, d, K = m["R"], m["C"], m["d"], m["K"]
-        tags = self.local_tags(name, device)
-        if m["G"] > 1:
-            tags = tags + t["row_book"].to(torch.int64)[:, None] * K
-        u = t["table"].float()[tags].reshape(R, C) * t["row_scale"].float()[:, None]
-        perms = self.perms(name).to(device)
-        idx = perms[t["row_mask"].to(torch.int64)] if m["M"] > 1 else perms.expand(R, C)
-        w = torch.empty_like(u)
-        w.scatter_(1, idx, u)
-        return w
+        return decode_tensors(self.local_tags(name, device), t["table"], t["row_scale"],
+                              t.get("row_book"), t.get("row_mask"), self.perms(name).to(device), m["K"])
+
+
+def decode_tensors(local_tags, table, row_scale, row_book, row_mask, perms, K: int) -> torch.Tensor:
+    """Reference decode from unpacked parts: local_tags [R, nch] int64, table
+    [G*K, d] fp16, row_scale [R], row_book/row_mask [R] or None, perms [M, C]."""
+    R, nch = local_tags.shape
+    d = table.shape[1]
+    C = nch * d
+    tags = local_tags if row_book is None else local_tags + row_book.to(torch.int64)[:, None] * K
+    u = table.float()[tags].reshape(R, C) * row_scale.float()[:, None]
+    idx = perms[row_mask.to(torch.int64)] if row_mask is not None else perms[:1].expand(R, C)
+    w = torch.empty_like(u)
+    w.scatter_(1, idx, u)
+    return w
 
 
 def apply_to_model(model, path, device=None) -> dict:
