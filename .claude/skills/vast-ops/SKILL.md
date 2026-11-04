@@ -121,7 +121,11 @@ Agent-side watching is only for waking up and reporting, and follows
 
 ## Safety
 
-- Never print, log, or transfer values from `vast/secrets.env`.
+- Never print, log, or transfer values from `vast/secrets.env`. Sole
+  exception (user decision, 2026-11-04): `vast/ops.py` forwards `HF_TOKEN`
+  (read-only) to the box over SSH stdin into the bootstrap/job environment,
+  so HF downloads and the net probe are authenticated. Never pass it any other
+  way (command line, file, log, artifact), and never forward other values.
 - The account API key stays local. The box only gets Vast's instance-scoped
   `CONTAINER_API_KEY`, used by the emergency self-destruct watchdog —
   defense in depth, not a guarantee (it has not been verified against a real

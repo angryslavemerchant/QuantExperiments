@@ -26,6 +26,11 @@ a delegated operator was too slow to react to messages).
 - Jobs download their own data at runtime. Never commit datasets, weights,
   or anything from `vast/secrets.env`. Extra remote pip deps go in
   `requirements-remote.txt`.
+- Never print, log, or transfer values from `vast/secrets.env`, with one
+  exception (user decision, 2026-11-04): `HF_TOKEN` (a read-only Hugging Face
+  token) may go to rented boxes, only the way `vast/ops.py` sends it — over
+  SSH stdin into the bootstrap's environment, never on a command line, in a
+  file, a log, or an artifact. `VAST_API_KEY` and every other value stay local.
 - Remote job outputs must be written under `artifacts/` to be recovered;
   verified results land in `artifacts/remote/<run_id>/`.
 - After a reboot or long sleep with a run live:

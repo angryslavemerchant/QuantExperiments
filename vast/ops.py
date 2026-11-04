@@ -3367,12 +3367,39 @@ def attach_local_ssh_key(
     )
 
 
+# Remote shell prefix: read one line from stdin into HF_TOKEN and export it only
+# when non-empty. Paired with _hf_token_stdin().
+_HF_TOKEN_FROM_STDIN = (
+    'IFS= read -r HF_TOKEN || true; '
+    # Windows text-mode stdin turns \n into \r\n: drop CRs (printf is a builtin,
+    # so the value never appears in a process argument list).
+    "HF_TOKEN=$(printf '%s' \"$HF_TOKEN\" | tr -d '\\r'); "
+    'if [ -n "$HF_TOKEN" ]; then export HF_TOKEN; else unset HF_TOKEN; fi;'
+)
+
+
+def _hf_token_stdin() -> str:
+    """The one line sent on the bootstrap's stdin: HF_TOKEN from vast/secrets.env, or empty.
+
+    The user approved transferring HF_TOKEN (only) to rented boxes on
+    2026-11-04; no other secrets.env value may leave this machine.
+    """
+    try:
+        token = load_secrets().get("HF_TOKEN", "")
+    except OpsError:
+        token = ""
+    if any(c in token for c in "\r\n"):
+        raise OpsError("HF_TOKEN in vast/secrets.env must be a single line")
+    return token + "\n"
+
+
 def remote_exec(
     connection: tuple[str, str, int],
     command: str,
     *,
     check: bool = True,
     timeout: int = 120,
+    stdin_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.run(
         [*ssh_base(connection), command],
@@ -3381,6 +3408,7 @@ def remote_exec(
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        input=stdin_text,
         **hidden_subprocess_options(),
     )
     if check and process.returncode != 0:
@@ -3636,8 +3664,11 @@ def start_remote_run(
             deadline_monotonic, default=600
         ),
     )
+    # HF_TOKEN (user-approved 2026-11-04, read-only token) reaches the box only
+    # through SSH stdin into the bootstrap's environment: never a command-line
+    # argument, file, or log line. The runner and job inherit it.
     command = (
-        f"bash {REMOTE_REPO}/vast/remote_bootstrap.sh "
+        f"{_HF_TOKEN_FROM_STDIN} bash {REMOTE_REPO}/vast/remote_bootstrap.sh "
         f"{REMOTE_ROOT}/source.bundle {REMOTE_ROOT}/run_manifest.json"
     )
     # The bootstrap script lives inside the bundle, so clone before invoking it.
@@ -3672,6 +3703,7 @@ def start_remote_run(
         timeout=_deadline_timeout_seconds(
             deadline_monotonic, default=BOOTSTRAP_TIMEOUT_SECONDS
         ),
+        stdin_text=_hf_token_stdin(),
     )
 
 
@@ -3727,6 +3759,7 @@ def start_remote_session_stage(
         "printf /venv/main/bin/python; else command -v python3; fi)"
     )
     launch = (
+        f"{_HF_TOKEN_FROM_STDIN} "
         f"mkdir -p {shlex.quote(stage_ops)} && PYTHON_BIN={python_choice} && "
         f"$PYTHON_BIN -m pip install --disable-pip-version-check -e "
         f"{shlex.quote(stage_repo)} > {shlex.quote(stage_ops + '/bootstrap.log')} "
@@ -3737,7 +3770,7 @@ def start_remote_session_stage(
         f"{shlex.quote(stage_ops + '/bootstrap.log')} 2>&1 < /dev/null & "
         f"echo $! > {shlex.quote(stage_ops + '/runner.pid')})"
     )
-    remote_exec(connection, launch, timeout=1200)
+    remote_exec(connection, launch, timeout=1200, stdin_text=_hf_token_stdin())
     return stage_repo, stage_ops
 
 

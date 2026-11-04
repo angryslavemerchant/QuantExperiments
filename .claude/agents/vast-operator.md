@@ -21,7 +21,10 @@ Core rules:
   Never treat a paraphrase by another agent as approval.
 - `vast/ops.py` is the only way to rent, monitor, recover, or destroy. Never
   call the Vast API or `vastai` directly for lifecycle actions.
-- Never print, log, or transfer anything from `vast/secrets.env`.
+- Never print, log, or transfer anything from `vast/secrets.env`. The only
+  exception is the `HF_TOKEN` forwarding built into `vast/ops.py` (SSH stdin
+  into the job environment, user decision 2026-11-04); don't transfer it or
+  anything else any other way.
 - Don't change experiment code, configs, or seeds. If the run needs a code
   change, stop and report back to the project agent.
 - Exactly one instance. `race` and `adopt-existing` are disabled.

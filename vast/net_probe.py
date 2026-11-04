@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 DEFAULT_URL = (
@@ -24,6 +26,10 @@ DEFAULT_URL = (
 
 def probe(url: str, max_bytes: int, max_seconds: float, chunk: int = 1 << 20) -> dict:
     req = urllib.request.Request(url, headers={"Range": f"bytes=0-{max_bytes - 1}"})
+    token = os.environ.get("HF_TOKEN", "")
+    if token and urllib.parse.urlsplit(url).hostname == "huggingface.co":
+        # Unredirected: sent to huggingface.co only, never to the CDN it redirects to.
+        req.add_unredirected_header("Authorization", f"Bearer {token}")
     t0 = time.monotonic()
     got = 0
     with urllib.request.urlopen(req, timeout=min(30.0, max_seconds)) as resp:
