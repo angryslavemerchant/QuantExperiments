@@ -92,7 +92,7 @@ def test_diagnostic_tail_makes_progress_output_readable():
 
 def test_diagnostic_tail_keeps_only_the_end():
     out = ops._diagnostic_tail("x" * 10_000 + "\nlast line", limit=100)
-    assert len(out) == 100 and out.endswith("last line")
+    assert out == "log: " + ("x" * 10_000 + "\nlast line")[-100:]
 
 
 def test_secrets_still_redacted_after_normalizing(monkeypatch):
@@ -100,3 +100,11 @@ def test_secrets_still_redacted_after_normalizing(monkeypatch):
     raw = "progress\rauth hf_supersecretvalue123 failed\r\nkey vk_abcdef0123456789\n"
     out = ops._redacted_diagnostic_text(ops._diagnostic_tail(raw))
     assert "hf_supersecretvalue123" not in out and "vk_abcdef0123456789" not in out
+
+
+def test_json_first_line_is_not_withheld():
+    # bootstrap.log starts with the net probe's JSON line; the redactor used to try
+    # to parse the whole multi-line text as JSON and withhold it
+    raw = '{"event": "net_probe", "ok": false, "mb_per_s": 3.1}\nERROR: setup failed\n'
+    out = ops._redacted_diagnostic_text(ops._diagnostic_tail(raw))
+    assert "net_probe" in out and "ERROR: setup failed" in out

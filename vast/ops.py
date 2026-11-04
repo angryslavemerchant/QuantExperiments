@@ -3436,7 +3436,8 @@ def _diagnostic_tail(text: str, limit: int = DIAGNOSTIC_TAIL_CHARACTERS) -> str:
     text = _ANSI_ESCAPE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
     text = "".join(c for c in text if c in "\n\t" or (32 <= ord(c) < 127) or ord(c) > 159)
     text = re.sub(r"\n{2,}", "\n", text).strip()
-    return text[-limit:]
+    # Leading "{"/"[" makes the redactor parse the whole text as JSON and withhold it.
+    return "log: " + text[-limit:]
 
 
 def wait_for_ssh(
