@@ -3486,9 +3486,12 @@ def wait_for_ssh(
             if probe.returncode == 0 and probe.stdout.strip() == "SSH_READY":
                 return connection
             last_error = (
-                _redacted_diagnostic_text(probe.stderr.strip())
+                f"rc {probe.returncode}: "
+                + _redacted_diagnostic_text(_diagnostic_tail(probe.stderr))
                 if probe.stderr.strip()
-                else "SSH probe failed"
+                else f"SSH probe failed (rc {probe.returncode}, stdout tail: "
+                + _redacted_diagnostic_text(_diagnostic_tail(probe.stdout, 300))
+                + ")"
             )
         except Exception as error:  # transient boot/route failures are expected
             last_error = _redacted_exception_text(error)
