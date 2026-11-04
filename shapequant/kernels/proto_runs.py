@@ -36,7 +36,8 @@ typedef unsigned int u32;
 // loads NWD+1 words and realigns them with a funnel shift by its bit offset.
 template <int NT, int NWD, bool TAIL>
 __device__ __forceinline__ void batch(const u32* const* __restrict__ wrow, int off, const uint4* __restrict__ x0,
-                                      const uint2* const* __restrict__ tbr, int lane, float* acc)
+                                      const uint2* const* __restrict__ tbr, int lane, float* acc,
+                                      const u32 (*wpre)[NWB] = nullptr)
 {
     const u32 MASK = (1u << BITS) - 1u;
     uint4 xv[NT / 2];
@@ -50,7 +51,8 @@ __device__ __forceinline__ void batch(const u32* const* __restrict__ wrow, int o
         #pragma unroll
         for (int r = 0; r < RU; ++r) {
             #pragma unroll
-            for (int i = 0; i < NWD; ++i) w[r][i] = wrow[r] ? __ldg(wrow[r] + off + lane * NWD + i) : 0u;
+            for (int i = 0; i < NWD; ++i)
+                w[r][i] = (PIPE && NFULL > 0) ? wpre[r][i] : (wrow[r] ? __ldg(wrow[r] + off + lane * NWD + i) : 0u);
             w[r][NWD] = 0u;
         }
     }
@@ -97,26 +99,59 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
 {
     const float ys = yscale[0];
     extern __shared__ uint2 stab[];
+    const int lane = threadIdx.x & 31;
+    const int wpb = blockDim.x >> 5;
+    int ti = blockIdx.x * wpb + (threadIdx.x >> 5);
+    const int tstride = gridDim.x * wpb;
+    int rows[RU];
+    const u32* wrow[RU];
+    auto setup = [&](int t, int* rr, const u32** wr) {
+        #pragma unroll
+        for (int r = 0; r < RU; ++r) {
+            rr[r] = t < ntiles ? tiles[t * RU + r] : -1;
+            wr[r] = rr[r] >= 0 ? words + (size_t)rr[r] * WROW : nullptr;
+        }
+    };
+    setup(ti, rows, wrow);
+#if PIPE && NFULL > 0
+    // software pipeline: the next full batch's words (and the first tile's, before the table
+    // copy) are loaded while the current batch is decoded
+    u32 wn[RU][NWB];
+    auto load_words = [&](const u32* const* wr, int off) {
+        #pragma unroll
+        for (int r = 0; r < RU; ++r) {
+            #pragma unroll
+            for (int i = 0; i < NWB; ++i) wn[r][i] = wr[r] ? __ldg(wr[r] + off + lane * NWB + i) : 0u;
+        }
+    };
+    load_words(wrow, 0);
+#endif
 #if SMEM
-    for (int i = threadIdx.x; i < table_n; i += blockDim.x) stab[i] = table[i];
+    {   // 16-byte copies, unrolled so each thread keeps several loads in flight
+        const uint4* src = (const uint4*)table;
+        uint4* dst = (uint4*)stab;
+        const int n4 = table_n >> 1;
+        int i = threadIdx.x;
+        for (; i + 3 * blockDim.x < n4; i += 4 * blockDim.x) {
+            const uint4 a = __ldg(src + i), b = __ldg(src + i + blockDim.x),
+                        c = __ldg(src + i + 2 * blockDim.x), d = __ldg(src + i + 3 * blockDim.x);
+            dst[i] = a; dst[i + blockDim.x] = b; dst[i + 2 * blockDim.x] = c; dst[i + 3 * blockDim.x] = d;
+        }
+        for (; i < n4; i += blockDim.x) dst[i] = __ldg(src + i);
+        if ((table_n & 1) && threadIdx.x == 0) stab[table_n - 1] = table[table_n - 1];
+    }
     __syncthreads();
     const uint2* tab = stab;
 #else
     const uint2* tab = table;
 #endif
-    const int lane = threadIdx.x & 31;
-    const int wpb = blockDim.x >> 5;
     constexpr int NPAIR = (NFULL * 8 + JT) * 32;   // chunk pairs per row
-    for (int ti = blockIdx.x * wpb + (threadIdx.x >> 5); ti < ntiles; ti += gridDim.x * wpb) {
-        int rows[RU];
-        const u32* wrow[RU];
+    for (; ti < ntiles; ti += tstride) {
         const uint2* tbr[RU];
         #pragma unroll
-        for (int r = 0; r < RU; ++r) {
-            rows[r] = tiles[ti * RU + r];
-            wrow[r] = rows[r] >= 0 ? words + (size_t)rows[r] * WROW : nullptr;
-            tbr[r] = tab + (rows[r] >= 0 ? book_off[rows[r]] : 0);
-        }
+        for (int r = 0; r < RU; ++r) tbr[r] = tab + (rows[r] >= 0 ? book_off[rows[r]] : 0);
+        int rows_n[RU];
+        const u32* wrow_n[RU];
 #if HAS_MASK
         const uint4* xr = xp + (size_t)row_mask[rows[0]] * NPAIR;
 #else
@@ -126,8 +161,24 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
         #pragma unroll
         for (int r = 0; r < RU; ++r) acc[r] = 0.f;
         #pragma unroll 1
-        for (int b = 0; b < NFULL; ++b)
+        for (int b = 0; b < NFULL; ++b) {
+#if PIPE && NFULL > 0
+            u32 wc[RU][NWB];
+            #pragma unroll
+            for (int r = 0; r < RU; ++r) {
+                #pragma unroll
+                for (int i = 0; i < NWB; ++i) wc[r][i] = wn[r][i];
+            }
+            if (b + 1 < NFULL) load_words(wrow, (b + 1) * 32 * NWB);
+            else { setup(ti + tstride, rows_n, wrow_n); load_words(wrow_n, 0); }
+            batch<16, NWB, false>(wrow, b * 32 * NWB, xr + b * 8 * 32, tbr, lane, acc, wc);
+#else
             batch<16, NWB, false>(wrow, b * 32 * NWB, xr + b * 8 * 32, tbr, lane, acc);
+#endif
+        }
+#if !(PIPE && NFULL > 0)
+        setup(ti + tstride, rows_n, wrow_n);
+#endif
 #if JT > 0
         batch<JT * 2, NWT, true>(wrow, NFULL * 32 * NWB, xr + NFULL * 8 * 32, tbr, lane, acc);
 #endif
@@ -138,6 +189,8 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
             for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
             if (lane == 0 && rows[r] >= 0) y[rows[r]] = __float2half(s * ys * __half2float(row_scale[rows[r]]));
         }
+        #pragma unroll
+        for (int r = 0; r < RU; ++r) { rows[r] = rows_n[r]; wrow[r] = wrow_n[r]; }
     }
 }
 """
@@ -214,13 +267,14 @@ def make_tiles(row_mask: torch.Tensor, ru: int) -> torch.Tensor:
     return torch.cat(out).to(torch.int32).to(row_mask.device).contiguous()
 
 
-def _kernel(bits, nch, smem, has_mask, threads, ru):
+def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True):
     import cupy as cp
     nfull, jt = geometry(nch)
-    key = (bits, nfull, jt, smem, has_mask, threads, ru)
+    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define SMEM {int(smem)}\n"
-               f"#define HAS_MASK {int(has_mask)}\n#define THREADS {threads}\n#define RU {ru}\n") + _SRC
+               f"#define HAS_MASK {int(has_mask)}\n#define THREADS {threads}\n#define RU {ru}\n"
+               f"#define PIPE {int(pipe)}\n") + _SRC
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs")
     return _mods[key]
 
@@ -254,17 +308,28 @@ def prep_x(rl: RunsLinear, x: torch.Tensor) -> torch.Tensor:
 
 
 def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: int = 4,
-         threads: int = 256, xp: torch.Tensor | None = None) -> torch.Tensor:
+         threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = True) -> torch.Tensor:
+    """table: "smem" copies the codebook into shared memory per block, "global" reads it through
+    L1 (no per-block copy: cheaper for small matrices, where the copies dominate), "auto" = smem
+    when it fits. threads=0: one block per SM sized to cover all tiles in one round (small
+    matrices; capped at 1024 threads). pipe: load the next
+    batch's weight words while decoding the current one (skipped where it would spill)."""
     import cupy as cp
     y = out if out is not None else torch.empty(rl.R, dtype=torch.float16, device=x.device)
     if xp is None:
         xp = prep_x(rl, x)
     yscale = rl.yscale
     table_bytes = rl.table.numel() * 2
-    smem = table_bytes <= SMEM_LIMIT
-    fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru)
+    smem = table_bytes <= SMEM_LIMIT if table == "auto" else table == "smem"
+    assert not smem or table_bytes <= SMEM_LIMIT
     sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     nt = rl.tiles.shape[0]
+    if threads == 0:   # auto: one block per SM, just enough warps to cover every tile in one round
+        threads, blocks_per_sm = min(1024, max(64, math.ceil(nt / sms) * 32)), 1
+    fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, False)
+    if pipe:   # the pipeline's extra registers spill under a tight per-thread cap (1024 threads, RU >= 2)
+        fp = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, True)
+        fn = fp if fp.local_size_bytes <= fn.local_size_bytes else fn
     grid = min(sms * blocks_per_sm, math.ceil(nt / (threads // 32)))
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
         fn((grid,), (threads,),

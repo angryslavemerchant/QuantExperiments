@@ -61,12 +61,18 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bits", default="10,12")
     ap.add_argument("--ru", default="1,2,4")
-    ap.add_argument("--cfgs", default="256x4", help="launch configs THREADSxBLOCKS_PER_SM, comma-separated")
+    ap.add_argument("--cfgs", default="256x4",
+                    help="launch configs THREADSxBLOCKS_PER_SM[g], comma-separated; a trailing n turns off "
+                         "the software pipeline, a trailing g reads the table through L1")
+    ap.add_argument("--shapes", default="", help="comma-separated subset of " + ",".join(SHAPES))
+    ap.add_argument("--patterns", default="random,perm,cap2")
     a = ap.parse_args()
     print(f"{torch.cuda.get_device_name(0)}; M={M}; times are per call (CUDA graph, weights rotated over >= 4x L2)")
     print(f"{'matrix':13s} {'kernel':26s} {'us':>8s} {'vs Q4':>7s} {'vs fp16':>8s} {'rel err':>8s}")
     totals: dict = {}
     for label, (R, C) in SHAPES.items():
+        if a.shapes and label not in a.shapes.split(","):
+            continue
         g = torch.Generator().manual_seed(0)
         x = torch.randn(C, generator=g).half().cuda()
         y = torch.empty(R, device="cuda", dtype=torch.float16)
@@ -87,7 +93,7 @@ def main() -> int:
         report("Q4", tq4)
         for bits in [int(v) for v in a.bits.split(",")]:
             K = 1 << bits
-            for kern, pats in (("cur", ("random",)), ("runs", ("random", "perm", "cap2"))):
+            for kern, pats in (("cur", ("random",)), ("runs", tuple(a.patterns.split(",")))):
                 for pat in pats:
                     gg = torch.Generator().manual_seed(1)
                     tags = make_tags(R, C // 4, K, pat, gg) if kern == "cur" else run_tags(R, C // 4, K, pat, gg)
@@ -105,12 +111,15 @@ def main() -> int:
                         rl = proto_runs.RunsLinear(lin, tags, ru)
                         lins = [rl] + [rl.clone() for _ in range(copies_for(rl.stored_bytes()) - 1)]
                         for cfg in a.cfgs.split(","):
-                            th, bps = (int(v) for v in cfg.split("x"))
+                            tab = "global" if cfg.endswith("g") else "auto"
+                            pipe = not cfg.rstrip("g").endswith("n")
+                            th, bps = (int(v) for v in cfg.rstrip("g").rstrip("n").split("x"))
                             y.zero_()
-                            got = proto_runs.gemv(lins[0], x, y, xp=xp, threads=th, blocks_per_sm=bps).float()
+                            got = proto_runs.gemv(lins[0], x, y, xp=xp, threads=th, blocks_per_sm=bps,
+                                                  table=tab, pipe=pipe).float()
                             err = float((got - ref).abs().max() / ref.abs().max())
-                            t = timeit([lambda l=l: proto_runs.gemv(l, x, y, xp=xp, threads=th, blocks_per_sm=bps)
-                                        for l in lins])
+                            t = timeit([lambda l=l: proto_runs.gemv(l, x, y, xp=xp, threads=th, blocks_per_sm=bps,
+                                                                    table=tab, pipe=pipe) for l in lins])
                             tag = "" if cfg == "256x4" else f" {cfg}"
                             report(f"K{K} runs+xp RU{ru}{tag} {pat}", t, err)
                         del rl, lins

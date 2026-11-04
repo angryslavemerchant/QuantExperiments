@@ -50,7 +50,7 @@ def run(cmd, out_file: Path, env=None, timeout=3600) -> int:
     return rc
 
 
-def llama_step(out: Path, work: Path) -> None:
+def llama_step(out: Path, work: Path, ggufs=GGUFS) -> None:
     from huggingface_hub import hf_hub_download
     llama_dir = work / "llama"
     llama_dir.mkdir(parents=True, exist_ok=True)
@@ -64,7 +64,7 @@ def llama_step(out: Path, work: Path) -> None:
     libdirs = sorted({str(p.parent) for p in llama_dir.rglob("*.so*")})
     env = dict(os.environ, LD_LIBRARY_PATH=":".join(libdirs + [os.environ.get("LD_LIBRARY_PATH", "")]))
     results = {}
-    for q in GGUFS:
+    for q in ggufs:
         path = hf_hub_download(GGUF_REPO, f"Qwen2.5-7B-Instruct-{q}.gguf", local_dir=str(work / "gguf"))
         f = out / f"llama_bench_{q}.json"
         rc = run([str(bench), "-m", path, "-ngl", "99", "-p", "0", "-n", "128", "-r", "5", "-fa", "1", "-o", "json"],

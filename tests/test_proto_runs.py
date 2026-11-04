@@ -79,3 +79,17 @@ def test_saturated_activations_stay_finite():
     x[::2] = -30000.0                                          # partial sums cancel; products are huge
     for y in (proto_runs.gemv(proto_runs.RunsLinear(lin, tags, 1), x), cuda_gemv.gemv(lin, x)):
         assert torch.isfinite(y.float()).all() or not torch.isfinite((lin.dense() @ x.float()).half()).all()
+
+
+@pytest.mark.parametrize("R,C", [(512, 3584), (300, 18944), (256, 4864), (128, 256)])
+@pytest.mark.parametrize("ru", [1, 2])
+@pytest.mark.parametrize("cfg", [(64, 1, True), (64, 1, False), (0, 1, True), (1024, 1, True)])
+def test_launch_configs_and_pipeline(R, C, ru, cfg):
+    # 64 threads x 1 block/SM: every warp runs many tiles (exercises the cross-tile pipeline)
+    threads, bps, pipe = cfg
+    lin, tags = _lin(R, C, 12, G=2)
+    rl = proto_runs.RunsLinear(lin, tags, ru)
+    x = torch.randn(C, device="cuda").half()
+    ref = lin.dense() @ x.float()
+    y = proto_runs.gemv(rl, x, threads=threads, blocks_per_sm=bps, pipe=pipe).float()
+    assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3
