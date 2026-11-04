@@ -29,12 +29,11 @@ from gpu_speed_report import ensure_cupy, read_bandwidth  # noqa: E402
 from remote_runs_report import llama_step, run  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-E2E_CONFIGS = [  # name, variants, extra args
-    ("ru1_512x2", "q4,runs10,runs12,fp16", ["--ru", "1", "--large", "512x2"]),
-    ("ru1_512x2_pipe", "runs10,runs12", ["--ru", "1", "--large", "512x2", "--pipe"]),
-    ("ru1_1024x1", "runs10,runs12", ["--ru", "1", "--large", "1024x1"]),
-    ("ru2_512x2", "runs10,runs12", ["--ru", "2", "--large", "512x2"]),
-    ("ru1_256x4_small256x4", "runs10,runs12", ["--ru", "1", "--large", "256x4", "--small", "256x4"]),
+E2E_CONFIGS = [  # name, variants, extra args (s4/s5: the real stacks' per-matrix K, G=4 books)
+    ("ru1_512x2", "q4,runs10,s4,runs12,s5,fp16", ["--ru", "1", "--large", "512x2", "--breakdown"]),
+    ("ru1_1024x1", "runs10,s4", ["--ru", "1", "--large", "1024x1", "--breakdown"]),
+    ("ru2_512x2", "runs10,s4", ["--ru", "2", "--large", "512x2", "--breakdown"]),
+    ("ru1_512x2_g1", "s4,s5", ["--ru", "1", "--large", "512x2", "--G", "1", "--breakdown"]),
 ]
 
 

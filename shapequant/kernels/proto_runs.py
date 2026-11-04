@@ -95,14 +95,24 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
           const __half* __restrict__ row_scale, const int* __restrict__ book_off,
           const int* __restrict__ row_mask, const uint4* __restrict__ xp,
           __half* __restrict__ y, const int* __restrict__ tiles, int ntiles, int table_n,
-          const float* __restrict__ yscale)
+          const float* __restrict__ yscale, const int4* __restrict__ blk)
 {
     const float ys = yscale[0];
     extern __shared__ uint2 stab[];
     const int lane = threadIdx.x & 31;
     const int wpb = blockDim.x >> 5;
+#if BOOKS
+    // book-major: this block serves one mixture book (tiles sorted by book) and copies only that
+    // book. blk: x = first table row of the book, y/z = the book's tile range, w = rank | nblk << 16
+    const int4 bk = blk[blockIdx.x];
+    table += bk.x;
+    int ti = bk.y + (bk.w & 0xffff) * wpb + (threadIdx.x >> 5);
+    const int tstride = (bk.w >> 16) * wpb;
+    ntiles = bk.z;
+#else
     int ti = blockIdx.x * wpb + (threadIdx.x >> 5);
     const int tstride = gridDim.x * wpb;
+#endif
     int rows[RU];
     const u32* wrow[RU];
     auto setup = [&](int t, int* rr, const u32** wr) {
@@ -149,7 +159,7 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
     for (; ti < ntiles; ti += tstride) {
         const uint2* tbr[RU];
         #pragma unroll
-        for (int r = 0; r < RU; ++r) tbr[r] = tab + (rows[r] >= 0 ? book_off[rows[r]] : 0);
+        for (int r = 0; r < RU; ++r) tbr[r] = tab + ((BOOKS || rows[r] < 0) ? 0 : book_off[rows[r]]);
         int rows_n[RU];
         const u32* wrow_n[RU];
 #if HAS_MASK
@@ -256,6 +266,34 @@ def scaled_table(table: torch.Tensor, limit: float):
     return t, torch.tensor([2.0 ** k], dtype=torch.float32, device=table.device)
 
 
+def book_tiles(rl, K: int):
+    """Tiles grouped by (book, column order), book-major, plus each book's tile range starts."""
+    if getattr(rl, "_book_tiles", None) is None:
+        book = (rl.book_off // K).long()
+        M = int(rl.row_mask.max()) + 1
+        tiles = make_tiles(book * M + rl.row_mask.long(), rl.ru)
+        tb = book.cpu()[tiles[:, 0].long().cpu()]           # each tile's book (first row is never padding)
+        G = rl.table.shape[0] // K
+        starts = [0]
+        for c in torch.bincount(tb, minlength=G).tolist():
+            starts.append(starts[-1] + c)
+        rl._book_tiles, rl._blk = (tiles, starts), {}
+    return rl._book_tiles
+
+
+def book_blocks(rl, K: int, grid: int, wpb: int) -> torch.Tensor:
+    """Per block (first table row, tile lo, tile hi, rank | nblk << 16): blocks split over books in
+    proportion to their tiles (at least one per non-empty book, no more than its tiles need)."""
+    _, starts = book_tiles(rl, K)
+    if (grid, wpb) not in rl._blk:
+        n = [starts[g + 1] - starts[g] for g in range(len(starts) - 1)]
+        nt = max(1, sum(n))
+        alloc = [0 if c == 0 else max(1, min(math.ceil(c / wpb), round(grid * c / nt))) for c in n]
+        rows = [(g * K, starts[g], starts[g + 1], r | (a << 16)) for g, a in enumerate(alloc) for r in range(a)]
+        rl._blk[(grid, wpb)] = torch.tensor(rows, dtype=torch.int32, device=rl.table.device).contiguous()
+    return rl._blk[(grid, wpb)]
+
+
 def make_tiles(row_mask: torch.Tensor, ru: int) -> torch.Tensor:
     """Group rows with the same column order into tiles of `ru` rows (-1 = padding)."""
     rm = row_mask.cpu()
@@ -267,14 +305,14 @@ def make_tiles(row_mask: torch.Tensor, ru: int) -> torch.Tensor:
     return torch.cat(out).to(torch.int32).to(row_mask.device).contiguous()
 
 
-def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True):
+def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True, books=False):
     import cupy as cp
     nfull, jt = geometry(nch)
-    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe)
+    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe, books)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define SMEM {int(smem)}\n"
                f"#define HAS_MASK {int(has_mask)}\n#define THREADS {threads}\n#define RU {ru}\n"
-               f"#define PIPE {int(pipe)}\n") + _SRC
+               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n") + _SRC
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs")
     return _mods[key]
 
@@ -309,7 +347,8 @@ def prep_x(rl: RunsLinear, x: torch.Tensor) -> torch.Tensor:
 
 def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: int = 4,
          threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = False) -> torch.Tensor:
-    """table: "smem" copies the codebook into shared memory per block, "global" reads it through
+    """table: "books" (and "auto" when the G-book table is over the limit but one book fits):
+    book-major blocks that each copy one book. "smem" copies the codebook into shared memory per block, "global" reads it through
     L1 (no per-block copy: cheaper for small matrices, where the copies dominate), "auto" = smem
     when it fits. threads=0: one block per SM sized to cover all tiles in one round (small
     matrices; capped at 1024 threads). pipe: load the next
@@ -319,24 +358,35 @@ def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, block
     if xp is None:
         xp = prep_x(rl, x)
     yscale = rl.yscale
+    K = 1 << rl.bits
     table_bytes = rl.table.numel() * 2
-    smem = table_bytes <= SMEM_LIMIT if table == "auto" else table == "smem"
+    G = rl.table.shape[0] // K
+    # book-major when the whole G-book table is over the limit but one book fits
+    books = table == "books" or (table == "auto" and G > 1 and table_bytes > SMEM_LIMIT and K * 8 <= SMEM_LIMIT)
+    if books:
+        table_bytes = K * 8
+    smem = books or (table_bytes <= SMEM_LIMIT if table == "auto" else table == "smem")
     assert not smem or table_bytes <= SMEM_LIMIT
     sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-    nt = rl.tiles.shape[0]
+    tiles = book_tiles(rl, K)[0] if books else rl.tiles
+    nt = tiles.shape[0]
     if threads == 0:   # auto: one block per SM, just enough warps to cover every tile in one round
         threads, blocks_per_sm = min(1024, max(64, math.ceil(nt / sms) * 32)), 1
-    fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, False)
+    fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, False, books)
     if pipe:   # the pipeline's extra registers spill under a tight per-thread cap (1024 threads, RU >= 2)
-        fp = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, True)
+        fp = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, True, books)
         fn = fp if fp.local_size_bytes <= fn.local_size_bytes else fn
     grid = min(sms * blocks_per_sm, math.ceil(nt / (threads // 32)))
+    blk = tiles                               # unused unless book-major
+    if books:
+        blk = book_blocks(rl, K, grid, threads // 32)
+        grid = blk.shape[0]
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
         fn((grid,), (threads,),
            (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()),
             cp.uint64(rl.row_scale.data_ptr()), cp.uint64(rl.book_off.data_ptr()),
             cp.uint64(rl.row_mask.data_ptr()), cp.uint64(xp.data_ptr()), cp.uint64(y.data_ptr()),
-            cp.uint64(rl.tiles.data_ptr()), cp.int32(nt), cp.int32(rl.table.shape[0]),
-            cp.uint64(yscale.data_ptr())),
+            cp.uint64(tiles.data_ptr()), cp.int32(nt), cp.int32(K if books else rl.table.shape[0]),
+            cp.uint64(yscale.data_ptr()), cp.uint64(blk.data_ptr())),
            shared_mem=table_bytes if smem else 0)
     return y

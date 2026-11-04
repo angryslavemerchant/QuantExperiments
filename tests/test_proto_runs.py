@@ -62,6 +62,29 @@ def test_stack_bits_with_four_books(R, C, bits):
         assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3, cfg
 
 
+@pytest.mark.parametrize("bits", [8, 10, 12])
+@pytest.mark.parametrize("R,C", [(512, 3584), (3584, 3584), (256, 18944)])
+@pytest.mark.parametrize("ru", [1, 2])
+@pytest.mark.parametrize("skew", [False, True])
+def test_book_major(R, C, bits, ru, skew):
+    """Book-major blocks (one book per block in shared memory) match the dense reference, also
+    with very uneven book sizes; "auto" picks it for K4096 x 4 books (128 KB)."""
+    lin, tags = _lin(R, C, bits, G=4, seed=bits + ru)
+    if skew:   # book 0 gets ~85% of the rows, book 3 none
+        g = torch.Generator().manual_seed(7)
+        b = torch.multinomial(torch.tensor([0.85, 0.1, 0.05, 0.0]), R, replacement=True, generator=g)
+        lin.book_off = (b * (1 << bits)).to(torch.int32).cuda()
+    rl = proto_runs.RunsLinear(lin, tags, ru)
+    x = torch.randn(C, device="cuda").half()
+    ref = lin.dense() @ x.float()
+    for th, bps in ((512, 2), (256, 4), (0, 1), (1024, 1)):
+        y = proto_runs.gemv(rl, x, threads=th, blocks_per_sm=bps, table="books").float()
+        assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3, (th, bps)
+    if bits == 12:
+        y = proto_runs.gemv(rl, x, threads=512, blocks_per_sm=2).float()
+        assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3
+
+
 @pytest.mark.parametrize("kernel", ["runs", "cur"])
 def test_outlier_activation_does_not_overflow(kernel):
     lin, tags = _lin(256, 3584, 10)

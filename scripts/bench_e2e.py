@@ -26,18 +26,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shapequant.kernels import decode_e2e as de  # noqa: E402
 
-ALLOC = {
-    "s4": ("artifacts/remote/s04_qwen7b_stack_seed0_20261103a/extracted/artifacts/qwen_s01/stage4_stack_7b/"
-           "allocation.json", "s4_full"),
-    "s5": ("artifacts/remote/s05_qwen7b_stack3b_seed0_20261103a/extracted/artifacts/qwen_s01/stage5_stack3b_7b/"
-           "allocation.json", "s5_full"),
-}
+ALLOC = {"s4": "configs/alloc/s4_full.json", "s5": "configs/alloc/s5_full.json"}   # per-matrix K of the stacks
 TYPES = ("q", "k", "v", "o", "gate", "up", "down")
 
 
-def load_alloc(path, run):
-    """{matrix name: K} chosen for `run` (allocation.json is written by the quantizer)."""
-    return json.loads((Path(__file__).resolve().parents[1] / path).read_text())["choices"][run]
+def load_alloc(path):
+    """{matrix name: K} (exported from the quantizer's allocation.json)."""
+    return json.loads((Path(__file__).resolve().parents[1] / path).read_text())["choices"]
 
 
 def breakdown(eng, reps=20):
@@ -100,7 +95,7 @@ def main() -> int:
         extra = {}
         if v in ALLOC:
             kind, bits = "runs", 10 if v == "s4" else 12
-            extra = dict(alloc=load_alloc(*ALLOC[v]), G=a.G, head_bits=a.head_bits or bits)
+            extra = dict(alloc=load_alloc(ALLOC[v]), G=a.G, head_bits=a.head_bits or bits)
         try:
             eng = de.random_engine(cfg, kind, bits=bits or 10, ru=a.ru, large=cfg_pair(a.large),
                                    small=cfg_pair(a.small), pipe=a.pipe, **extra)
