@@ -114,6 +114,12 @@ def rvq_encode(x, wt, books, batch, refine: int = 2):
     of coordinate re-selection of each stage's tag given the others.
     Returns (list of tags, weighted squared error per chunk)."""
     books32 = [b.to(torch.float32) for b in books]
+    if len(books32) == 2 and books32[0].shape[0] * books32[1].shape[0] <= 4096:
+        # two small books: search all K1*K2 sums exactly
+        K2 = books32[1].shape[0]
+        combo = (books32[0][:, None, :] + books32[1][None, :, :]).reshape(-1, books32[0].shape[1])
+        i, err = cb.assign(x, combo, batch, wt)
+        return [i // K2, i % K2], err
     tags, r = [], x
     for b in books32:
         i, _ = cb.assign(r, b, batch, wt)

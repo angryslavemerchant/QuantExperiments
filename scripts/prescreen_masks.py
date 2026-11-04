@@ -51,6 +51,24 @@ def mixture_variants(K: int):
     ]
 
 
+def kernel_variants(K: int):
+    """Round 5: kernel-friendly codebooks. Sums of tiny books (16-64 entries)
+    decode with warp shuffles (a 32-entry book lives one entry per lane), no
+    shared-memory bank conflicts; bits-matched against the free codebook."""
+    full = dict(select_frac=1.0)
+    return [
+        ("b20_single_d4_k256", dict(d=4, K=256)),                                   # 2.0 tag bpw
+        ("b20_add_d4_16x16", dict(d=4, K=(16, 16))),                                # 2.0
+        ("b25_single_d4_k1024", dict(d=4, K=1024)),                                 # 2.5
+        ("b25_add_d4_32x32", dict(d=4, K=(32, 32))),                                # 2.5
+        ("b25_add_d4_32x32_masks16", dict(d=4, K=(32, 32), M=16, init="identity+random", rounds=2, **full)),
+        ("b25_single_d4_k1024_masks16", dict(d=4, K=1024, M=16, init="identity+random", rounds=2, **full)),
+        ("b25_add_d8_32x4", dict(d=8, K=(32, 32, 32, 32))),                         # 2.5
+        ("b30_single_d4_k4096", dict(d=4, K=4096)),                                 # 3.0
+        ("b30_add_d4_64x64", dict(d=4, K=(64, 64))),                                # 3.0
+    ]
+
+
 def variants(K: int):
     return [
         # round 3: residual (two-stage) codebooks, bits-matched by tag bits
@@ -89,7 +107,7 @@ def main() -> int:
     ap.add_argument("--d", type=int, default=4)
     ap.add_argument("--K", type=int, default=256)
     ap.add_argument("--only", default="", help="comma-separated variant names")
-    ap.add_argument("--set", default="masks", choices=["masks", "mixture"])
+    ap.add_argument("--set", default="masks", choices=["masks", "mixture", "kernel"])
     ap.add_argument("--out", default="artifacts/prescreen/masks_0p5b.csv")
     args = ap.parse_args()
 
@@ -113,7 +131,8 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     rows = []
-    for vname, kw in (mixture_variants if args.set == "mixture" else variants)(args.K):
+    sets = {"mixture": mixture_variants, "kernel": kernel_variants, "masks": variants}
+    for vname, kw in sets[args.set](args.K):
         if want and vname not in want:
             continue
         kw = dict(kw)
