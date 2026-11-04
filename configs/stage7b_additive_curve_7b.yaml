@@ -1,0 +1,65 @@
+# Stage 7b: format A's quality-vs-size curve ends (2.0 and 3.5 bpw), same recipe as Stage 7.
+#
+# Batch-1 GEMV profiling (scripts/bench_gemv.py, bench_formats.py) showed the
+# free 1024-16384-entry codebooks are limited by random table lookups (shared-
+# memory bank conflicts), ~20-25% of DRAM bandwidth on an RTX 2060. Format A -
+# codeword = sum of one entry from each of two tiny books (16-128 entries,
+# replicated per bank, conflict-free) - ran ~1.5x faster but screened ~20%
+# worse in weighted reconstruction error on 0.5B. This run measures the real
+# 7B cost, everything fine-tuned (512 steps), against:
+#   Stage 4 full stack (free codebooks, Fisher alloc 256/1024/4096, mix4, masks16): KL 0.154 @ 2.52 bpw
+#   Stage 5 full stack at ~3 bpw: KL 0.080 @ 3.06 bpw
+# and a same-run "capped" current format (free K=1024, mix4, masks16: the
+# largest free table that still fits shared memory).
+# Format A cannot use the mixture (G=1); masks are seeded orders, rows choose
+# on all chunks; Fisher allocation picks the book size per matrix.
+# Run: python scripts/run_experiment.py --config configs/stage7b_additive_curve_7b.yaml
+stage: 7
+output_dir: artifacts/qwen_s01/stage7b_additive_curve_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [[8, 8], [16, 16], [32, 32], [64, 64], [128, 128]]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original}
+  - {name: s7_alloc20, method: stack, d: 4, alloc: fisher, budget: "uniform:16x16", M: 16, rounds: 2, select_frac: 1.0, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s7_alloc35, method: stack, d: 4, alloc: fisher, budget: "uniform:128x128", M: 16, rounds: 2, select_frac: 1.0, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
