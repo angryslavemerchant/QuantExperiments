@@ -1,0 +1,40 @@
+# Stage 7 references: the GGUF quants people actually run (Q4_K_M etc.),
+# decoded and scored in this harness (block linears only, real storage bits,
+# KL vs the same-GPU 16-bit model), so the options table can compare Stage 7's
+# format A against Q4-class quality directly. No calibration or fitting.
+# Run: python scripts/run_experiment.py --config configs/stage7_refs_7b.yaml
+stage: 7
+output_dir: artifacts/qwen_s01/stage7_refs_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+kmeans: {iters: 1, refit_iters: 1, max_fit_chunks: 1000, assign_batch: 32768}
+
+runs:
+  - {name: original, method: original}
+  - {name: gguf_i1_q4_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q4_K_M.gguf}
+  - {name: gguf_i1_iq4_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ4_XS.gguf}
+  - {name: gguf_i1_q3_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q3_K_M.gguf}
+  - {name: gguf_i1_q5_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q5_K_M.gguf}
+  - {name: gguf_i1_q4_0, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q4_0.gguf, gsm8k: false}
+  - {name: gguf_i1_q3_k_l, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q3_K_L.gguf, gsm8k: false}
+  - {name: gguf_i1_q6_k, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q6_K.gguf, gsm8k: false}
+  - {name: gguf_i1_iq3_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_M.gguf, gsm8k: false}
