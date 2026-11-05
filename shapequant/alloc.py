@@ -36,9 +36,16 @@ def fisher_diag(model, seqs: torch.Tensor, log=print) -> dict[str, torch.Tensor]
     for p in model.parameters():
         p.requires_grad_(False)
     dev = next(model.parameters()).device
+    if dev.type == "cuda":
+        # memory freed earlier (e.g. the full input Hessians, ~44 GB at 7B, moved to the CPU) stays
+        # in PyTorch's cache and would read as used, sending the accumulators to the CPU: one 26 GB
+        # device-to-host copy + single-core add per sequence (~25 s each instead of ~1 s)
+        torch.cuda.empty_cache()
     free = torch.cuda.mem_get_info()[0] if dev.type == "cuda" else 0
     need = sum(m.weight.numel() for m in mods.values()) * 4
-    acc_dev = dev if free > 2.5 * need else torch.device("cpu")
+    # peak ~1.6x need: fp32 accumulators + bf16 grads + activations of one sequence
+    acc_dev = dev if free > 2.0 * need else torch.device("cpu")
+    log(f"  fisher accumulators on {acc_dev} (free {free / 1e9:.0f} GB, need {need / 1e9:.0f} GB)")
     acc = {}
     for n, m in mods.items():
         m.weight.requires_grad_(True)
