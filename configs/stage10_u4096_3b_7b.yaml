@@ -1,0 +1,47 @@
+# Stage 10: the 3-bpw stack capped at K4096 for decode speed. s5_full_ft (Fisher over K {1024, 4096,
+# 16384}, G4, M16) got KL 0.080 at 3.06 bpw but runs 129-153 tok/s on the 5090 because the 89 K16384
+# matrices' 128 KB books overflow shared memory. d4 K4096 is the fastest format per byte, and at a
+# 3-bpw budget a K<=4096 cap leaves nothing for Fisher to trade (K4096 tags alone are 3.0 bpw), so this
+# is uniform K4096 with the current recipe: G4 mixture books, M1 (masks dropped), 512-step finetune.
+# Compare: s5_full_ft 0.080 (3.06 bpw); 2.5-bpw stack M1 G4 0.158; GGUF IQ3_XXS / IQ3_XS (stage 5).
+# Run: python scripts/run_experiment.py --config configs/stage10_u4096_3b_7b.yaml
+stage: 10
+output_dir: artifacts/qwen_s01/stage10_u4096_3b_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s10_u4096_m1_g4, method: stack, d: 4, K: 4096, G: 4, M: 1, rounds: 2, select_frac: 1.0, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
