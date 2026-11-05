@@ -71,20 +71,32 @@ __device__ __forceinline__ void batch(const u32* const* __restrict__ wrow, int o
             for (int i = 0; i < NWD; ++i) w[0][i] = __funnelshift_r(raw[i], raw[i + 1], sh0);
             w[0][NWD] = 0u;
         }
+        // QJ tags per half2 accumulator: at most 8 products per lane before the fp32 add (TABLE_MAX)
+        constexpr int QJ = D8 ? 2 : 4;
         #pragma unroll
-        for (int q = 0; q < (NT + 3) / 4; ++q) {
+        for (int q = 0; q < (NT + QJ - 1) / QJ; ++q) {
             __half2 a = __float2half2_rn(0.f);
             #pragma unroll
-            for (int jj = 0; jj < 4; ++jj) {
-                const int j = q * 4 + jj;
+            for (int jj = 0; jj < QJ; ++jj) {
+                const int j = q * QJ + jj;
                 if (j >= NT) break;
                 const int bit = j * BITS, wi = bit >> 5, sh = bit & 31;
                 const u32 v = ((sh + BITS <= 32) ? (w[ri][wi] >> sh) : __funnelshift_r(w[ri][wi], w[ri][wi + 1], sh)) & MASK;
-                const uint2 t = tbr[r][v];
                 const uint4 X = xv[j >> 1];
+#if D8
+                // d = 8 additive: tag pair (2g, 2g+1) = (A index, B index) of the 8-weight group g,
+                // one x load per group; B entries follow the KA A entries in the same table
+                const uint4 t = ((const uint4*)tbr[r])[v + ((j & 1) ? KA : 0)];
+                a = __hfma2(*(const __half2*)&t.x, *(const __half2*)&X.x, a);
+                a = __hfma2(*(const __half2*)&t.y, *(const __half2*)&X.y, a);
+                a = __hfma2(*(const __half2*)&t.z, *(const __half2*)&X.z, a);
+                a = __hfma2(*(const __half2*)&t.w, *(const __half2*)&X.w, a);
+#else
+                const uint2 t = tbr[r][v];
                 const u32 x0v = (j & 1) ? X.z : X.x, x1v = (j & 1) ? X.w : X.y;
                 a = __hfma2(*(const __half2*)&t.x, *(const __half2*)&x0v, a);
                 a = __hfma2(*(const __half2*)&t.y, *(const __half2*)&x1v, a);
+#endif
             }
             const float2 f = __half22float2(a);
             acc[r] += f.x + f.y;
@@ -103,7 +115,7 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
 {
     PDL_TRIGGER();      // dependents may launch once every block is running (see pdl.py)
     const float ys = yscale[0];
-    extern __shared__ uint2 stab[];
+    extern __shared__ __align__(16) uint2 stab[];
     const int lane = threadIdx.x & 31;
     const int wpb = blockDim.x >> 5;
 #if BOOKS
@@ -376,16 +388,89 @@ def make_tiles(row_mask: torch.Tensor, ru: int) -> torch.Tensor:
     return torch.cat(out).to(torch.int32).to(row_mask.device).contiguous()
 
 
-def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True, books=False, epi=0, ne=8):
+def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True, books=False, epi=0, ne=8, ka=0):
+    """ka > 0: d = 8 additive books (tag pairs = A/B indices, B table at offset ka)."""
     import cupy as cp
     nfull, jt = geometry(nch)
-    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe, books, epi, ne)
+    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe, books, epi, ne, ka)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define SMEM {int(smem)}\n"
                f"#define HAS_MASK {int(has_mask)}\n#define THREADS {threads}\n#define RU {ru}\n"
-               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n#define EPI {epi}\n#define NE {ne}\n") + PDL_DEFS + _SRC
+               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n#define EPI {epi}\n#define NE {ne}\n"
+               f"#define D8 {int(ka > 0)}\n#define KA {ka}\n") + PDL_DEFS + _SRC
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs")
     return _mods[key]
+
+
+def smem_optin_limit(device=None) -> int:
+    """Largest dynamic shared memory per block with the opt-in attribute (48 KB without it)."""
+    import cupy as cp
+    dev = torch.cuda.current_device() if device is None else torch.device(device).index or 0
+    return int(cp.cuda.runtime.deviceGetAttribute(cp.cuda.runtime.cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))
+
+
+class AdditiveRunsLinear:
+    """d = 8 additive-book matrix for the run kernel: codeword(g) = A[a_g] + B[b_g], one fp16
+    row scale per row, no column orders (M = 1), one book pair (G = 1). Tags are packed as the
+    d = 4 kernel's chunk pairs: pair g = (a_g, b_g), sharing one 16-byte x load."""
+
+    def __init__(self, A: torch.Tensor, B: torch.Tensor, ta: torch.Tensor, tb: torch.Tensor,
+                 row_scale: torch.Tensor, ru: int = 1):
+        R, ng = ta.shape
+        KA, KB = A.shape[0], B.shape[0]
+        assert A.shape[1] == 8 and B.shape[1] == 8 and KA == KB, "equal-size d = 8 books"
+        self.bits = int(math.log2(KA))
+        assert 1 << self.bits == KA and self.bits % 2 == 0
+        self.R, self.ng, self.nch, self.ru, self.ka = R, ng, 2 * ng, ru, KA
+        dev = A.device
+        tags = torch.stack([ta, tb], -1).reshape(R, 2 * ng)
+        self.words = pack_lane_major(tags.to(dev), self.bits)
+        self.table, self.yscale = scaled_table(torch.cat([A, B]).half(), TABLE_MAX)
+        self.row_scale = row_scale.half().to(dev).contiguous()
+        self.row_mask = torch.zeros(R, dtype=torch.int32, device=dev)
+        self.book_off = torch.zeros(R, dtype=torch.int32, device=dev)
+        self.tiles = make_tiles(self.row_mask, ru)
+        self.has_mask = False
+
+    def table_bytes(self) -> int:
+        return self.table.numel() * 2
+
+    def stored_bytes(self) -> int:
+        return self.words.numel() * 4
+
+
+def gemv_additive(rl: AdditiveRunsLinear, x: torch.Tensor, out: torch.Tensor | None = None,
+                  blocks_per_sm: int = 4, threads: int = 256, pipe: bool = False, pdl: bool = False):
+    """y = W x for a d = 8 additive matrix; both books are copied to shared memory (opt-in
+    above 48 KB where the device allows it)."""
+    import cupy as cp
+    y = out if out is not None else torch.empty(rl.R, dtype=torch.float16, device=x.device)
+    xp = x.contiguous()
+    tb = rl.table_bytes()
+    lim = smem_optin_limit(x.device)
+    assert tb <= lim, f"d8 tables {tb} B over this device's shared memory ({lim} B)"
+    fn = _kernel(rl.bits, rl.nch, True, False, threads, rl.ru, False, False, 0, 8, rl.ka)
+    if pipe:
+        fp = _kernel(rl.bits, rl.nch, True, False, threads, rl.ru, True, False, 0, 8, rl.ka)
+        fn = fp if fp.local_size_bytes <= fn.local_size_bytes else fn
+    if tb > SMEM_LIMIT:
+        fn.max_dynamic_shared_size_bytes = tb
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    nt = rl.tiles.shape[0]
+    grid = min(sms * blocks_per_sm, math.ceil(nt / (threads // 32)))
+    args = (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()),
+            cp.uint64(rl.row_scale.data_ptr()), cp.uint64(rl.book_off.data_ptr()),
+            cp.uint64(rl.row_mask.data_ptr()), cp.uint64(xp.data_ptr()), cp.uint64(y.data_ptr()),
+            cp.uint64(rl.tiles.data_ptr()), cp.int32(nt), cp.int32(rl.table.shape[0] * 2),
+            cp.uint64(rl.yscale.data_ptr()), cp.uint64(rl.tiles.data_ptr()))
+    args += (cp.uint64(0),) * 6 + (cp.int32(0), cp.int32(0), cp.float32(0.0), cp.uint64(0))
+    if pdl:
+        from . import pdl as pdl_mod
+        pdl_mod.launch(fn, grid, threads, args, tb)
+        return y
+    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+        fn((grid,), (threads,), args, shared_mem=tb)
+    return y
 
 
 class RunsLinear:

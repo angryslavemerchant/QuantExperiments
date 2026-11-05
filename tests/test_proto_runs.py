@@ -130,3 +130,32 @@ def test_launch_configs_and_pipeline(R, C, ru, cfg):
     ref = lin.dense() @ x.float()
     y = proto_runs.gemv(rl, x, threads=threads, blocks_per_sm=bps, pipe=pipe).float()
     assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3
+
+
+def _additive(R, C, bits, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    K = 1 << bits
+    A = (torch.randn(K, 8, generator=g) * 0.5).half()
+    B = (torch.randn(K, 8, generator=g) * 0.3).half()
+    ta = torch.randint(0, K, (R, C // 8), generator=g)
+    tb = torch.randint(0, K, (R, C // 8), generator=g)
+    rs = (torch.rand(R, generator=g) * 0.02 + 0.01).half()
+    dense = ((A.float()[ta] + B.float()[tb]).reshape(R, C) * rs.float()[:, None])
+    return A.cuda(), B.cuda(), ta, tb, rs.cuda(), dense.cuda()
+
+
+@pytest.mark.parametrize("R,C", [(512, 3584), (300, 18944), (128, 512)])
+@pytest.mark.parametrize("bits", [8, 10, 12])
+@pytest.mark.parametrize("ru", [1, 2])
+def test_additive_d8_matches_dense(R, C, bits, ru):
+    """d = 8 additive books (A[a] + B[b] per 8-weight group): tag pairs reuse the d = 4 packing."""
+    A, B, ta, tb, rs, dense = _additive(R, C, bits)
+    rl = proto_runs.AdditiveRunsLinear(A, B, ta, tb, rs, ru)
+    if rl.table_bytes() > proto_runs.smem_optin_limit():
+        pytest.skip("tables over this device's shared memory")
+    assert rl.words.shape[1] * 32 == (C // 8) * 2 * bits          # 2 * bits per 8 weights, no padding
+    x = torch.randn(C, device="cuda").half()
+    ref = dense @ x.float()
+    for pipe in (False, True):
+        y = proto_runs.gemv_additive(rl, x, pipe=pipe).float()
+        assert float((y - ref).abs().max() / ref.abs().max()) < 3e-3

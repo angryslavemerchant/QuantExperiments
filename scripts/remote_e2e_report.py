@@ -77,7 +77,7 @@ def main() -> int:
     ap.add_argument("--work", default="/workspace/scratch_e2e")
     ap.add_argument("--skip-precision", action="store_true")
     ap.add_argument("--skip-llama", action="store_true")
-    ap.add_argument("--mode", choices=("e2e", "profile", "fusion", "formats"), default="e2e")
+    ap.add_argument("--mode", choices=("e2e", "profile", "fusion", "formats", "additive"), default="e2e")
     a = ap.parse_args()
     import os
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")    # s14 5090: the xet download path failed
@@ -105,6 +105,11 @@ def main() -> int:
     run([sys.executable, "-m", "pytest", str(ROOT.parent / "tests" / "test_decode_e2e.py"),
          str(ROOT.parent / "tests" / "test_proto_runs.py"), "-q", "-W", "ignore", "-p", "no:cacheprovider",
          "--basetemp", str(work / "pytest")], out / "tests_gpu.txt", timeout=1800)
+    if a.mode == "additive":
+        # d = 8 additive run kernel vs d = 4 at matched bits (scripts/bench_additive.py)
+        run([sys.executable, str(ROOT / "bench_additive.py"), "--bits", "8,10,12", "--ru", "1,2,4",
+             "--threads", "256,512", "--bps", "1,2,4"], out / "additive.txt", timeout=2400)
+        return 0
     if a.mode in ("profile", "fusion", "formats"):
         prof = ["--attn-split", "2"] if a.mode == "fusion" else []
         pv = "s4,s4_m1,s4_m1_g1" if a.mode == "formats" else "q4,runs10,s4"
