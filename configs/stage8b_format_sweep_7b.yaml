@@ -1,0 +1,56 @@
+# Stage 8b: the cheap-kernel half of the stage 8 sweep. Stage 8 (s16_format_sweep_7b_20261105b) hit its
+# TTL after M16/M8/M4/M1 x G4 (KL after finetune 0.154/0.153/0.150/0.158). Masks are dropped (M=1 from
+# here on), so this finishes the speed-for-fidelity trade at M=1: G1, and the K<=1024 cap with G4 / G1.
+# 5090 tok/s for the same structures (s16 speed): m1_g4 360.7, m1_g1 379.6, u1024_m1_g4 400.7,
+# u1024_m1_g1 414.9.
+# Run: python scripts/run_experiment.py --config configs/stage8b_format_sweep_7b.yaml
+stage: 8
+output_dir: artifacts/qwen_s01/stage8b_format_sweep_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s8_m1_g1, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 1, M: 1, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s8_u1024_m1_g1, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 1, M: 1, alloc_Ks: [256, 1024], finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s8_u1024_m1_g4, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 4, M: 1, alloc_Ks: [256, 1024], finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
