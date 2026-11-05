@@ -316,6 +316,7 @@ def compress_mixture(
     iters: int = 25, refit_iters: int = 10, max_fit_chunks: int = 1_000_000,
     seed: int = 0, batch: int = 65536, select_frac: float = 1.0,
     joint: bool | None = None, keep_tags: bool = False,
+    H: torch.Tensor | None = None, ldlq_damp: float = 0.01,
 ) -> Fit:
     """Mixture of codebooks (switched VQ): G distinct codebooks per matrix, each
     row picks one (log2 G bits per row). Optionally combined with M seeded
@@ -329,7 +330,10 @@ def compress_mixture(
     G*M <= 16); otherwise alternate, codebook given order then order given
     codebook (G + M snaps per round).
     keep_tags: return tags indexing the concatenation of the G codebooks
-    (stats['books'] = [that table]), the form the Stage 5 fine-tune takes."""
+    (stats['books'] = [that table]), the form the Stage 5 fine-tune takes.
+    H: full input second moment [C, C] (original column order). When given, the
+    final tags come from LDLQ error feedback (ldlq.py) within each row's chosen
+    (codebook, order) instead of nearest-codeword snapping."""
     R, C = w.shape
     dev = w.device
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -441,12 +445,26 @@ def compress_mixture(
     tags = torch.empty(chunks.shape[0], dtype=torch.long, device=dev)
     flat = torch.empty(chunks.shape[0], d, dtype=torch.float32, device=dev)
     rows_idx = torch.arange(chunks.shape[0], device=dev) // nch
-    for g in range(G):
-        selc = row_book[rows_idx] == g
-        if selc.any():
-            t, _ = cb.assign(chunks[selc], books[g], batch, ew[selc])
-            tags[selc] = t
-            flat[selc] = books[g].to(torch.float32)[t]
+    if H is not None:
+        from .ldlq import ldlq_assign
+        if pad:
+            raise ValueError("LDLQ path needs C divisible by d")
+        u_rows = chunks.view(R, -1)                      # rows in their own order (normalized)
+        tags2, flat2 = tags.view(R, nch), flat.view(R, -1)
+        Hd = H.to(dev, torch.float32)
+        for m in torch.unique(row_mask).tolist():
+            sel = row_mask == m
+            P = perms[m]
+            t, q = ldlq_assign(u_rows[sel], Hd[P][:, P], books, row_book[sel], d, damp=ldlq_damp)
+            tags2[sel] = t
+            flat2[sel] = q
+    else:
+        for g in range(G):
+            selc = row_book[rows_idx] == g
+            if selc.any():
+                t, _ = cb.assign(chunks[selc], books[g], batch, ew[selc])
+                tags[selc] = t
+                flat[selc] = books[g].to(torch.float32)[t]
     u = flat.reshape(R, -1)[:, :C]
     decoded = torch.empty_like(u)
     decoded.scatter_(1, idx, u)

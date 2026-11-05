@@ -52,8 +52,18 @@ def unique_param_count(model) -> int:
 WEIGHTINGS = {"none": (False, False), "act": (True, False), "row": (False, True), "act_row": (True, True)}
 
 
+def random_orthogonal(n: int, seed: int, device) -> torch.Tensor:
+    """Seeded Haar-random orthogonal [n, n] (QR of a Gaussian, sign-corrected). Stands in
+    for a randomized Hadamard transform in quality screens (same incoherence effect)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    a = torch.randn(n, n, generator=g, dtype=torch.float64).to(device)
+    q, r = torch.linalg.qr(a)
+    q = q * torch.sign(torch.diagonal(r))[None, :]
+    return q.to(torch.float32)
+
+
 def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str, source=None,
-                    importance: dict | None = None):
+                    importance: dict | None = None, hessians: dict | None = None):
     """Returns (decoded float32 matrix, rounded bits, ideal bits, extra stats)."""
     R, C = w.shape
     method = run["method"]
@@ -122,19 +132,49 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
             usage = fit.stats["mask_usage"]
             return out, bits, bits, {"fit": fit, "mask_nonidentity": 1.0 - usage[0] / max(1, sum(usage)),
                                      "log2K": sum(math.log2(k) for k in Kt), "numel": R * C}
+        # QTIP/QuIP#-style options: rotate ("in": W V^T, "both": U W V^T with seeded random
+        # orthogonal U, V; incoherence processing) and/or LDLQ error feedback (full H).
+        rot, use_ldlq = run.get("rotate"), bool(run.get("ldlq"))
+        h = importance[name].to(w.device, torch.float32)
+        H = Ur = Vr = None
+        w_fit = w
+        if rot or use_ldlq:
+            if hessians is None or name not in hessians:
+                raise RuntimeError(f"{name}: rotate/ldlq need full input Hessians")
+            H = hessians[name].to(w.device, torch.float32)
+        if rot:
+            if rot not in ("in", "both"):
+                raise ValueError(f"rotate must be 'in' or 'both', got {rot!r}")
+            lseed = cb.layer_seed(seed, name)
+            Vr = random_orthogonal(C, lseed + 1, w.device)
+            w_fit = w @ Vr.T
+            if rot == "both":
+                Ur = random_orthogonal(R, lseed + 2, w.device)
+                w_fit = Ur @ w_fit
+            H = Vr @ H @ Vr.T
+            H = 0.5 * (H + H.T)
+            h = torch.diag(H).clamp_min(0).contiguous()
+        if run.get("export") and rot:
+            raise ValueError("packed export does not carry rotations")
         fit = mk.compress_mixture(
-            w, importance[name].to(w.device, torch.float32), run["d"], K,
+            w_fit, h, run["d"], K,
             G=run.get("G", 1), M=run.get("M", 1), rounds=run.get("rounds", 2),
             select_frac=run.get("select_frac", 1.0), joint=run.get("joint"),
             iters=kcfg["iters"], refit_iters=kcfg.get("refit_iters", 10),
             max_fit_chunks=kcfg["max_fit_chunks"], seed=cb.layer_seed(seed, name),
             batch=kcfg["assign_batch"], keep_tags=bool(run.get("finetune") or run.get("export")),
+            H=H if use_ldlq else None, ldlq_damp=run.get("ldlq_damp", 0.01),
         )
         fit.stats["pack"] = {"d": run["d"], "K": K, "G": run.get("G", 1), "M": run.get("M", 1),
                              "seed": cb.layer_seed(seed, name)}
         bits = float(sum(fit.bits.values()))
         out = fit.decoded
         fit.decoded = None
+        if rot:
+            out = out @ Vr
+            if Ur is not None:
+                out = Ur.T @ out
+            fit.stats["rot_in"], fit.stats["rot_out"] = Vr, Ur
         usage = fit.stats["mask_usage"]
         return out, bits, bits, {"fit": fit, "mask_nonidentity": 1.0 - usage[0] / max(1, sum(usage)),
                                  "log2K": math.log2(K), "numel": R * C}
@@ -156,7 +196,7 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
 
 
 def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, seed: int,
-              log=print, importance: dict | None = None) -> dict:
+              log=print, importance: dict | None = None, hessians: dict | None = None) -> dict:
     """Restore originals, then compress every block linear per `run`. Returns stats."""
     restore_originals(model, originals)
     linears = compressible_linears(model)
@@ -176,6 +216,7 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
     t0 = time.time()
     rbits = ibits = 0.0
     se = sq = 0.0
+    hse = hsq = 0.0
     usage = []
     qtypes: dict[str, int] = {}
     fits: dict = {}
@@ -189,7 +230,14 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
     with torch.no_grad():
         for i, (name, mod) in enumerate(linears):
             w = originals[name].to(mod.weight.device, torch.float32)
-            out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source, importance)
+            out, rb, ib, stats = compress_matrix(w, run, kcfg, seed, name, source, importance, hessians)
+            if hessians is not None and name in hessians:   # layer-output error under the full H
+                Hd = hessians[name].to(w.device, torch.float64)
+                e = (out - w).to(torch.float64)
+                w64 = w.to(torch.float64)
+                hse += float(((e @ Hd) * e).sum())
+                hsq += float(((w64 @ Hd) * w64).sum())
+                del Hd
             if "fit" in stats:
                 f = stats.pop("fit")
                 if run.get("finetune") or run.get("export"):
@@ -217,6 +265,7 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
         "pct_of_original": 100.0 * (rbits + other_bits) / original_bits,
         "recon_mse": se / n_compressed,
         "recon_rel_mse": se / sq,
+        **({"out_rel_err_fullH": hse / hsq} if hsq > 0 else {}),
         "codebook_usage": (sum(usage) / len(usage)) if usage else None,
         "compress_seconds": time.time() - t0,
         **({"ggml_type_fractions": {k: v / n_compressed for k, v in sorted(qtypes.items())}} if qtypes else {}),

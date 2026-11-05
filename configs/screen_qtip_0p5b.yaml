@@ -1,0 +1,32 @@
+# Local screen (RTX 2060): QTIP / QuIP# ingredients combined with our codebook stack, on
+# Qwen2.5-0.5B-Instruct at ~2.5 bpw (d=4, K=1024). Rankings should transfer to 7B;
+# magnitudes may not (0.5B is far more sensitive than 7B).
+#   ldlq   : LDLQ / GPTQ error feedback with the full input Hessian (QuIP#/QTIP rounding)
+#   rotate : seeded random orthogonal rotation (incoherence processing); "in" = input
+#            side only, "both" = U W V^T
+# Same k-means settings everywhere; no allocation (uniform K), so only the named factor moves.
+# Run: python scripts/run_experiment.py --config configs/screen_qtip_0p5b.yaml
+stage: 8
+output_dir: artifacts/screens/qtip_0p5b
+model: Qwen/Qwen2.5-0.5B-Instruct
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 256
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 2048, num_windows: 40}
+  gsm8k: {enabled: false}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 128, context: 1024, batch_size: 4}
+kmeans: {iters: 15, refit_iters: 5, max_fit_chunks: 300000, assign_batch: 32768}
+runs:
+  - {name: original, method: original}
+  # our stack (mixture books + column orders) with and without the QTIP ingredients
+  - {name: stack, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2}
+  - {name: stack_ldlq, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, ldlq: true}
+  - {name: stack_rotin, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, rotate: in}
+  - {name: stack_rotboth, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, rotate: both}
+  - {name: stack_rotboth_ldlq, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, rotate: both, ldlq: true}
+  # plain learned codebook (no books/orders): the QuIP#-like recipe with a learned codebook
+  - {name: plain, method: stack, d: 4, K: 1024}
+  - {name: plain_ldlq, method: stack, d: 4, K: 1024, ldlq: true}
+  - {name: plain_rotboth, method: stack, d: 4, K: 1024, rotate: both}
+  - {name: plain_rotboth_ldlq, method: stack, d: 4, K: 1024, rotate: both, ldlq: true}

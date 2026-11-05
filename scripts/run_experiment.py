@@ -40,6 +40,7 @@ COLUMNS = [
     "mean_kl", "p99_kl", "top1_agree", "perplexity", "gsm8k_acc", "codebook_usage",
     "recon_mse", "recon_rel_mse", "compress_seconds", "eval_tokens",
     "G", "alloc", "mean_log2K", "mask_nonidentity_frac", "ft_kl_first", "ft_kl_last",
+    "rotate", "ldlq", "out_rel_err_fullH",
 ]
 
 T0 = time.time()
@@ -195,6 +196,11 @@ def main() -> int:
         importance = column_importance(model, seqs, ccfg.get("batch_size", 4))
 
     finished = done_runs(csv_path)
+    hessians = None
+    if any((r.get("ldlq") or r.get("rotate")) and r["name"] not in finished for r in cfg["runs"]):
+        from shapequant.calibrate import input_hessians
+        hessians = input_hessians(model, seqs, ccfg.get("batch_size", 4))
+        log(f"calibration: full input Hessians for {len(set(map(id, hessians.values())))} distinct inputs")
     alloc_runs = [r for r in cfg["runs"] if r.get("alloc") and r["name"] not in finished]
     if alloc_runs:
         # Per-matrix codebook sizes: Fisher + light proxy fits once, then each
@@ -238,7 +244,8 @@ def main() -> int:
         log(f"=== run {name}: { {k: v for k, v in run.items() if not k.startswith('_')} }")
         seed_everything(seed)
         try:
-            stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance)
+            stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance,
+                              hessians=hessians)
         except Exception as e:  # a broken external reference must not cost the whole run
             if run["method"] not in ("gguf", "vptq"):
                 raise
@@ -264,6 +271,7 @@ def main() -> int:
                 "model": cfg["model"], "d": run.get("d"), "K": run.get("K"),
                 "shuffle": run.get("shuffle", False), "masks": run.get("M", 1) > 1 if run["method"] in ("masked", "stack") else run.get("masks", False),
                 "M": run.get("M"), "G": run.get("G"), "alloc": run.get("alloc"),
+                "rotate": run.get("rotate"), "ldlq": bool(run.get("ldlq")),
                 "finetune": ft,
                 "weighting": ("act_row" if run["method"] in ("masked", "stack") else run.get("weighting", "none"))
                 if run["method"] in ("codebook", "masked", "stack") else None,

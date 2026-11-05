@@ -61,3 +61,46 @@ def column_importance(model, sequences: torch.Tensor, batch_size: int = 4) -> di
         for h in hooks:
             h.remove()
     return {n: (v / count).cpu() for n, v in sums.items()}
+
+
+@torch.no_grad()
+def input_hessians(model, sequences: torch.Tensor, batch_size: int = 4) -> dict[str, torch.Tensor]:
+    """Full input second-moment matrix H = E[x x^T] per block linear (CPU fp32), for LDLQ
+    and rotations. Linears reading the same input (q/k/v, gate/up) share one tensor.
+    diag(H) equals `column_importance`."""
+    sums: dict[str, torch.Tensor] = {}
+    rep: dict[str, str] = {}          # linear name -> name whose input it shares
+    count = 0
+    hooks = []
+    lins = compressible_linears(model)
+    for name, _ in lins:
+        kind = name.rsplit(".", 1)[1]
+        first = {"q_proj": "q_proj", "k_proj": "q_proj", "v_proj": "q_proj", "gate_proj": "gate_proj",
+                 "up_proj": "gate_proj"}.get(kind, kind)
+        prefix = name[: -len(kind)]
+        rep[name] = prefix + first
+
+    def make_hook(name):
+        def hook(_mod, args):
+            x = args[0].detach().reshape(-1, args[0].shape[-1]).to(torch.float32)
+            s = x.T @ x
+            if name in sums:
+                sums[name] += s
+            else:
+                sums[name] = s
+        return hook
+
+    for name, mod in lins:
+        if rep[name] == name:
+            hooks.append(mod.register_forward_pre_hook(make_hook(name)))
+    try:
+        dev = next(model.parameters()).device
+        for s in range(0, sequences.shape[0], batch_size):
+            b = sequences[s : s + batch_size].to(dev)
+            model.model(input_ids=b, use_cache=False)
+            count += b.numel()
+    finally:
+        for h in hooks:
+            h.remove()
+    out = {n: (v / count).cpu() for n, v in sums.items()}
+    return {n: out[rep[n]] for n, _ in lins}
