@@ -494,6 +494,7 @@ class DecodeEngine:
         self.pos = torch.zeros(1, dtype=torch.int32, device=dev)
         self.graph = None
         self.only_linears = False
+        self.skip: set = set()   # op classes left out of step() (timing only)
 
     # -- fused helpers
     def _launch(self, name, grid, block, args, smem=0):
@@ -539,15 +540,21 @@ class DecodeEngine:
             self.lm_head.run(self.xp, self.logits)
             return
         self.cur = 0
-        self._launch("embed", 16, 256, (_ptr(self.embed), _ptr(self.tok), cp.int32(self.embed.shape[0]),
-                                        cp.int32(cfg.hidden), _ptr(self.hb[0])))
+        on = lambda k: k not in self.skip   # noqa: E731  (leave-one-out timing; outputs then meaningless)
+        if on("embed"):
+            self._launch("embed", 16, 256, (_ptr(self.embed), _ptr(self.tok), cp.int32(self.embed.shape[0]),
+                                            cp.int32(cfg.hidden), _ptr(self.hb[0])))
         add = None
         for li, (L, G) in enumerate(zip(self.layers, self.groups)):
-            self._addnorm(add, L["ln1"], L["q"])
-            for lin, y in G["q"]:
-                lin.run(self.xp, y)
+            if on("addnorm"):
+                self._addnorm(add, L["ln1"], L["q"])
+            if on("qkv"):
+                for lin, y in G["q"]:
+                    lin.run(self.xp, y)
             kc, vc = self.kc[li], self.vc[li]
-            if self.fuse:
+            if not on("attn"):
+                pass
+            elif self.fuse:
                 inv = G.get("oinv")
                 self._launch("attn_rope", cfg.n_heads, cfg.head_dim,
                              (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
@@ -563,16 +570,24 @@ class DecodeEngine:
                              (_ptr(self.qr), _ptr(kc), _ptr(vc), _ptr(self.pos), cp.float32(cfg.head_dim ** -0.5),
                               _ptr(self.ao)))
                 self._elementwise("perm_copy", (self.ao,), L["o"])
-            L["o"].run(self.xp, self.yo)
-            self._addnorm(self.yo, L["ln2"], L["gate"])
-            for lin, y in G["gate"]:
-                lin.run(self.xp, y)
-            self._elementwise("silu_mul_perm", (self.yg, self.yu), L["down"])
-            L["down"].run(self.xp, self.yd)
+            if on("o"):
+                L["o"].run(self.xp, self.yo)
+            if on("addnorm"):
+                self._addnorm(self.yo, L["ln2"], L["gate"])
+            if on("gateup"):
+                for lin, y in G["gate"]:
+                    lin.run(self.xp, y)
+            if on("silu"):
+                self._elementwise("silu_mul_perm", (self.yg, self.yu), L["down"])
+            if on("down"):
+                L["down"].run(self.xp, self.yd)
             add = self.yd
-        self._addnorm(add, self.final_norm, self.lm_head)
-        self.lm_head.run(self.xp, self.logits)
-        torch.argmax(self.logits, out=self.tok.view(()))
+        if on("addnorm"):
+            self._addnorm(add, self.final_norm, self.lm_head)
+        if on("lm_head"):
+            self.lm_head.run(self.xp, self.logits)
+        if on("argmax"):
+            torch.argmax(self.logits, out=self.tok.view(()))
         self.pos.add_(1)
 
     def reset(self, tok: int = 0):

@@ -45,6 +45,16 @@ E2E_CONFIGS = [  # name, variants, extra args (s4/s5: the real stacks' per-matri
     ("s5", "runs12,s5", []),
 ]
 
+# --mode profile: profile_engine (isolated / leave-one-out / torch.profiler trace), then a
+# launch-config grid for tuning on this GPU (fused engine; PDL auto = on for sm_90+ only)
+TUNE_CONFIGS = [(f"tune_L{lg}_S{sm}", "runs10,s4", ["--large", lg, "--small", sm])
+                for lg in ("512x2", "1024x1", "256x4") for sm in ("1024x1", "0x1", "512x2")]
+TUNE_CONFIGS += [
+    ("tune_ru2", "runs10,s4", ["--ru", "2"]),
+    ("tune_nofuse", "q4,runs10,s4", ["--no-fuse"]),
+    ("tune_ref", "q4,runs12,s5,fp16", []),
+]
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -52,6 +62,7 @@ def main() -> int:
     ap.add_argument("--work", default="/workspace/scratch_e2e")
     ap.add_argument("--skip-precision", action="store_true")
     ap.add_argument("--skip-llama", action="store_true")
+    ap.add_argument("--mode", choices=("e2e", "profile"), default="e2e")
     a = ap.parse_args()
     out, work = Path(a.out), Path(a.work)
     out.mkdir(parents=True, exist_ok=True)
@@ -77,7 +88,10 @@ def main() -> int:
     run([sys.executable, "-m", "pytest", str(ROOT.parent / "tests" / "test_decode_e2e.py"),
          str(ROOT.parent / "tests" / "test_proto_runs.py"), "-q", "-W", "ignore", "-p", "no:cacheprovider",
          "--basetemp", str(work / "pytest")], out / "tests_gpu.txt", timeout=1800)
-    for name, variants, extra in E2E_CONFIGS:
+    if a.mode == "profile":
+        run([sys.executable, str(ROOT / "profile_engine.py"), "--variants", "q4,runs10,s4", "--trace",
+             "--json", str(out / "profile.json")], out / "profile.txt", timeout=2400)
+    for name, variants, extra in (TUNE_CONFIGS if a.mode == "profile" else E2E_CONFIGS):
         run([sys.executable, str(ROOT / "bench_e2e.py"), "--variants", variants, *extra,
              "--json", str(out / f"e2e_{name}.json")], out / f"e2e_{name}.txt", timeout=1800)
     if not a.skip_llama:

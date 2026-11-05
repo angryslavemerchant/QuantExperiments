@@ -78,7 +78,7 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--ru", type=int, default=1)
     ap.add_argument("--large", default="512x2", help="launch config THREADSxBLOCKS_PER_SM for matrices with > 4096 rows")
-    ap.add_argument("--small", default="0x1", help="launch config for the rest (0 = one block per SM, auto size)")
+    ap.add_argument("--small", default="1024x1", help="launch config for the rest (0 = one block per SM, auto size; 1024x1 best on the 5090, s13)")
     ap.add_argument("--pipe", action="store_true", help="software pipeline (slower on the 2060 and the 5090)")
     ap.add_argument("--G", type=int, default=4, help="mixture books for s4/s5")
     ap.add_argument("--head-bits", type=int, default=0, help="lm_head bits for s4/s5 (0: 10 for s4, 12 for s5)")
