@@ -348,6 +348,7 @@ def compress_mixture(
     iters: int = 25, refit_iters: int = 10, max_fit_chunks: int = 1_000_000,
     seed: int = 0, batch: int = 65536, select_frac: float = 1.0,
     joint: bool | None = None, keep_tags: bool = False,
+    H: torch.Tensor | None = None, ldlq_damp: float = 0.01, ldlq_refit: int = 0,
 ) -> Fit:
     """Mixture of codebooks (switched VQ): G distinct codebooks per matrix, each
     row picks one (log2 G bits per row). Optionally combined with M seeded
@@ -361,7 +362,10 @@ def compress_mixture(
     G*M <= 16); otherwise alternate, codebook given order then order given
     codebook (G + M snaps per round).
     keep_tags: return tags indexing the concatenation of the G codebooks
-    (stats['books'] = [that table]), the form the Stage 5 fine-tune takes."""
+    (stats['books'] = [that table]), the form the Stage 5 fine-tune takes.
+    H: full input second moment [C, C] (original column order). When given, the
+    final tags come from LDLQ error feedback (ldlq.py) within each row's chosen
+    (codebook, order) instead of nearest-codeword snapping."""
     R, C = w.shape
     dev = w.device
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -473,12 +477,58 @@ def compress_mixture(
     tags = torch.empty(chunks.shape[0], dtype=torch.long, device=dev)
     flat = torch.empty(chunks.shape[0], d, dtype=torch.float32, device=dev)
     rows_idx = torch.arange(chunks.shape[0], device=dev) // nch
-    for g in range(G):
-        selc = row_book[rows_idx] == g
-        if selc.any():
-            t, _ = cb.assign(chunks[selc], books[g], batch, ew[selc])
-            tags[selc] = t
-            flat[selc] = books[g].to(torch.float32)[t]
+    if H is not None:
+        from .ldlq import ldlq_assign, upper_chol_inv
+        if pad:
+            raise ValueError("LDLQ path needs C divisible by d")
+        u_rows = chunks.view(R, -1)                      # rows in their own order (normalized)
+        tags2, flat2 = tags.view(R, nch), flat.view(R, -1)
+        Hd = H.to(dev, torch.float32)
+        masks_used = torch.unique(row_mask).tolist()
+        ucache = {} if ldlq_refit else None              # factors reused across refit rounds
+        tgt = torch.empty_like(u_rows) if ldlq_refit else None
+
+        def run_ldlq():
+            for m in masks_used:
+                sel = row_mask == m
+                P = perms[m]
+                Hp = Hd[P][:, P]
+                U = ucache.get(m) if ucache is not None else None
+                if U is None:
+                    U = upper_chol_inv(Hp, ldlq_damp)[0]
+                    if ucache is not None:
+                        ucache[m] = U
+                tg = torch.empty(int(sel.sum()), u_rows.shape[1], device=dev) if tgt is not None else None
+                t, q = ldlq_assign(u_rows[sel], Hp, books, row_book[sel], d, damp=ldlq_damp, targets=tg, U=U)
+                tags2[sel] = t
+                flat2[sel] = q
+                if tgt is not None:
+                    tgt[sel] = tg
+                del U
+
+        run_ldlq()
+        for _ in range(ldlq_refit):
+            # refit each codeword to the feedback-adjusted targets it was snapped from, then
+            # snap again with the new books (alternation, like Lloyd on LDLQ's targets)
+            for g in range(G):
+                selc = row_book[rows_idx] == g
+                if not selc.any():
+                    continue
+                x = tgt.view(-1, d)[selc].to(torch.float64)
+                t = tags[selc]
+                s = torch.zeros(K, d, dtype=torch.float64, device=dev).index_add_(0, t, x)
+                c = torch.bincount(t, minlength=K)
+                new = books[g].to(torch.float64).clone()
+                new[c > 0] = s[c > 0] / c[c > 0, None]
+                books[g] = new.to(torch.float16)
+            run_ldlq()
+    else:
+        for g in range(G):
+            selc = row_book[rows_idx] == g
+            if selc.any():
+                t, _ = cb.assign(chunks[selc], books[g], batch, ew[selc])
+                tags[selc] = t
+                flat[selc] = books[g].to(torch.float32)[t]
     u = flat.reshape(R, -1)[:, :C]
     decoded = torch.empty_like(u)
     decoded.scatter_(1, idx, u)

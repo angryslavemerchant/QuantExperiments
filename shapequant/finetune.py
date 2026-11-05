@@ -63,6 +63,10 @@ class CodebookLinear(nn.Module):
         self.log_gain = nn.Parameter(torch.zeros(R, device=lin.weight.device))  # sorted-row order
         for i, t in enumerate(fit.tags):
             self.register_buffer(f"tags{i}", t.view(R, -1)[order].reshape(-1).contiguous())
+        # rotated fits (pipeline `rotate`): W = U^T W'' V, applied as x -> x V^T and y'' -> y'' U
+        rin, rout = fit.stats.get("rot_in"), fit.stats.get("rot_out")
+        self.register_buffer("rot_in", None if rin is None else rin.detach().float().clone())
+        self.register_buffer("rot_out", None if rout is None else rout.detach().float().clone())
         counts = torch.bincount(row_mask, minlength=fit.perms.shape[0]).tolist()
         self.groups = []
         start = 0
@@ -86,6 +90,8 @@ class CodebookLinear(nn.Module):
 
     def forward(self, x):
         w = self.sorted_weight().to(x.dtype)
+        if self.rot_in is not None:
+            x = F.linear(x, self.rot_in.to(x.dtype))
         outs = []
         for a, b, perm in self.groups:
             xin = x if perm is None else x.index_select(-1, getattr(self, perm))
@@ -93,6 +99,8 @@ class CodebookLinear(nn.Module):
         y = torch.cat(outs, dim=-1) if len(outs) > 1 else outs[0]
         if len(self.groups) > 1:
             y = y.index_select(-1, self.unsort)
+        if self.rot_out is not None:
+            y = y @ self.rot_out.to(y.dtype)
         bias = self.lin[0].bias
         return y if bias is None else y + bias
 
@@ -111,7 +119,12 @@ class CodebookLinear(nn.Module):
                 out[a:b] = ws[a:b]
             else:
                 out[a:b][:, getattr(self, perm)] = ws[a:b]  # column j holds original column perm[j]
-        return out[self.unsort]
+        out = out[self.unsort]
+        if self.rot_in is not None:
+            out = out @ self.rot_in
+        if self.rot_out is not None:
+            out = self.rot_out.T @ out
+        return out
 
 
 def write_back(fit, wrap: "CodebookLinear") -> None:
