@@ -189,74 +189,110 @@ extern "C" __global__ void attn(const __half* q, const __half* kc, const __half*
     out[h * HD + d] = __float2half(acc / s);
 }
 
-// rope_cache + attn + the o input's column-order copies in one kernel. One block of HD threads per
-// query head: it rotates its q and its group's current k itself (bias added and rounded as in
-// rope_cache), the group's first block writes k/v at *pos into the cache, position *pos is read from
-// shared memory (no block reads it from the cache in this launch), and the head's outputs are
-// scattered into the M copies through the inverse orders: out[m*C + inv[m*C + j]] = o[j].
+// software grid barrier for small grids whose blocks are all resident; bar[0] arrivals, bar[1]
+// departures (the last block to leave resets both, so consecutive launches can reuse it)
+__device__ __forceinline__ void grid_barrier(unsigned int* bar, unsigned int nb) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(&bar[0], 1u);
+        while (atomicAdd(&bar[0], 0u) < nb) __nanosleep(32);
+        __threadfence();
+        if (atomicAdd(&bar[1], 1u) == nb - 1) { bar[1] = 0u; atomicExch(&bar[0], 0u); }
+    }
+    __syncthreads();
+}
+
+// rope_cache + attn + the o input's column-order copies in one kernel. Grid NH * MS blocks of HD
+// threads; block (h, 0) computes head h: it rotates its q and its group's current k itself (bias
+// added and rounded as in rope_cache), the group's first head writes k/v at *pos into the cache,
+// position *pos is read from shared memory (no block reads it from the cache in this launch).
+// perms null: the output goes straight to out. Otherwise to ao, then every block (after a grid
+// barrier) writes its share of out[m*C + i] = ao[perms[m*C + i]].
 extern "C" __global__ void attn_rope(const __half* q, const __half* k, const __half* v,
                                      const __half* bq, const __half* bk, const __half* bv,
                                      const int* pos, float theta, __half* kc, __half* vc, float scale,
-                                     const unsigned short* inv, int M, int C, __half* out) {
+                                     const unsigned short* perms, int M, int C, __half* out, int MS,
+                                     __half* ao, unsigned int* bar) {
     PDL_TRIGGER();
     PDL_WAIT();     // reads the previous kernel's output right away
     __shared__ float sc[MAXLEN];
     __shared__ float red[32];
     __shared__ __half qs[HD], ks[HD], vs[HD];
-    const int h = blockIdx.x, kv = h / (NH / NKV), p = *pos, L = p + 1, i = threadIdx.x, half = HD / 2;
-    const __half z = __float2half(0.f);
-    if (i < half) {
-        const float inv_f = 1.f / powf(theta, (2.f * i) / HD);
-        const float ang = (float)p * inv_f;
-        const float c = __half2float(__float2half(cosf(ang))), s = __half2float(__float2half(sinf(ang)));
-        const int o = h * HD;
-        float x1 = __half2float(__hadd(q[o + i], bq ? bq[o + i] : z));
-        float x2 = __half2float(__hadd(q[o + i + half], bq ? bq[o + i + half] : z));
-        qs[i] = __float2half(x1 * c - x2 * s);
-        qs[i + half] = __float2half(x2 * c + x1 * s);
-        const int ok = kv * HD;
-        x1 = __half2float(__hadd(k[ok + i], bk ? bk[ok + i] : z));
-        x2 = __half2float(__hadd(k[ok + i + half], bk ? bk[ok + i + half] : z));
-        ks[i] = __float2half(x1 * c - x2 * s);
-        ks[i + half] = __float2half(x2 * c + x1 * s);
+    __shared__ float qf[HD];
+    const int h = blockIdx.x / MS, js = blockIdx.x % MS, i = threadIdx.x;
+    if (js == 0) {
+        const int kv = h / (NH / NKV), p = *pos, L = p + 1, half = HD / 2;
+        const __half z = __float2half(0.f);
+        if (i < half) {
+            const float inv_f = 1.f / powf(theta, (2.f * i) / HD);
+            const float ang = (float)p * inv_f;
+            const float c = __half2float(__float2half(cosf(ang))), s = __half2float(__float2half(sinf(ang)));
+            const int o = h * HD;
+            float x1 = __half2float(__hadd(q[o + i], bq ? bq[o + i] : z));
+            float x2 = __half2float(__hadd(q[o + i + half], bq ? bq[o + i + half] : z));
+            qs[i] = __float2half(x1 * c - x2 * s);
+            qs[i + half] = __float2half(x2 * c + x1 * s);
+            const int ok = kv * HD;
+            x1 = __half2float(__hadd(k[ok + i], bk ? bk[ok + i] : z));
+            x2 = __half2float(__hadd(k[ok + i + half], bk ? bk[ok + i + half] : z));
+            ks[i] = __float2half(x1 * c - x2 * s);
+            ks[i + half] = __float2half(x2 * c + x1 * s);
+        }
+        vs[i] = __hadd(v[kv * HD + i], bv ? bv[kv * HD + i] : z);
+        __syncthreads();
+        qf[i] = __half2float(qs[i]);
+        if (h % (NH / NKV) == 0) {
+            const size_t co = ((size_t)kv * MAXLEN + p) * HD;
+            kc[co + i] = ks[i];
+            vc[co + i] = vs[i];
+        }
+        __syncthreads();
+        // scores: one thread per cache position, the whole 256-byte k row with 16-byte loads
+        for (int t = i; t < L; t += blockDim.x) {
+            float d = 0.f;
+            if (t == p) {
+                #pragma unroll 8
+                for (int j = 0; j < HD; ++j) d += qf[j] * __half2float(ks[j]);
+            } else {
+                const uint4* kr = (const uint4*)(kc + ((size_t)kv * MAXLEN + t) * HD);
+                #pragma unroll
+                for (int c = 0; c < HD / 8; ++c) {
+                    const uint4 w = kr[c];
+                    const __half2* hp = (const __half2*)&w;
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float2 f = __half22float2(hp[e]);
+                        d += qf[c * 8 + 2 * e] * f.x + qf[c * 8 + 2 * e + 1] * f.y;
+                    }
+                }
+            }
+            sc[t] = d * scale;
+        }
+        __syncthreads();
+        float m = -3.0e38f;
+        for (int t = i; t < L; t += blockDim.x) m = fmaxf(m, sc[t]);
+        m = block_max(m, red);
+        float s = 0.f;
+        for (int t = i; t < L; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; s += e; }
+        s = block_sum(s, red);
+        // values: thread i = output dim i, independent loads kept in flight by unrolling
+        const __half* vb = vc + (size_t)kv * MAXLEN * HD + i;
+        float acc = 0.f;
+        #pragma unroll 8
+        for (int t = 0; t < p; ++t) acc += sc[t] * __half2float(vb[(size_t)t * HD]);
+        acc += sc[p] * __half2float(vs[i]);
+        const __half val = __float2half(acc / s);
+        (perms ? ao : out)[h * HD + i] = val;
     }
-    vs[i] = __hadd(v[kv * HD + i], bv ? bv[kv * HD + i] : z);
+    if (!perms) return;
+    grid_barrier(bar, gridDim.x);
+    __shared__ unsigned short xs[NH * HD];
+    const unsigned short* aos = (const unsigned short*)ao;
+    for (int t = i; t < C; t += blockDim.x) xs[t] = __ldcg(aos + t);
     __syncthreads();
-    if (h % (NH / NKV) == 0) {
-        const size_t co = ((size_t)kv * MAXLEN + p) * HD;
-        kc[co + i] = ks[i];
-        vc[co + i] = vs[i];
-    }
-    const int lane = i & 31, warp = i >> 5, nw = blockDim.x >> 5;
-    float qv[HD / 32];
-    #pragma unroll
-    for (int j = 0; j < HD / 32; ++j) qv[j] = __half2float(qs[lane * (HD / 32) + j]);
-    for (int t = warp; t < L; t += nw) {
-        const __half* kp = (t == p ? ks : kc + ((size_t)kv * MAXLEN + t) * HD) + lane * (HD / 32);
-        float d = 0.f;
-        #pragma unroll
-        for (int j = 0; j < HD / 32; ++j) d += qv[j] * __half2float(kp[j]);
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
-        if (lane == 0) sc[t] = d * scale;
-    }
-    __syncthreads();
-    float m = -3.0e38f;
-    for (int t = i; t < L; t += blockDim.x) m = fmaxf(m, sc[t]);
-    m = block_max(m, red);
-    float s = 0.f;
-    for (int t = i; t < L; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; s += e; }
-    s = block_sum(s, red);
-    float acc = 0.f;
-    for (int t = 0; t < p; ++t) acc += sc[t] * __half2float(vc[((size_t)kv * MAXLEN + t) * HD + i]);
-    acc += sc[p] * __half2float(vs[i]);
-    const __half val = __float2half(acc / s);
-    const int j = h * HD + i;
-    if (inv) {
-        for (int mm = 0; mm < M; ++mm) out[mm * C + inv[mm * C + j]] = val;
-    } else {
-        out[j] = val;
-    }
+    unsigned short* o16 = (unsigned short*)out;
+    for (int kk = blockIdx.x * blockDim.x + i; kk < M * C; kk += gridDim.x * blockDim.x) o16[kk] = xs[perms[kk]];
 }
 """
 
@@ -350,9 +386,10 @@ class RunsLin:
         rl.tiles = pr.make_tiles(rl.row_mask, ru)
         return cls(rl, **launch)
 
-    def run(self, xp, y):
+    def run(self, xp, y, epi=None):
         from . import proto_runs as pr
-        pr.gemv(self.rl, xp, y, xp=xp, threads=self.threads, blocks_per_sm=self.bps, pipe=self.pipe, pdl=self.pdl)
+        pr.gemv(self.rl, xp, y, xp=xp, threads=self.threads, blocks_per_sm=self.bps, pipe=self.pipe, pdl=self.pdl,
+                epi=epi)
 
     def nbytes(self):
         return self.rl.stored_bytes() + self.rl.R * 2 + self.rl.table.numel() * 2
@@ -424,7 +461,8 @@ class DecodeEngine:
     bq, bk, bv (fp16 bias or None). Linears in a group (q/k/v; gate/up) must share `perms`."""
 
     def __init__(self, cfg: Cfg, embed: torch.Tensor, layers: list, final_norm: torch.Tensor, lm_head, dev="cuda",
-                 fuse: bool = True, large=(512, 2), small=(0, 1), pdl: bool | None = None):
+                 fuse: bool = True, large=(512, 2), small=(0, 1), pdl: bool | None = None,
+                 attn_split: int = 4, epilogue: bool = True, epi_blocks: int = 8):
         """fuse: rope + attention + the o input's copies in one kernel, and linears reading the same
         input with the same tag bits (q/k/v, gate/up) merged into one launch (launch config
         `large` for merged matrices over 4096 rows, else `small`)."""
@@ -451,6 +489,10 @@ class DecodeEngine:
         self.ygu = torch.empty(2 * cfg.inter, **f16)
         self.yg, self.yu, self.yd = self.ygu[:cfg.inter], self.ygu[cfg.inter:], torch.empty(H, **f16)
         self.fuse = fuse
+        self.attn_split = attn_split   # blocks per head in attn_rope (they split the copies)
+        # run-kernel epilogues (fuse only): o -> add+norm for gate/up, gate/up -> silu*mul for down,
+        # down -> add+norm for the next layer / lm_head, written by the last epi_blocks blocks
+        self.epilogue, self.epi_blocks = fuse and epilogue, epi_blocks
         from . import pdl as pdl_mod
         self.pdl = pdl_mod.supported(dev) if pdl is None else pdl
         outs = dict(q=self.yq, k=self.yk, v=self.yv, gate=self.yg, up=self.yu)
@@ -476,12 +518,9 @@ class DecodeEngine:
                         off = (start - base.data_ptr()) // 2
                         plan.append((merge_runs([L[n] for n in r], th, bps), base[off:off + R]))
                 gl[stage[0]] = plan
-            if fuse and L["o"].perms is not None:
-                p = L["o"].perms.long()
-                inv = torch.empty_like(p)
-                inv.scatter_(1, p, torch.arange(p.shape[1], device=p.device).expand_as(p).contiguous())
-                gl["oinv"] = inv.to(torch.int16).contiguous()
             self.groups.append(gl)
+        self.bar = torch.zeros(2, dtype=torch.int32, device=dev)     # grid barrier counters
+        self.ebar = torch.zeros(2, dtype=torch.int32, device=dev)    # epilogue counters
         lins = [lm_head] + [l for L in layers for l in L.values() if isinstance(l, RunsLin)]
         lins += [lin for G in self.groups for st in ("q", "gate") for lin, _ in G[st]]
         for lin in lins:
@@ -517,6 +556,33 @@ class DecodeEngine:
                      (_ptr(h_in), _ptr(h_out), _ptr(add), _ptr(w), _ptr(lin.perms), cp.int32(M),
                       cp.int32(self.cfg.hidden), cp.float32(self.cfg.eps), _ptr(self.xp)), smem=self.cfg.hidden * 2)
 
+    def _epi_ok(self, lin) -> bool:
+        return self.epilogue and isinstance(lin, RunsLin)
+
+    def _norm_epi(self, add, w, consumer):
+        """Epilogue (mode 1) writing consumer's input: h += add; rmsnorm * w; M column-order copies.
+        Advances the residual ping-pong exactly like _addnorm."""
+        h_in, h_out = self.hb[self.cur], self.hb[1 - self.cur]
+        self.cur = 1 - self.cur
+        return dict(mode=1, ne=self.epi_blocks, bar=self.ebar, h_in=h_in, h_out=h_out, w=w, src=add,
+                    perms=consumer.perms, C=self.cfg.hidden, eps=self.cfg.eps, out=self.xp)
+
+    def _attn(self, L, kc, vc):
+        import cupy as cp
+        from . import pdl as pdl_mod
+        cfg, perms = self.cfg, L["o"].perms
+        ms = self.attn_split if perms is not None else 1
+        if perms is not None:   # the grid barrier needs every block resident at once
+            cap = pdl_mod.max_resident_blocks(_fn("attn_rope", cfg), cfg.head_dim)
+            assert cap >= cfg.n_heads, "attn_rope: not even one block per head fits"
+            ms = max(1, min(ms, cap // cfg.n_heads))
+        self._launch("attn_rope", cfg.n_heads * ms, cfg.head_dim,
+                     (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
+                      _ptr(L.get("bv")), _ptr(self.pos), cp.float32(cfg.rope_theta), _ptr(kc), _ptr(vc),
+                      cp.float32(cfg.head_dim ** -0.5), _ptr(perms),
+                      cp.int32(1 if perms is None else perms.shape[0]), cp.int32(L["o"].C), _ptr(self.xp),
+                      cp.int32(ms), _ptr(self.ao), _ptr(self.bar)))
+
     def _elementwise(self, name, srcs, lin):
         import cupy as cp
         MC = (lin.perms.shape[0] if lin.perms is not None else 1) * lin.C
@@ -545,8 +611,10 @@ class DecodeEngine:
             self._launch("embed", 16, 256, (_ptr(self.embed), _ptr(self.tok), cp.int32(self.embed.shape[0]),
                                             cp.int32(cfg.hidden), _ptr(self.hb[0])))
         add = None
+        normed = False      # the next matmul's input was already written by an epilogue
+        nlay = len(self.layers)
         for li, (L, G) in enumerate(zip(self.layers, self.groups)):
-            if on("addnorm"):
+            if on("addnorm") and not normed:
                 self._addnorm(add, L["ln1"], L["q"])
             if on("qkv"):
                 for lin, y in G["q"]:
@@ -555,12 +623,7 @@ class DecodeEngine:
             if not on("attn"):
                 pass
             elif self.fuse:
-                inv = G.get("oinv")
-                self._launch("attn_rope", cfg.n_heads, cfg.head_dim,
-                             (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
-                              _ptr(L.get("bv")), _ptr(self.pos), cp.float32(cfg.rope_theta), _ptr(kc), _ptr(vc),
-                              cp.float32(cfg.head_dim ** -0.5), _ptr(inv),
-                              cp.int32(1 if inv is None else inv.shape[0]), cp.int32(L["o"].C), _ptr(self.xp)))
+                self._attn(L, kc, vc)
             else:
                 self._launch("rope_cache", cfg.n_heads + cfg.n_kv, cfg.head_dim // 2,
                              (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
@@ -570,19 +633,28 @@ class DecodeEngine:
                              (_ptr(self.qr), _ptr(kc), _ptr(vc), _ptr(self.pos), cp.float32(cfg.head_dim ** -0.5),
                               _ptr(self.ao)))
                 self._elementwise("perm_copy", (self.ao,), L["o"])
+            epi = self._norm_epi(self.yo, L["ln2"], L["gate"]) if on("addnorm") and self._epi_ok(L["o"]) else None
             if on("o"):
-                L["o"].run(self.xp, self.yo)
-            if on("addnorm"):
+                L["o"].run(self.xp, self.yo, **({"epi": epi} if epi else {}))
+            if on("addnorm") and not epi:
                 self._addnorm(self.yo, L["ln2"], L["gate"])
+            last_gu = G["gate"][-1][0]
+            gepi = None
+            if on("silu") and self._epi_ok(last_gu) and all(isinstance(l, RunsLin) for l, _ in G["gate"]):
+                gepi = dict(mode=2, ne=self.epi_blocks, bar=self.ebar, src=self.ygu, perms=L["down"].perms,
+                            C=cfg.inter, out=self.xp)
             if on("gateup"):
                 for lin, y in G["gate"]:
-                    lin.run(self.xp, y)
-            if on("silu"):
+                    lin.run(self.xp, y, **({"epi": gepi} if gepi and lin is last_gu else {}))
+            if on("silu") and not gepi:
                 self._elementwise("silu_mul_perm", (self.yg, self.yu), L["down"])
+            nxt_w, nxt_lin = (self.layers[li + 1]["ln1"], self.layers[li + 1]["q"]) if li + 1 < nlay else                 (self.final_norm, self.lm_head)
+            depi = self._norm_epi(self.yd, nxt_w, nxt_lin) if on("addnorm") and self._epi_ok(L["down"]) else None
             if on("down"):
-                L["down"].run(self.xp, self.yd)
+                L["down"].run(self.xp, self.yd, **({"epi": depi} if depi else {}))
+            normed = depi is not None
             add = self.yd
-        if on("addnorm"):
+        if on("addnorm") and not normed:
             self._addnorm(add, self.final_norm, self.lm_head)
         if on("lm_head"):
             self.lm_head.run(self.xp, self.logits)
@@ -644,7 +716,8 @@ class DecodeEngine:
 def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int = 1, large=(512, 1),
                   small=(0, 1), pipe=False, embed_rows: int = 32768, seed: int = 0, dev="cuda",
                   G: int = 1, alloc: dict | None = None, head_bits: int | None = None, fuse: bool = True,
-                  pdl: bool | None = None) -> DecodeEngine:
+                  pdl: bool | None = None, attn_split: int = 4, epilogue: bool = True,
+                  epi_blocks: int = 8) -> DecodeEngine:
     """Random-weight engine (speed only). kind: fp16 | q4 | runs. Column orders are shared within
     q/k/v and gate/up; each layer/group draws its own. embed_rows: the token embedding is only read
     one row per step, so a truncated table (tok % rows) keeps memory down without changing speed.
@@ -686,4 +759,5 @@ def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int =
         torch.cuda.empty_cache()
     head = lin(cfg.vocab, H, perms(H))
     embed = (torch.randn(min(embed_rows, cfg.vocab), H, device=dev, generator=g) * 0.02).half()
-    return DecodeEngine(cfg, embed, layers, vec(H, 0.1, 1.0), head, dev, fuse=fuse, large=large, small=small, pdl=pdl)
+    return DecodeEngine(cfg, embed, layers, vec(H, 0.1, 1.0), head, dev, fuse=fuse, large=large, small=small, pdl=pdl,
+                        attn_split=attn_split, epilogue=epilogue, epi_blocks=epi_blocks)

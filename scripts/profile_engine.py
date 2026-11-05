@@ -86,22 +86,17 @@ def build(v, cfg, a):
         kind, bits = "runs", 10 if v == "s4" else 12
         extra = dict(alloc=load_alloc(ALLOC[v]), G=4, head_bits=bits)
     return de.random_engine(cfg, kind, bits=bits, large=cfg_pair(a.large), small=cfg_pair(a.small),
-                            pdl=None if a.pdl == "auto" else a.pdl == "on", **extra)
+                            pdl=None if a.pdl == "auto" else a.pdl == "on", attn_split=a.attn_split, epilogue=not a.no_epilogue, epi_blocks=a.epi_blocks, **extra)
 
 
 def isolated(eng, cfg, pos):
     import cupy as cp
     eng.reset()
     eng.pos.fill_(pos)
-    L0, G0, nl = eng.layers[0], eng.groups[0], len(eng.layers)
-    inv = G0.get("oinv")
+    L0, nl = eng.layers[0], len(eng.layers)
 
     def attn():
-        eng._launch("attn_rope", cfg.n_heads, cfg.head_dim,
-                    (de._ptr(eng.yq), de._ptr(eng.yk), de._ptr(eng.yv), de._ptr(L0.get("bq")), de._ptr(L0.get("bk")),
-                     de._ptr(L0.get("bv")), de._ptr(eng.pos), cp.float32(cfg.rope_theta), de._ptr(eng.kc[0]),
-                     de._ptr(eng.vc[0]), cp.float32(cfg.head_dim ** -0.5), de._ptr(inv),
-                     cp.int32(1 if inv is None else inv.shape[0]), cp.int32(L0["o"].C), de._ptr(eng.xp)))
+        eng._attn(L0, eng.kc[0], eng.vc[0])
 
     ops = {
         "addnorm1": lambda: eng._addnorm(eng.yd, L0["ln1"], L0["q"]),
@@ -152,6 +147,9 @@ def main() -> int:
     ap.add_argument("--small", default="1024x1")
     ap.add_argument("--pdl", choices=("auto", "on", "off"), default="auto")
     ap.add_argument("--trace", action="store_true")
+    ap.add_argument("--attn-split", type=int, default=4)
+    ap.add_argument("--no-epilogue", action="store_true", help="separate add+norm / silu kernels")
+    ap.add_argument("--epi-blocks", type=int, default=8, help="blocks running each epilogue")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     cfg = de.Cfg(layers=a.layers)

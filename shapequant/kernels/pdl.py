@@ -61,6 +61,24 @@ def _driver():
     return _lib
 
 
+_occ: dict = {}
+
+
+def max_resident_blocks(kernel, block: int, shared_mem: int = 0, device=None) -> int:
+    """How many blocks of `kernel` can be resident on the whole GPU at once (driver occupancy
+    calculator x SMs). A software grid barrier is only safe for grids up to this size."""
+    key = (kernel.kernel.ptr, block, shared_mem)
+    if key not in _occ:
+        lib = _driver()
+        n = ctypes.c_int(0)
+        rc = lib.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(n), ctypes.c_void_p(kernel.kernel.ptr),
+                                                             ctypes.c_int(block), ctypes.c_size_t(shared_mem))
+        if rc != 0:
+            raise RuntimeError(f"cuOccupancyMaxActiveBlocksPerMultiprocessor failed: CUresult {rc}")
+        _occ[key] = n.value * torch.cuda.get_device_properties(device).multi_processor_count
+    return _occ[key]
+
+
 def supported(device=None) -> bool:
     return torch.cuda.get_device_capability(device)[0] >= 9
 

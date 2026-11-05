@@ -51,7 +51,8 @@ def _packed(R, C, perms, seed, bits=10):
     return lin, tags
 
 
-def _engine(hf, kind, fuse=True):
+def _engine(hf, kind, fuse=True, bits=None, **kw):
+    """bits: {name: tag bits} overrides for runs linears (default 10)."""
     """Engine with `kind` linears; HF weights are replaced by what the engine actually computes with."""
     sd = hf.model
     gc = torch.Generator().manual_seed(3)
@@ -67,7 +68,8 @@ def _engine(hf, kind, fuse=True):
             mod.weight.data.copy_(pf.q4_pack(w.float().cpu())[2].cuda())
             return lin
         seed[0] += 1
-        lin, tags = _packed(*w.shape, perms, seed[0])
+        name = next((n for n, full in NAMES.items() if getattr(mod, "_qe_name", None) == full), None)
+        lin, tags = _packed(*w.shape, perms, seed[0], bits=(bits or {}).get(name, 10))
         mod.weight.data.copy_(lin.dense().float())
         return de.RunsLin(proto_runs.RunsLinear(lin, tags, ru=2), threads=0 if w.shape[0] <= 512 else 128,
                           blocks_per_sm=1)
@@ -80,6 +82,8 @@ def _engine(hf, kind, fuse=True):
         for blk in sd.layers:
             pa, po, pg, pd = perms(CFG.hidden), perms(CFG.hidden), perms(CFG.hidden), perms(CFG.inter)
             a, mlp = blk.self_attn, blk.mlp
+            for n, full in NAMES.items():
+                blk.get_submodule(full)._qe_name = full
             layers.append(dict(ln1=blk.input_layernorm.weight.half(), ln2=blk.post_attention_layernorm.weight.half(),
                                q=make(a.q_proj, pa), k=make(a.k_proj, pa), v=make(a.v_proj, pa),
                                o=make(a.o_proj, po), gate=make(mlp.gate_proj, pg), up=make(mlp.up_proj, pg),
@@ -87,7 +91,7 @@ def _engine(hf, kind, fuse=True):
                                bv=a.v_proj.bias.half()))
         head = make(hf.lm_head, perms(CFG.hidden))
     return de.DecodeEngine(CFG, sd.embed_tokens.weight.half().contiguous(), layers, sd.norm.weight.half(), head,
-                           fuse=fuse)
+                           fuse=fuse, **kw)
 
 
 @pytest.mark.parametrize("kind", ["dense", "q4", "runs"])
@@ -124,18 +128,51 @@ def test_graph_replay_matches_eager():
     assert replay == eager
 
 
-def test_fused_matches_unfused_exactly():
-    """Fusion changes launches, not arithmetic: same logits bit for bit over 20 steps (tokens
-    from the unfused engine fed to both)."""
+def test_fused_matches_unfused():
+    """Fusion changes launches and the attention summation order only: logits agree to fp16
+    rounding over 30 steps (tokens from the unfused engine fed to both), and the attention block
+    split (who scatters which copies) changes nothing at all."""
     hf = _hf()
     a, b = _engine(hf, "runs", fuse=False), _engine(hf, "runs", fuse=True)
-    a.reset(5)
-    b.reset(5)
-    for _ in range(20):
-        a.step()
-        b.step()
-        assert torch.equal(a.logits, b.logits)
-        b.tok.copy_(a.tok)
+    ref = {}
+    for ms in (1, 4, 16):
+        b.attn_split = ms
+        a.reset(5)
+        b.reset(5)
+        got = []
+        for _ in range(30):
+            a.step()
+            b.step()
+            rel = float((a.logits.float() - b.logits.float()).abs().max() / a.logits.float().abs().max())
+            assert rel < 2e-3, rel
+            got.append(b.logits.clone())
+            b.tok.copy_(a.tok)
+        ref[ms] = torch.stack(got)
+    assert torch.equal(ref[1], ref[4]) and torch.equal(ref[1], ref[16])
+
+
+@pytest.mark.parametrize("pos", [127, 128, 300, 511])
+def test_attention_long_context(pos):
+    """Fused attention past one position per thread (128) up to max_len, against the unfused kernels."""
+    cfg = de.Cfg(hidden=512, n_heads=4, n_kv=2, head_dim=128, inter=1024, vocab=1024, layers=2, max_len=512)
+    a = de.random_engine(cfg, "runs", fuse=False, large=(128, 1), small=(0, 1), seed=3)
+    b = de.random_engine(cfg, "runs", fuse=True, large=(128, 1), small=(0, 1), seed=3)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    for e in (a, b):     # a random but identical cache so every position matters
+        e.kc.copy_(torch.randn(e.kc.shape, generator=g, device="cuda").half())
+        g.manual_seed(1)
+    g.manual_seed(2)
+    vc = torch.randn(a.vc.shape, generator=g, device="cuda").half()
+    a.vc.copy_(vc)
+    b.vc.copy_(vc)
+    a.reset(7)
+    b.reset(7)
+    a.pos.fill_(pos)
+    b.pos.fill_(pos)
+    a.step()
+    b.step()
+    rel = float((a.logits.float() - b.logits.float()).abs().max() / a.logits.float().abs().max())
+    assert rel < 2e-3, rel
 
 
 @pytest.mark.parametrize("graph", [False, True])
@@ -160,3 +197,39 @@ def test_pdl_matches_plain_launches(graph):
             eng.graph.replay() if graph else eng.step()
         assert torch.equal(a.logits, b.logits)
         assert int(a.tok) == int(b.tok)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_epilogues_match_separate_kernels(mixed):
+    """Run-kernel epilogues (add+norm after o / down, silu*mul after gate|up) against the separate
+    kernels, on HF-consistent weights. mixed: gate and up with different tag bits, so they run as
+    two launches and only the second carries the silu epilogue (reading gate's finished output)."""
+    hf = _hf()
+    bits = dict(gate=8, k=8) if mixed else None
+    a = _engine(hf, "runs", bits=bits, epilogue=False)
+    b = _engine(hf, "runs", bits=bits, epilogue=True)
+    if mixed:
+        assert all(len(G["gate"]) == 2 for G in b.groups)
+    for graph in (False, True):
+        if graph:
+            a.capture()
+            b.capture()
+        a.reset(4)
+        b.reset(4)
+        for _ in range(25):
+            for e in (a, b):
+                e.graph.replay() if graph else e.step()
+            rel = float((a.logits.float() - b.logits.float()).abs().max() / a.logits.float().abs().max())
+            assert rel < 2e-3, rel
+            b.tok.copy_(a.tok)
+            b.pos.copy_(a.pos)
+    with torch.no_grad():          # and the epilogue engine against HF itself
+        b.graph = None
+        b.reset(4)
+        toks, logits = [4], []
+        for _ in range(10):
+            b.step()
+            logits.append(b.logits.float().clone())
+            toks.append(int(b.tok))
+        ref = hf(torch.tensor([toks[:-1]], device="cuda")).logits[0].float()
+    assert float((torch.stack(logits) - ref).norm() / ref.norm()) < 2e-2

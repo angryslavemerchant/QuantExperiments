@@ -47,14 +47,20 @@ E2E_CONFIGS = [  # name, variants, extra args (s4/s5: the real stacks' per-matri
 
 # --mode profile: profile_engine (isolated / leave-one-out / torch.profiler trace), then a
 # launch-config grid for tuning on this GPU (fused engine; PDL auto = on for sm_90+ only)
-TUNE_CONFIGS = [(f"tune_L{lg}_S{sm}", "runs10,s4", ["--large", lg, "--small", sm])
+TUNE_CONFIGS = [(f"tune_L{lg}_S{sm}", "runs10,s4", ["--large", lg, "--small", sm, "--no-epilogue"])
                 for lg in ("512x2", "1024x1", "256x4") for sm in ("1024x1", "0x1", "512x2")]
 TUNE_CONFIGS += [
-    ("tune_ru2", "runs10,s4", ["--ru", "2"]),
+    ("tune_ru2", "runs10,s4", ["--ru", "2", "--no-epilogue"]),
     ("tune_nofuse", "q4,runs10,s4", ["--no-fuse"]),
-    ("tune_ref", "q4,runs12,s5,fp16", []),
+    ("tune_ref", "q4,runs12,s5,fp16", ["--no-epilogue"]),
 ]
-
+# --mode fusion: attention split x run-kernel epilogues (blocks running them), per GPU
+FUSION_CONFIGS = [("f_nofuse", "q4,runs10,s4", ["--no-fuse"])]
+FUSION_CONFIGS += [(f"f_attn{ms}_noepi", "runs10,s4", ["--no-epilogue", "--attn-split", str(ms)]) for ms in (1, 2, 4)]
+FUSION_CONFIGS += [(f"f_attn2_epi{ne}", "runs10,s4", ["--attn-split", "2", "--epi-blocks", str(ne)])
+                   for ne in (4, 8, 16, 32, 64)]
+FUSION_CONFIGS += [("f_attn2_noepi_L1024x1", "runs10,s4", ["--no-epilogue", "--attn-split", "2", "--large", "1024x1"]),
+                   ("f_attn2_noepi_ru2", "runs10,s4", ["--no-epilogue", "--attn-split", "2", "--ru", "2"])]
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -62,8 +68,10 @@ def main() -> int:
     ap.add_argument("--work", default="/workspace/scratch_e2e")
     ap.add_argument("--skip-precision", action="store_true")
     ap.add_argument("--skip-llama", action="store_true")
-    ap.add_argument("--mode", choices=("e2e", "profile"), default="e2e")
+    ap.add_argument("--mode", choices=("e2e", "profile", "fusion"), default="e2e")
     a = ap.parse_args()
+    import os
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")    # s14 5090: the xet download path failed
     out, work = Path(a.out), Path(a.work)
     out.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
@@ -88,10 +96,12 @@ def main() -> int:
     run([sys.executable, "-m", "pytest", str(ROOT.parent / "tests" / "test_decode_e2e.py"),
          str(ROOT.parent / "tests" / "test_proto_runs.py"), "-q", "-W", "ignore", "-p", "no:cacheprovider",
          "--basetemp", str(work / "pytest")], out / "tests_gpu.txt", timeout=1800)
-    if a.mode == "profile":
-        run([sys.executable, str(ROOT / "profile_engine.py"), "--variants", "q4,runs10,s4", "--trace",
+    if a.mode in ("profile", "fusion"):
+        prof = ["--no-epilogue", "--attn-split", "2"] if a.mode == "fusion" else []
+        run([sys.executable, str(ROOT / "profile_engine.py"), "--variants", "q4,runs10,s4", "--trace", *prof,
              "--json", str(out / "profile.json")], out / "profile.txt", timeout=2400)
-    for name, variants, extra in (TUNE_CONFIGS if a.mode == "profile" else E2E_CONFIGS):
+    configs = {"profile": TUNE_CONFIGS, "fusion": FUSION_CONFIGS}.get(a.mode, E2E_CONFIGS)
+    for name, variants, extra in configs:
         run([sys.executable, str(ROOT / "bench_e2e.py"), "--variants", variants, *extra,
              "--json", str(out / f"e2e_{name}.json")], out / f"e2e_{name}.txt", timeout=1800)
     if not a.skip_llama:

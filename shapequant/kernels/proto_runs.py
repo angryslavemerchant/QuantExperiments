@@ -97,7 +97,9 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
           const __half* __restrict__ row_scale, const int* __restrict__ book_off,
           const int* __restrict__ row_mask, const uint4* __restrict__ xp,
           __half* __restrict__ y, const int* __restrict__ tiles, int ntiles, int table_n,
-          const float* __restrict__ yscale, const int4* __restrict__ blk)
+          const float* __restrict__ yscale, const int4* __restrict__ blk,
+          unsigned int* ebar, const float* h_in, float* h_out, const __half* w, const __half* src,
+          const unsigned short* eperms, int EM, int EC, float eps, __half* eout)
 {
     PDL_TRIGGER();      // dependents may launch once every block is running (see pdl.py)
     const float ys = yscale[0];
@@ -206,6 +208,71 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
         #pragma unroll
         for (int r = 0; r < RU; ++r) { rows[r] = rows_n[r]; wrow[r] = wrow_n[r]; }
     }
+#if EPI
+    // Epilogue run by the last NE blocks to finish, once every block has written its rows: it
+    // stages the next matmul's input vector in shared memory (the table region, no longer needed)
+    // and writes its M column-order copies contiguously, eout[m*EC + i] = act[eperms[m*EC + i]].
+    //   EPI 1: act = rmsnorm(h_in + y) * w (residual add + norm; h_out = h_in + y)
+    //   EPI 2: act = silu(g) * u with g = src[i], u = src[EC + i] (HF rounding: fp16 silu, fp16 mul)
+    // Every block has finished reading x before any copy is written, so eout may be x's buffer.
+    {
+        __shared__ unsigned int e_ticket;
+        __shared__ float e_red[32];
+        __syncthreads();
+        if (threadIdx.x == 0) { __threadfence(); e_ticket = atomicAdd(&ebar[0], 1u); }
+        __syncthreads();
+        const unsigned int nb = gridDim.x, ne = (unsigned)NE < nb ? (unsigned)NE : nb;
+        if (e_ticket < nb - ne) return;
+        const unsigned int part = e_ticket - (nb - ne);
+        if (threadIdx.x == 0) {
+            while (atomicAdd(&ebar[0], 0u) < nb) __nanosleep(32);
+            __threadfence();
+        }
+        __syncthreads();
+        unsigned short* xs = (unsigned short*)stab;
+        const unsigned short* s16 = (const unsigned short*)src;
+#if EPI == 1
+        float ss = 0.f;
+        for (int i = threadIdx.x; i < EC; i += blockDim.x) {
+            const unsigned short a = __ldcg(s16 + i);
+            const float v = h_in[i] + __half2float(*(const __half*)&a);
+            ss += v * v;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if (lane == 0) e_red[threadIdx.x >> 5] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float t = threadIdx.x < (blockDim.x >> 5) ? e_red[threadIdx.x] : 0.f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+            if (threadIdx.x == 0) e_red[0] = t;
+        }
+        __syncthreads();
+        const float rstd = rsqrtf(e_red[0] / EC + eps);
+        for (int i = threadIdx.x; i < EC; i += blockDim.x) {
+            const unsigned short a = __ldcg(s16 + i);
+            const float v = h_in[i] + __half2float(*(const __half*)&a);
+            if (part == 0) h_out[i] = v;
+            const __half o = __float2half(v * rstd * __half2float(w[i]));
+            xs[i] = *(const unsigned short*)&o;
+        }
+#else
+        for (int i = threadIdx.x; i < EC; i += blockDim.x) {
+            const unsigned short gs = __ldcg(s16 + i), us = __ldcg(s16 + EC + i);
+            const float a = __half2float(*(const __half*)&gs);
+            const __half o = __hmul(__float2half(a / (1.f + __expf(-a))), *(const __half*)&us);
+            xs[i] = *(const unsigned short*)&o;
+        }
+#endif
+        __syncthreads();
+        unsigned short* o16 = (unsigned short*)eout;
+        const int n = EM * EC;
+        for (int kk = part * blockDim.x + threadIdx.x; kk < n; kk += ne * blockDim.x)
+            o16[kk] = xs[eperms ? eperms[kk] : kk];
+        if (threadIdx.x == 0 && atomicAdd(&ebar[1], 1u) == ne - 1) { ebar[1] = 0u; atomicExch(&ebar[0], 0u); }
+    }
+#endif
 }
 """
 
@@ -309,14 +376,14 @@ def make_tiles(row_mask: torch.Tensor, ru: int) -> torch.Tensor:
     return torch.cat(out).to(torch.int32).to(row_mask.device).contiguous()
 
 
-def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True, books=False):
+def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True, books=False, epi=0, ne=8):
     import cupy as cp
     nfull, jt = geometry(nch)
-    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe, books)
+    key = (bits, nfull, jt, smem, has_mask, threads, ru, pipe, books, epi, ne)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define SMEM {int(smem)}\n"
                f"#define HAS_MASK {int(has_mask)}\n#define THREADS {threads}\n#define RU {ru}\n"
-               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n") + PDL_DEFS + _SRC
+               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n#define EPI {epi}\n#define NE {ne}\n") + PDL_DEFS + _SRC
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs")
     return _mods[key]
 
@@ -351,7 +418,7 @@ def prep_x(rl: RunsLinear, x: torch.Tensor) -> torch.Tensor:
 
 def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: int = 4,
          threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = False,
-         pdl: bool = False) -> torch.Tensor:
+         pdl: bool = False, epi: dict | None = None) -> torch.Tensor:
     """table: "books" (and "auto" when the G-book table is over the limit but one book fits):
     book-major blocks that each copy one book. "smem" copies the codebook into shared memory per block, "global" reads it through
     L1 (no per-block copy: cheaper for small matrices, where the copies dominate), "auto" = smem
@@ -359,7 +426,11 @@ def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, block
     matrices; capped at 1024 threads). pipe: load the next
     batch's weight words while decoding the current one (skipped where it would spill).
     pdl: programmatic dependent launch (sm_90+, see pdl.py): the codebook copy overlaps the
-    previous kernel."""
+    previous kernel.
+    epi: the next matmul's input written by the last `ne` blocks (see the kernel's EPI section):
+    dict(mode=1 (add + rmsnorm) | 2 (silu * mul), ne, bar (int32[2], zeros), h_in, h_out, w (mode 1),
+    src (mode 1: this launch's y; mode 2: the [2C] gate|up output), perms (uint16 [M, C] or None),
+    C, eps, out)."""
     import cupy as cp
     y = out if out is not None else torch.empty(rl.R, dtype=torch.float16, device=x.device)
     if xp is None:
@@ -379,9 +450,10 @@ def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, block
     nt = tiles.shape[0]
     if threads == 0:   # auto: one block per SM, just enough warps to cover every tile in one round
         threads, blocks_per_sm = min(1024, max(64, math.ceil(nt / sms) * 32)), 1
-    fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, False, books)
+    mode, ne = (epi["mode"], epi["ne"]) if epi else (0, 8)
+    fn = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, False, books, mode, ne)
     if pipe:   # the pipeline's extra registers spill under a tight per-thread cap (1024 threads, RU >= 2)
-        fp = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, True, books)
+        fp = _kernel(rl.bits, rl.nch, smem, rl.has_mask, threads, rl.ru, True, books, mode, ne)
         fn = fp if fp.local_size_bytes <= fn.local_size_bytes else fn
     grid = min(sms * blocks_per_sm, math.ceil(nt / (threads // 32)))
     blk = tiles                               # unused unless book-major
@@ -393,10 +465,21 @@ def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, block
             cp.uint64(rl.row_mask.data_ptr()), cp.uint64(xp.data_ptr()), cp.uint64(y.data_ptr()),
             cp.uint64(tiles.data_ptr()), cp.int32(nt), cp.int32(K if books else rl.table.shape[0]),
             cp.uint64(yscale.data_ptr()), cp.uint64(blk.data_ptr()))
+    shm = table_bytes if smem else 0
+    if epi:
+        p = lambda t: cp.uint64(0 if t is None else t.data_ptr())   # noqa: E731
+        perms = epi.get("perms")
+        args += (p(epi["bar"]), p(epi.get("h_in")), p(epi.get("h_out")), p(epi.get("w")), p(epi["src"]), p(perms),
+                 cp.int32(1 if perms is None else perms.shape[0]), cp.int32(epi["C"]),
+                 cp.float32(epi.get("eps", 0.0)), p(epi["out"]))
+        shm = max(shm, epi["C"] * 2)
+        assert shm <= SMEM_LIMIT
+    else:
+        args += (cp.uint64(0),) * 6 + (cp.int32(0), cp.int32(0), cp.float32(0.0), cp.uint64(0))
     if pdl:
         from . import pdl as pdl_mod
-        pdl_mod.launch(fn, grid, threads, args, table_bytes if smem else 0)
+        pdl_mod.launch(fn, grid, threads, args, shm)
         return y
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-        fn((grid,), (threads,), args, shared_mem=table_bytes if smem else 0)
+        fn((grid,), (threads,), args, shared_mem=shm)
     return y
