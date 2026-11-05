@@ -27,6 +27,9 @@ runs:
   d: 4
   alloc: fisher
   budget: uniform:1024
+  # the Fisher allocation solved by s04 (and re-solved identically by qx2): skips ~35 min of
+  # CPU-bound Fisher + proxy fits; histogram {256: 33, 1024: 68, 4096: 95}
+  alloc_file: configs/alloc/s4_full.json
   G: 4
   M: 16
   rounds: 2

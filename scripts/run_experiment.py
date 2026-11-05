@@ -201,7 +201,15 @@ def main() -> int:
         from shapequant.calibrate import input_hessians
         hessians = input_hessians(model, seqs, ccfg.get("batch_size", 4))
         log(f"calibration: full input Hessians for {len(set(map(id, hessians.values())))} distinct inputs")
-    alloc_runs = [r for r in cfg["runs"] if r.get("alloc") and r["name"] not in finished]
+    for r in cfg["runs"]:
+        # a previously solved allocation (configs/alloc/*.json, exported from allocation.json):
+        # same per-matrix K without re-running Fisher + proxy fits
+        if r.get("alloc_file"):
+            d = json.loads(Path(r["alloc_file"]).read_text())
+            r["_K_by_name"] = {n: int(k) for n, k in d["choices"].items()}
+            r.setdefault("alloc", f"file:{Path(r['alloc_file']).stem}")
+            log(f"  {r['name']}: allocation from {r['alloc_file']} ({len(r['_K_by_name'])} matrices)")
+    alloc_runs = [r for r in cfg["runs"] if r.get("alloc") and not r.get("alloc_file") and r["name"] not in finished]
     if alloc_runs:
         # Per-matrix codebook sizes: Fisher + light proxy fits once, then each
         # run's allocation is solved against its own budget.
