@@ -217,7 +217,11 @@ def main() -> int:
         table = {"Ks": Ks, "names": names, "err": err, "bits": bits, "choices": {}}
         for run in alloc_runs:
             B = al.budget_bits(bits, Ks, run["budget"])
-            ch = (al.lagrangian(err, bits, B) if run["alloc"] == "fisher"
+            # alloc_Ks: restrict this run's choices to a subset of Ks (e.g. kernel-friendly sizes);
+            # the budget is still the global spec, so the leftover bits are spent within the subset
+            allowed = set(run.get("alloc_Ks", Ks))
+            run_err = [[e if Ks[i] in allowed else float("inf") for i, e in enumerate(row)] for row in err]
+            ch = (al.lagrangian(run_err, bits, B) if run["alloc"] == "fisher"
                   else al.heuristic(names, bits, B, n_layers) if run["alloc"] == "heuristic"
                   else None)
             if ch is None:

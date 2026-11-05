@@ -26,7 +26,28 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shapequant.kernels import decode_e2e as de  # noqa: E402
 
-ALLOC = {"s4": "configs/alloc/s4_full.json", "s5": "configs/alloc/s5_full.json"}   # per-matrix K of the stacks
+ALLOC = {"s4": "configs/alloc/s4_full.json", "s5": "configs/alloc/s5_full.json",   # per-matrix K of the stacks
+         "u1024": "configs/alloc/s4_kmax1024.json"}   # s4 tables restricted to K <= 1024 = uniform 1024
+
+
+def parse_variant(v: str, default_G: int):
+    """'q4' | 'fp16' | 'runsB' | ALLOC key, with optional _m<M> / _g<G> suffixes (column orders,
+    mixture books; defaults M = 16, G = default_G for ALLOC keys and 1 for runsB).
+    Returns (kind, bits, M, G, alloc key or None)."""
+    parts = v.split("_")
+    base, M, G = parts[0], 16, None
+    for t in parts[1:]:
+        if t[0] == "m":
+            M = int(t[1:])
+        elif t[0] == "g":
+            G = int(t[1:])
+        else:
+            raise ValueError(f"variant {v!r}")
+    if base in ALLOC:
+        return "runs", (12 if base == "s5" else 10), M, (default_G if G is None else G), base
+    if base.startswith("runs"):
+        return "runs", int(base[4:]), M, (1 if G is None else G), None
+    return base, 0, M, 1, None
 TYPES = ("q", "k", "v", "o", "gate", "up", "down")
 
 
@@ -94,21 +115,20 @@ def main() -> int:
     cfg = de.Cfg(layers=a.layers)
     print(f"{torch.cuda.get_device_name(0)}; Qwen2.5-7B shapes, {a.layers} layers, tg{a.tokens}, "
           f"runs: RU{a.ru} large {a.large} small {a.small} pipe {a.pipe} fuse {not a.no_fuse} pdl {a.pdl}", flush=True)
-    print(f"{'variant':10s} {'weights GB':>10s} {'tok/s':>8s} {'ms/tok':>8s} {'GEMV ms':>8s} {'other ms':>9s} {'GEMV GB/s':>10s}")
+    print(f"{'variant':16s} {'weights GB':>10s} {'tok/s':>8s} {'ms/tok':>8s} {'GEMV ms':>8s} {'other ms':>9s} {'GEMV GB/s':>10s}")
     rows = []
     for v in a.variants.split(","):
-        kind, bits = ("runs", int(v[4:])) if v.startswith("runs") else (v, 0)
-        extra = {}
-        if v in ALLOC:
-            kind, bits = "runs", 10 if v == "s4" else 12
-            extra = dict(alloc=load_alloc(ALLOC[v]), G=a.G, head_bits=a.head_bits or bits)
+        kind, bits, M, G, key = parse_variant(v, a.G)
+        extra = dict(M=M, G=G)
+        if key:
+            extra.update(alloc=load_alloc(ALLOC[key]), head_bits=a.head_bits or bits)
         try:
             eng = de.random_engine(cfg, kind, bits=bits or 10, ru=a.ru, large=cfg_pair(a.large),
                                    small=cfg_pair(a.small), pipe=a.pipe, fuse=not a.no_fuse,
                                    pdl=None if a.pdl == "auto" else a.pdl == "on", attn_split=a.attn_split, epilogue=a.epilogue, epi_blocks=a.epi_blocks,
                                    **extra)
         except torch.OutOfMemoryError:
-            print(f"{v:10s} out of memory", flush=True)
+            print(f"{v:14s} out of memory", flush=True)
             torch.cuda.empty_cache()
             continue
         t = eng.time_tokens(a.tokens)
@@ -119,7 +139,7 @@ def main() -> int:
         r = dict(variant=v, weights_gb=gb, tok_s=1 / t, ms_tok=t * 1e3, gemv_ms=tl * 1e3, other_ms=(t - tl) * 1e3,
                  gemv_gbps=gb / tl, sample_tokens=toks)
         rows.append(r)
-        print(f"{v:10s} {gb:10.2f} {1 / t:8.1f} {t * 1e3:8.3f} {tl * 1e3:8.3f} {(t - tl) * 1e3:9.3f} {gb / tl:10.0f}",
+        print(f"{v:16s} {gb:10.2f} {1 / t:8.1f} {t * 1e3:8.3f} {tl * 1e3:8.3f} {(t - tl) * 1e3:9.3f} {gb / tl:10.0f}",
               flush=True)
         if a.breakdown:
             r["breakdown_us"] = bd = breakdown(eng)

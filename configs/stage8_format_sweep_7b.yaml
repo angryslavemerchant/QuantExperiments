@@ -1,0 +1,72 @@
+# Stage 8: format speed/quality sweep on Qwen2.5-7B-Instruct at ~2.5 bpw.
+#
+# The 2.5 bpw stack (s4_full_ft: Fisher allocation over K in {256, 1024, 4096}, G=4 mixture books,
+# M=16 column orders, 512-step finetune; KL 0.154) runs at 330.7 tok/s on the 5090 (s15) against
+# 370.1 for the uniform K1024 / G1 / M16 kernel benchmark; most of the remaining non-GEMV time is
+# the M permuted input copies, and the K4096 x G4 tables need book-major mode. This sweep prices
+# each structural choice in KL, every run with the full recipe (allocation + finetune) so the
+# points are directly comparable to 0.154. Tok/s for the same structures comes from bench_e2e
+# variants (s4_m<M>_g<G>, u1024) on the 5090.
+#
+# Same header as stage 4 (eval windows, calibration, allocation tables), so the allocation for
+# every fisher run except u1024 equals s4_full's.
+# Run: python scripts/run_experiment.py --config configs/stage8_format_sweep_7b.yaml
+stage: 8
+output_dir: artifacts/qwen_s01/stage8_format_sweep_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  # control: reproduces s4_full / s4_full_ft (KL 0.204 / 0.154)
+  - {name: s8_m16_g4, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 4, M: 16, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  # no column orders: no permuted input copies at all
+  - {name: s8_m1_g4, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 4, M: 1, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s8_m4_g4, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 4, M: 4, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s8_m8_g4, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 4, M: 8, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  # no mixture books: no book-major mode, 4x smaller tables
+  - {name: s8_m16_g1, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 1, M: 16, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  # allocation + finetune only: the simplest kernel
+  - {name: s8_m1_g1, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 1, M: 1, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  # sizes capped at 1024: at this budget the optimum is all-1024 (no 4096 tables)
+  - {name: s8_u1024_m16_g4, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", rounds: 2, select_frac: 1.0, gsm8k: false, G: 4, M: 16, alloc_Ks: [256, 1024], finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

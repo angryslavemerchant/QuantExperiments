@@ -61,6 +61,15 @@ FUSION_CONFIGS += [(f"f_attn2_epi{ne}", "runs10,s4", ["--epilogue", "--attn-spli
                    for ne in (4, 8, 16, 32, 64)]
 FUSION_CONFIGS += [("f_attn2_noepi_L1024x1", "runs10,s4", ["--attn-split", "2", "--large", "1024x1"]),
                    ("f_attn2_noepi_ru2", "runs10,s4", ["--attn-split", "2", "--ru", "2"])]
+# --mode formats: tok/s of the stage-8 format variants (s4 allocation with M column orders and
+# G books varied; u1024 = sizes capped at 1024), same engine defaults as s15
+FORMAT_CONFIGS = [
+    ("fmt_m", "q4,runs10,s4,s4_m8,s4_m4,s4_m1", ["--breakdown"]),
+    ("fmt_g", "s4_g1,s4_m4_g1,s4_m1_g1", ["--breakdown"]),
+    ("fmt_u", "u1024,u1024_m4,u1024_m1,u1024_g1,u1024_m1_g1", ["--breakdown"]),
+    ("fmt_m_rep", "runs10,s4,s4_m4,s4_m1,s4_m1_g1,u1024", []),     # repeat for noise
+]
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -68,7 +77,7 @@ def main() -> int:
     ap.add_argument("--work", default="/workspace/scratch_e2e")
     ap.add_argument("--skip-precision", action="store_true")
     ap.add_argument("--skip-llama", action="store_true")
-    ap.add_argument("--mode", choices=("e2e", "profile", "fusion"), default="e2e")
+    ap.add_argument("--mode", choices=("e2e", "profile", "fusion", "formats"), default="e2e")
     a = ap.parse_args()
     import os
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")    # s14 5090: the xet download path failed
@@ -96,11 +105,12 @@ def main() -> int:
     run([sys.executable, "-m", "pytest", str(ROOT.parent / "tests" / "test_decode_e2e.py"),
          str(ROOT.parent / "tests" / "test_proto_runs.py"), "-q", "-W", "ignore", "-p", "no:cacheprovider",
          "--basetemp", str(work / "pytest")], out / "tests_gpu.txt", timeout=1800)
-    if a.mode in ("profile", "fusion"):
+    if a.mode in ("profile", "fusion", "formats"):
         prof = ["--attn-split", "2"] if a.mode == "fusion" else []
-        run([sys.executable, str(ROOT / "profile_engine.py"), "--variants", "q4,runs10,s4", "--trace", *prof,
+        pv = "s4,s4_m1,s4_m1_g1" if a.mode == "formats" else "q4,runs10,s4"
+        run([sys.executable, str(ROOT / "profile_engine.py"), "--variants", pv, "--trace", *prof,
              "--json", str(out / "profile.json")], out / "profile.txt", timeout=2400)
-    configs = {"profile": TUNE_CONFIGS, "fusion": FUSION_CONFIGS}.get(a.mode, E2E_CONFIGS)
+    configs = {"profile": TUNE_CONFIGS, "fusion": FUSION_CONFIGS, "formats": FORMAT_CONFIGS}.get(a.mode, E2E_CONFIGS)
     for name, variants, extra in configs:
         run([sys.executable, str(ROOT / "bench_e2e.py"), "--variants", variants, *extra,
              "--json", str(out / f"e2e_{name}.json")], out / f"e2e_{name}.txt", timeout=1800)

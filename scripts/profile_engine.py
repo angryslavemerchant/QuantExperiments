@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_e2e import ALLOC, cfg_pair, load_alloc  # noqa: E402
+from bench_e2e import ALLOC, cfg_pair, load_alloc, parse_variant  # noqa: E402
 from shapequant.kernels import decode_e2e as de  # noqa: E402
 
 LOO = ("embed", "addnorm", "qkv", "attn", "o", "gateup", "silu", "down", "lm_head", "argmax")
@@ -79,14 +79,13 @@ def leave_one_out(eng, ops, pairs=7):
 
 
 def build(v, cfg, a):
-    extra, kind, bits = {}, v, 10
-    if v.startswith("runs"):
-        kind, bits = "runs", int(v[4:])
-    elif v in ALLOC:
-        kind, bits = "runs", 10 if v == "s4" else 12
-        extra = dict(alloc=load_alloc(ALLOC[v]), G=4, head_bits=bits)
-    return de.random_engine(cfg, kind, bits=bits, large=cfg_pair(a.large), small=cfg_pair(a.small),
-                            pdl=None if a.pdl == "auto" else a.pdl == "on", attn_split=a.attn_split, epilogue=a.epilogue, epi_blocks=a.epi_blocks, **extra)
+    kind, bits, M, G, key = parse_variant(v, 4)
+    extra = dict(M=M, G=G)
+    if key:
+        extra.update(alloc=load_alloc(ALLOC[key]), head_bits=bits)
+    return de.random_engine(cfg, kind, bits=bits or 10, large=cfg_pair(a.large), small=cfg_pair(a.small),
+                            pdl=None if a.pdl == "auto" else a.pdl == "on", attn_split=a.attn_split,
+                            epilogue=a.epilogue, epi_blocks=a.epi_blocks, **extra)
 
 
 def isolated(eng, cfg, pos):
