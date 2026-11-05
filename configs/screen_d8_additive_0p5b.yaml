@@ -1,0 +1,23 @@
+# Local screen (RTX 2060): does d=8 additive (1024+1024, 2.5 bpw tags) beat free d=4 K1024 in KL
+# on Qwen2.5-0.5B-Instruct, with finetune? Follows scripts/screen_d8_additive.py (weighted rel error
+# 12% lower at 2.0/2.25/2.5 bpw). No masks (M=1). d4 G4 is the mixture reference.
+# Note: on 0.5B the codebook overhead is not negligible (d8 tables are 4x the d4 K1024 table),
+# so compare at bits_per_weight_ideal as well as tag bits.
+# Run: python scripts/run_experiment.py --config configs/screen_d8_additive_0p5b.yaml
+stage: 9
+output_dir: artifacts/prescreen/d8_additive_kl_0p5b
+model: Qwen/Qwen2.5-0.5B-Instruct
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 256
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 1024, num_windows: 24}
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 64, context: 1024, batch_size: 4}
+allocation: {d: 4, Ks: [256, 1024, 4096], fisher_sequences: 8, fisher_seq_len: 1024, proxy_iters: 10, proxy_fit_chunks: 250000}
+kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 32768}
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: d4_k1024, method: stack, d: 4, K: 1024, M: 1, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: d8_add1024, method: stack, d: 8, K: [1024, 1024], M: 1, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: d4_k1024_g4, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

@@ -1,0 +1,54 @@
+# Stage 9a: d=8 additive books (codeword = A[i] + B[j], 1024 + 1024 entries, 20 bits per 8 weights =
+# 2.5 bpw tags) on Qwen2.5-7B-Instruct, no allocation, G1, M1, full finetune. Direct comparison:
+# s8_u1024_m1_g1_ft (d=4 K1024 everywhere, G1, M1): KL 0.194 (s17c).
+# 0.5B screens: weighted rel error -12% vs d=4 at 2.0/2.25/2.5 bpw (scripts/screen_d8_additive.py);
+# KL after 256-step finetune 0.350 vs 0.394 for d4 K1024, tied with d4 K1024 G4 (configs/screen_d8_additive_0p5b.yaml).
+# Run: python scripts/run_experiment.py --config configs/stage9a_d8_uniform_7b.yaml
+stage: 9
+output_dir: artifacts/qwen_s01/stage9a_d8_uniform_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s9_d8_u1024, method: stack, d: 8, K: [1024, 1024], M: 1, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

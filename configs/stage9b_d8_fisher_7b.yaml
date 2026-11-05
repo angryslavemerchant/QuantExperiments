@@ -1,0 +1,55 @@
+# Stage 9b: d=8 additive books with the stage-4 Fisher allocation reused at matched tag bits:
+# d=4 K256 / K1024 / K4096 (8 / 10 / 12 bits per 4 weights) -> d=8 256+256 / 1024+1024 / 4096+4096
+# (16 / 20 / 24 bits per 8 weights), configs/alloc/s4_full.json (33 / 68 / 95 matrices). G1, M1, full finetune.
+# (Fresh d=8 proxy fits cost ~25 s per matrix on 0.5B / 2060 - about an hour on 7B - so they're skipped.)
+# Comparisons (s16/s17): s8_m1_g1_ft (same allocation at d=4, G1): KL 0.166; s8_m1_g4_ft (current stack): 0.158.
+# Note: 4096+4096 d=8 tables are 128 KB (kernel would need the global/L1 path); this is a quality test.
+# Run: python scripts/run_experiment.py --config configs/stage9b_d8_fisher_7b.yaml
+stage: 9
+output_dir: artifacts/qwen_s01/stage9b_d8_fisher_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s9_d8_fisher, method: stack, d: 8, M: 1, alloc_from: configs/alloc/s4_full.json, alloc_map: {"256": [256, 256], "1024": [1024, 1024], "4096": [4096, 4096]}, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

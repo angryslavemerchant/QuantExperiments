@@ -109,6 +109,34 @@ def sort_perm(score: torch.Tensor) -> torch.Tensor:
 
 
 
+def beam_encode2(x, wt, A, B, beam: int = 16, batch: int = 4096, refine: int = 2):
+    """Two-book additive snap: keep the `beam` best A entries per chunk (by their
+    own weighted distance), take the exact best B for each, then `refine` rounds
+    of coordinate re-selection. Returns (tags A, tags B, weighted error)."""
+    A, B = A.float(), B.float()
+    A2, B2 = A * A, B * B
+    n = x.shape[0]
+    ia = torch.empty(n, dtype=torch.long, device=x.device)
+    ib = torch.empty(n, dtype=torch.long, device=x.device)
+    beam = min(beam, A.shape[0])
+    for s in range(0, n, batch):
+        xb, wb = x[s:s + batch], wt[s:s + batch]
+        top = (wb @ A2.T - 2.0 * ((wb * xb) @ A.T)).topk(beam, dim=1, largest=False).indices
+        r = xb[:, None, :] - A[top]                                   # [b, beam, d]
+        wr = wb[:, None, :].expand_as(r)
+        dist = (wr * r * r).sum(-1, keepdim=True) + torch.einsum("bjd,kd->bjk", wr, B2) \
+            - 2.0 * torch.einsum("bjd,kd->bjk", wr * r, B)            # [b, beam, Kb]
+        v, j = dist.min(-1)
+        k = v.argmin(1)
+        rows = torch.arange(xb.shape[0], device=x.device)
+        ia[s:s + batch] = top[rows, k]
+        ib[s:s + batch] = j[rows, k]
+    for _ in range(refine):
+        ia, _ = cb.assign(x - B[ib], A, 65536, wt)
+        ib, _ = cb.assign(x - A[ia], B, 65536, wt)
+    return ia, ib, ((x - A[ia] - B[ib]).pow(2) * wt).sum(1)
+
+
 def rvq_encode(x, wt, books, batch, refine: int = 2):
     """Residual (multi-stage) snap: greedy stage by stage, then `refine` rounds
     of coordinate re-selection of each stage's tag given the others.
@@ -120,6 +148,10 @@ def rvq_encode(x, wt, books, batch, refine: int = 2):
         combo = (books32[0][:, None, :] + books32[1][None, :, :]).reshape(-1, books32[0].shape[1])
         i, err = cb.assign(x, combo, batch, wt)
         return [i // K2, i % K2], err
+    if len(books32) == 2:
+        # two large books (e.g. d=8 1024+1024): beam search, then coordinate refinement
+        ia, ib, err = beam_encode2(x, wt, books32[0], books32[1], refine=refine)
+        return [ia, ib], err
     tags, r = [], x
     for b in books32:
         i, _ = cb.assign(r, b, batch, wt)

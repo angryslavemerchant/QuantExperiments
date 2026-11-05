@@ -195,6 +195,23 @@ def main() -> int:
         importance = column_importance(model, seqs, ccfg.get("batch_size", 4))
 
     finished = done_runs(csv_path)
+    for run in cfg["runs"]:
+        if run.get("alloc_from"):
+            # Per-matrix K from a saved allocation (configs/alloc/*.json, {"choices": {name: K}}),
+            # optionally mapped to another format's sizes (alloc_map: {"<K>": K' or [Ka, Kb]}),
+            # e.g. a d=4 Fisher allocation reused for d=8 additive books at the same tag bits.
+            if run.get("alloc"):
+                raise ValueError(f"{run['name']}: alloc_from and alloc are exclusive")
+            src = json.loads(Path(run["alloc_from"]).read_text())["choices"]
+            amap = {str(k): v for k, v in run.get("alloc_map", {}).items()}
+            names = {n for n, _ in compressible_linears(model)}
+            if set(src) != names:
+                raise ValueError(f"{run['name']}: {run['alloc_from']} does not cover this model's matrices")
+            run["_K_by_name"] = {n: amap.get(str(k), k) for n, k in src.items()}
+            hist: dict[str, int] = {}
+            for v in run["_K_by_name"].values():
+                hist[str(v)] = hist.get(str(v), 0) + 1
+            log(f"  {run['name']}: allocation from {run['alloc_from']}: K histogram {hist}")
     alloc_runs = [r for r in cfg["runs"] if r.get("alloc") and r["name"] not in finished]
     if alloc_runs:
         # Per-matrix codebook sizes: Fisher + light proxy fits once, then each
