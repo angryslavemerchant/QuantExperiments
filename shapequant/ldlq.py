@@ -58,42 +58,70 @@ def ldlq_assign(u: torch.Tensor, H: torch.Tensor, books: list[torch.Tensor], row
     n, C = u.shape
     if C % d:
         raise ValueError("LDLQ needs C divisible by d")
+    dev = u.device
     block = max(d, block - block % d)
-    dead = (torch.diag(H) == 0).to(u.device)
+    nch = C // d
+    dead = (torch.diag(H) == 0).to(dev)
     if U is None:
         U = upper_chol_inv(H, damp)[0]
-    U = U.to(u.device)
-    W = u.to(torch.float32).clone()
+    U = U.to(dev)
+    # Every step's d x d quantities up front, batched (one launch, one error check, instead of
+    # an inverse + triangular solve + device sync per step): the diagonal blocks Uss, the
+    # snapping metric A = (Uss^T Uss)^-1 and Uss^-1 (error pushed onward: E = (X - q) Uss^-1).
+    ar = torch.arange(nch, device=dev)
+    Ublk = U.view(nch, d, nch, d)[ar, :, ar, :].to(torch.float64)              # [nch, d, d]
+    A_all = torch.linalg.inv(Ublk.transpose(1, 2) @ Ublk)
+    A_all = (0.5 * (A_all + A_all.transpose(1, 2))).to(torch.float32)
+    Uinv_all = torch.linalg.inv(Ublk).to(torch.float32)
+    # Rows sorted by book so each book scores only its own rows, as contiguous slices
+    # (the dominant step was every row against all G*K codewords).
+    order = torch.argsort(row_book, stable=True)
+    counts = torch.bincount(row_book, minlength=len(books)).tolist()
+    spans, s0 = [], 0
+    for g, c in enumerate(counts):
+        if c:
+            spans.append((g, s0, s0 + c))
+        s0 += c
+    W = u.to(torch.float32)[order].clone()
     W[:, dead] = 0.0
-    allb = torch.cat([b.to(torch.float32) for b in books]).to(u.device)       # [G*K, d]
-    K = books[0].shape[0]
-    pen = torch.full((n, allb.shape[0]), float("inf"), device=u.device)
-    for g in range(len(books)):
-        pen[row_book == g, g * K:(g + 1) * K] = 0.0
-    tags = torch.empty(n, C // d, dtype=torch.long, device=u.device)
-    Q = torch.empty(n, C, dtype=torch.float32, device=u.device)
+    bk = [b.to(device=dev, dtype=torch.float32) for b in books]                 # [K, d] each
+    bkT = [b.T.contiguous() for b in bk]
+    # c^T A c for every step and codeword, in slabs of steps (bounded memory on wide inputs)
+    cAc_all = [torch.empty(nch, b.shape[0], device=dev) for b in bk]
+    for c0 in range(0, nch, 256):
+        Ac = A_all[c0:c0 + 256]
+        for g, b in enumerate(bk):
+            cAc_all[g][c0:c0 + 256] = torch.einsum("kd,sde,ke->sk", b, Ac, b)
+    tags_s = torch.empty(n, nch, dtype=torch.long, device=dev)
+    Q_s = torch.empty(n, C, dtype=torch.float32, device=dev)
+    tg_s = torch.empty(n, C, dtype=torch.float32, device=dev) if targets is not None else None
     for b0 in range(0, C, block):
         b1 = min(b0 + block, C)
-        err = torch.empty(n, b1 - b0, device=u.device)
+        err = torch.empty(n, b1 - b0, device=dev)
         for i in range(b0, b1, d):
             j = slice(i, i + d)
+            c = i // d
             X = W[:, j]
-            if targets is not None:
-                targets[:, j] = X
-            Uss = U[j, j]
-            A = torch.linalg.inv(Uss.T @ Uss)
-            A = 0.5 * (A + A.T)
-            cAc = ((allb @ A) * allb).sum(1)
-            t = (cAc[None, :] - 2.0 * (X @ A) @ allb.T + pen).argmin(1)
-            q = allb[t]
-            tags[:, i // d] = t - row_book * K
-            Q[:, j] = q
-            E = torch.linalg.solve_triangular(Uss, X - q, upper=True, left=False)   # E @ Uss = X - q
+            if tg_s is not None:
+                tg_s[:, j] = X
+            A = A_all[c]
+            XA = X @ A
+            for g, r0, r1 in spans:
+                t = torch.addmm(cAc_all[g][c][None, :], XA[r0:r1], bkT[g], alpha=-2.0).argmin(1)
+                tags_s[r0:r1, c] = t
+                Q_s[r0:r1, j] = bk[g][t]
+            E = (X - Q_s[:, j]) @ Uinv_all[c]                                   # E @ Uss = X - q
             if i + d < b1:
                 W[:, i + d:b1] -= E @ U[j, i + d:b1]
             err[:, i - b0:i - b0 + d] = E
         if b1 < C:
             W[:, b1:] -= err @ U[b0:b1, b1:]
+    tags = torch.empty_like(tags_s)
+    tags[order] = tags_s
+    Q = torch.empty_like(Q_s)
+    Q[order] = Q_s
+    if targets is not None:
+        targets[order] = tg_s
     return tags, Q
 
 
