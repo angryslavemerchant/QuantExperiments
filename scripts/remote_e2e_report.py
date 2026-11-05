@@ -1,4 +1,7 @@
-"""Rented-GPU report, round 3: end-to-end decode speed of our format.
+"""Rented-GPU report, round 4: end-to-end decode speed of our format.
+
+Round 4 adds the fused engine and programmatic dependent launch (PDL); the tests
+run on the rented GPU first because PDL only overlaps kernels on sm_90+.
 
 1. DRAM read ceiling.
 2. scripts/bench_e2e.py (greedy decode tg128 on Qwen2.5-7B shapes, random
@@ -30,10 +33,16 @@ from remote_runs_report import llama_step, run  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 E2E_CONFIGS = [  # name, variants, extra args (s4/s5: the real stacks' per-matrix K, G=4 books)
-    ("ru1_512x2", "q4,runs10,s4,runs12,s5,fp16", ["--ru", "1", "--large", "512x2", "--breakdown"]),
-    ("ru1_1024x1", "runs10,s4", ["--ru", "1", "--large", "1024x1", "--breakdown"]),
-    ("ru2_512x2", "runs10,s4", ["--ru", "2", "--large", "512x2", "--breakdown"]),
-    ("ru1_512x2_g1", "s4,s5", ["--ru", "1", "--large", "512x2", "--G", "1", "--breakdown"]),
+    # defaults: fused engine (rope+attn+perm in one kernel, merged q/k/v and gate/up), PDL on sm_90+
+    ("main", "q4,runs10,s4,fp16", ["--breakdown"]),
+    ("nopdl", "runs10,s4", ["--pdl", "off"]),
+    ("nofuse_nopdl", "q4,runs10,s4", ["--no-fuse", "--pdl", "off"]),     # = the s12 engine
+    ("nofuse_pdl", "runs10,s4", ["--no-fuse", "--pdl", "on"]),
+    ("small1024x1", "runs10,s4", ["--small", "1024x1"]),
+    ("small512x1", "runs10,s4", ["--small", "512x1"]),
+    ("small256x2", "runs10,s4", ["--small", "256x2"]),
+    ("large1024x1", "runs10,s4", ["--large", "1024x1"]),
+    ("s5", "runs12,s5", []),
 ]
 
 
@@ -60,11 +69,17 @@ def main() -> int:
     (out / "gpu.json").write_text(json.dumps(info, indent=1))
     if not ok:
         return 0
+    # correctness on this GPU first (PDL only really overlaps kernels on sm_90+, never locally)
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        run([sys.executable, "-m", "pip", "install", "pytest==9.0.2"], out / "pip_pytest.txt")
+    run([sys.executable, "-m", "pytest", str(ROOT.parent / "tests" / "test_decode_e2e.py"),
+         str(ROOT.parent / "tests" / "test_proto_runs.py"), "-q", "-W", "ignore", "-p", "no:cacheprovider",
+         "--basetemp", str(work / "pytest")], out / "tests_gpu.txt", timeout=1800)
     for name, variants, extra in E2E_CONFIGS:
         run([sys.executable, str(ROOT / "bench_e2e.py"), "--variants", variants, *extra,
              "--json", str(out / f"e2e_{name}.json")], out / f"e2e_{name}.txt", timeout=1800)
-    run([sys.executable, str(ROOT / "bench_runs.py"), "--bits", "10,12", "--ru", "1,2", "--patterns", "random",
-         "--cfgs", "512x2,512x2n,1024x1,1024x1n,256x4,0x1"], out / "runs_speed_cfgs.txt")
     if not a.skip_llama:
         try:
             llama_step(out, work, ["Q4_0", "IQ2_M"])

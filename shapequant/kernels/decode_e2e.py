@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .pdl import PDL_DEFS
+
 _SRC = r"""
 #include <cuda_fp16.h>
 
@@ -59,6 +61,8 @@ __device__ __forceinline__ float block_max(float v, float* red) {
 }
 
 extern "C" __global__ void embed(const __half* E, const long long* tok, int rows, int C, float* h) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
     const long long t = tok[0] % rows;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
         h[i] = __half2float(E[t * C + i]);
@@ -69,6 +73,8 @@ extern "C" __global__ void embed(const __half* E, const long long* tok, int rows
 // block 0 writes h_out (ping-pong buffers, so no block reads a half-updated residual).
 extern "C" __global__ void addnorm_perm(const float* h_in, float* h_out, const __half* add, const __half* w,
                                         const unsigned short* perms, int M, int C, float eps, __half* out) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
     extern __shared__ __half xs[];
     __shared__ float red[32];
     float ss = 0.f;
@@ -100,6 +106,8 @@ __device__ __forceinline__ void gather_out(const __half* xs, const unsigned shor
 }
 
 extern "C" __global__ void perm_copy(const __half* x, const unsigned short* perms, int C, int MC, __half* out) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
     extern __shared__ __half xs[];
     for (int i = threadIdx.x; i < C; i += blockDim.x) xs[i] = x[i];
     gather_out(xs, perms, C, MC, out);
@@ -107,6 +115,8 @@ extern "C" __global__ void perm_copy(const __half* x, const unsigned short* perm
 
 extern "C" __global__ void silu_mul_perm(const __half* g, const __half* u, const unsigned short* perms, int C, int MC,
                                          __half* out) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
     extern __shared__ __half xs[];
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         const float a = __half2float(g[i]);
@@ -121,6 +131,8 @@ extern "C" __global__ void silu_mul_perm(const __half* g, const __half* u, const
 extern "C" __global__ void rope_cache(const __half* q, const __half* k, const __half* v,
                                       const __half* bq, const __half* bk, const __half* bv,
                                       const int* pos, float theta, __half* qo, __half* kc, __half* vc) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
     const int b = blockIdx.x, i = threadIdx.x, half = HD / 2, p = *pos;
     const float inv = 1.f / powf(theta, (2.f * i) / HD);
     const float ang = (float)p * inv;
@@ -146,6 +158,8 @@ extern "C" __global__ void rope_cache(const __half* q, const __half* k, const __
 // one block of HD (=128) threads per query head; attends over cache positions 0..*pos
 extern "C" __global__ void attn(const __half* q, const __half* kc, const __half* vc, const int* pos,
                                 float scale, __half* out) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
     __shared__ float sc[MAXLEN];
     __shared__ float red[32];
     const int h = blockIdx.x, kv = h / (NH / NKV), L = *pos + 1;
@@ -173,6 +187,76 @@ extern "C" __global__ void attn(const __half* q, const __half* kc, const __half*
     float acc = 0.f;
     for (int t = 0; t < L; ++t) acc += sc[t] * __half2float(vc[((size_t)kv * MAXLEN + t) * HD + d]);
     out[h * HD + d] = __float2half(acc / s);
+}
+
+// rope_cache + attn + the o input's column-order copies in one kernel. One block of HD threads per
+// query head: it rotates its q and its group's current k itself (bias added and rounded as in
+// rope_cache), the group's first block writes k/v at *pos into the cache, position *pos is read from
+// shared memory (no block reads it from the cache in this launch), and the head's outputs are
+// scattered into the M copies through the inverse orders: out[m*C + inv[m*C + j]] = o[j].
+extern "C" __global__ void attn_rope(const __half* q, const __half* k, const __half* v,
+                                     const __half* bq, const __half* bk, const __half* bv,
+                                     const int* pos, float theta, __half* kc, __half* vc, float scale,
+                                     const unsigned short* inv, int M, int C, __half* out) {
+    PDL_TRIGGER();
+    PDL_WAIT();     // reads the previous kernel's output right away
+    __shared__ float sc[MAXLEN];
+    __shared__ float red[32];
+    __shared__ __half qs[HD], ks[HD], vs[HD];
+    const int h = blockIdx.x, kv = h / (NH / NKV), p = *pos, L = p + 1, i = threadIdx.x, half = HD / 2;
+    const __half z = __float2half(0.f);
+    if (i < half) {
+        const float inv_f = 1.f / powf(theta, (2.f * i) / HD);
+        const float ang = (float)p * inv_f;
+        const float c = __half2float(__float2half(cosf(ang))), s = __half2float(__float2half(sinf(ang)));
+        const int o = h * HD;
+        float x1 = __half2float(__hadd(q[o + i], bq ? bq[o + i] : z));
+        float x2 = __half2float(__hadd(q[o + i + half], bq ? bq[o + i + half] : z));
+        qs[i] = __float2half(x1 * c - x2 * s);
+        qs[i + half] = __float2half(x2 * c + x1 * s);
+        const int ok = kv * HD;
+        x1 = __half2float(__hadd(k[ok + i], bk ? bk[ok + i] : z));
+        x2 = __half2float(__hadd(k[ok + i + half], bk ? bk[ok + i + half] : z));
+        ks[i] = __float2half(x1 * c - x2 * s);
+        ks[i + half] = __float2half(x2 * c + x1 * s);
+    }
+    vs[i] = __hadd(v[kv * HD + i], bv ? bv[kv * HD + i] : z);
+    __syncthreads();
+    if (h % (NH / NKV) == 0) {
+        const size_t co = ((size_t)kv * MAXLEN + p) * HD;
+        kc[co + i] = ks[i];
+        vc[co + i] = vs[i];
+    }
+    const int lane = i & 31, warp = i >> 5, nw = blockDim.x >> 5;
+    float qv[HD / 32];
+    #pragma unroll
+    for (int j = 0; j < HD / 32; ++j) qv[j] = __half2float(qs[lane * (HD / 32) + j]);
+    for (int t = warp; t < L; t += nw) {
+        const __half* kp = (t == p ? ks : kc + ((size_t)kv * MAXLEN + t) * HD) + lane * (HD / 32);
+        float d = 0.f;
+        #pragma unroll
+        for (int j = 0; j < HD / 32; ++j) d += qv[j] * __half2float(kp[j]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+        if (lane == 0) sc[t] = d * scale;
+    }
+    __syncthreads();
+    float m = -3.0e38f;
+    for (int t = i; t < L; t += blockDim.x) m = fmaxf(m, sc[t]);
+    m = block_max(m, red);
+    float s = 0.f;
+    for (int t = i; t < L; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; s += e; }
+    s = block_sum(s, red);
+    float acc = 0.f;
+    for (int t = 0; t < p; ++t) acc += sc[t] * __half2float(vc[((size_t)kv * MAXLEN + t) * HD + i]);
+    acc += sc[p] * __half2float(vs[i]);
+    const __half val = __float2half(acc / s);
+    const int j = h * HD + i;
+    if (inv) {
+        for (int mm = 0; mm < M; ++mm) out[mm * C + inv[mm * C + j]] = val;
+    } else {
+        out[j] = val;
+    }
 }
 """
 
@@ -242,6 +326,7 @@ class RunsLin:
         assert self.C < 32768
         self.perms = rl.perms_l.to(torch.int16).contiguous() if rl.has_mask else None   # read as uint16
         self.threads, self.bps, self.pipe = threads, blocks_per_sm, pipe
+        self.pdl = False        # set by DecodeEngine
 
     @classmethod
     def random(cls, R, C, bits, perms, g: torch.Generator, ru=1, dev="cuda", G=1, **launch):
@@ -267,10 +352,52 @@ class RunsLin:
 
     def run(self, xp, y):
         from . import proto_runs as pr
-        pr.gemv(self.rl, xp, y, xp=xp, threads=self.threads, blocks_per_sm=self.bps, pipe=self.pipe)
+        pr.gemv(self.rl, xp, y, xp=xp, threads=self.threads, blocks_per_sm=self.bps, pipe=self.pipe, pdl=self.pdl)
 
     def nbytes(self):
         return self.rl.stored_bytes() + self.rl.R * 2 + self.rl.table.numel() * 2
+
+
+def mergeable(a, b) -> bool:
+    """Two linears can run as one launch: run kernel, same tag bits / width / RU / column orders."""
+    return (isinstance(a, RunsLin) and isinstance(b, RunsLin) and a.rl.bits == b.rl.bits and a.C == b.C
+            and a.rl.ru == b.rl.ru and a.rl.has_mask == b.rl.has_mask
+            and (a.perms is b.perms or (a.perms is not None and b.perms is not None and torch.equal(a.perms, b.perms))))
+
+
+def merge_runs(lins: list, threads: int, blocks_per_sm: int) -> RunsLin:
+    """One RunsLin over the stacked rows of `lins` (all mergeable): output rows are concatenated.
+    Each matrix's books become books of the merged table (book_off shifted). The tables keep their
+    own power-of-two scales; the differences go into the fp16 row scales (exact powers of two), so
+    the merged launch computes bit-identical outputs."""
+    import math
+    from . import proto_runs as pr
+    r0 = lins[0].rl
+    ks = [round(math.log2(float(l.rl.yscale))) for l in lins]
+    k = max(ks)
+    tabs, offs, rss, base = [], [], [], 0
+    for l, ki in zip(lins, ks):
+        tabs.append(l.rl.table)
+        offs.append(l.rl.book_off + base)
+        rs = (l.rl.row_scale.float() * 2.0 ** (ki - k)).half()
+        assert torch.equal(rs.float() * 2.0 ** (k - ki), l.rl.row_scale.float()), "row scale underflow"
+        rss.append(rs)
+        base += l.rl.table.shape[0]
+    rl = object.__new__(pr.RunsLinear)
+    rl.ru, rl.R, rl.nch, rl.bits = r0.ru, sum(l.R for l in lins), r0.nch, r0.bits
+    rl.words = torch.cat([l.rl.words for l in lins]).contiguous()
+    rl.table = torch.cat(tabs).contiguous()
+    rl.yscale = torch.tensor([2.0 ** k], dtype=torch.float32, device=r0.table.device)
+    rl.row_scale = torch.cat(rss).contiguous()
+    rl.book_off = torch.cat(offs).to(torch.int32).contiguous()
+    rl.row_mask = torch.cat([l.rl.row_mask for l in lins]).contiguous()
+    rl.perms_l, rl.has_mask = r0.perms_l, r0.has_mask
+    rl.tiles = pr.make_tiles(rl.row_mask, rl.ru)
+    off = 0
+    for l in lins:      # the originals keep working, as views (no second copy of the weights)
+        l.rl.words = rl.words[off:off + l.R]
+        off += l.R
+    return RunsLin(rl, threads=threads, blocks_per_sm=blocks_per_sm, pipe=lins[0].pipe)
 
 
 # ---------------------------------------------------------------- engine
@@ -283,7 +410,7 @@ def _fn(name, cfg: Cfg):
     key = (cfg.n_heads, cfg.n_kv, cfg.head_dim, cfg.max_len)
     if key not in _mods:
         defs = f"#define NH {cfg.n_heads}\n#define NKV {cfg.n_kv}\n#define HD {cfg.head_dim}\n#define MAXLEN {cfg.max_len}\n"
-        _mods[key] = cp.RawModule(code=defs + _SRC)
+        _mods[key] = cp.RawModule(code=defs + PDL_DEFS + _SRC)
     return _mods[key].get_function(name)
 
 
@@ -296,7 +423,11 @@ class DecodeEngine:
     """layers: list of dicts with ln1, ln2 (fp16 [hidden]), q, k, v, o, gate, up, down (linears),
     bq, bk, bv (fp16 bias or None). Linears in a group (q/k/v; gate/up) must share `perms`."""
 
-    def __init__(self, cfg: Cfg, embed: torch.Tensor, layers: list, final_norm: torch.Tensor, lm_head, dev="cuda"):
+    def __init__(self, cfg: Cfg, embed: torch.Tensor, layers: list, final_norm: torch.Tensor, lm_head, dev="cuda",
+                 fuse: bool = True, large=(512, 2), small=(0, 1), pdl: bool | None = None):
+        """fuse: rope + attention + the o input's copies in one kernel, and linears reading the same
+        input with the same tag bits (q/k/v, gate/up) merged into one launch (launch config
+        `large` for merged matrices over 4096 rows, else `small`)."""
         assert cfg.head_dim == 128 and cfg.n_heads % cfg.n_kv == 0 and cfg.max_len <= 8192
         self.cfg, self.embed, self.layers, self.final_norm, self.lm_head = cfg, embed, layers, final_norm, lm_head
         for L in layers:
@@ -313,9 +444,49 @@ class DecodeEngine:
         self.xp = torch.empty(mx(all_lins), **f16)
         self.hb = [torch.empty(H, dtype=torch.float32, device=dev) for _ in range(2)]   # residual, ping-pong
         self.cur = 0
-        self.yq, self.yk, self.yv = (torch.empty(n, **f16) for n in (NH * HD, NKV * HD, NKV * HD))
+        # q|k|v and gate|up outputs are contiguous so a merged launch writes them in one go
+        self.yqkv = torch.empty(NH * HD + 2 * NKV * HD, **f16)
+        self.yq, self.yk, self.yv = self.yqkv[:NH * HD], self.yqkv[NH * HD:(NH + NKV) * HD], self.yqkv[(NH + NKV) * HD:]
         self.qr, self.ao, self.yo = torch.empty(NH * HD, **f16), torch.empty(NH * HD, **f16), torch.empty(H, **f16)
-        self.yg, self.yu, self.yd = torch.empty(cfg.inter, **f16), torch.empty(cfg.inter, **f16), torch.empty(H, **f16)
+        self.ygu = torch.empty(2 * cfg.inter, **f16)
+        self.yg, self.yu, self.yd = self.ygu[:cfg.inter], self.ygu[cfg.inter:], torch.empty(H, **f16)
+        self.fuse = fuse
+        from . import pdl as pdl_mod
+        self.pdl = pdl_mod.supported(dev) if pdl is None else pdl
+        outs = dict(q=self.yq, k=self.yk, v=self.yv, gate=self.yg, up=self.yu)
+        self.groups = []    # per layer: [(linear, output view)] for the q/k/v and gate/up stages
+        for L in layers:
+            gl = {}
+            for stage in (("q", "k", "v"), ("gate", "up")):
+                runs = [[stage[0]]]
+                for n in stage[1:]:
+                    if fuse and mergeable(L[runs[-1][-1]], L[n]):
+                        runs[-1].append(n)
+                    else:
+                        runs.append([n])
+                plan = []
+                for r in runs:
+                    if len(r) == 1:
+                        plan.append((L[r[0]], outs[r[0]]))
+                    else:
+                        R = sum(L[n].R for n in r)
+                        th, bps = small if R <= 4096 else large
+                        start = outs[r[0]].data_ptr()
+                        base = (self.yqkv if stage[0] == "q" else self.ygu)
+                        off = (start - base.data_ptr()) // 2
+                        plan.append((merge_runs([L[n] for n in r], th, bps), base[off:off + R]))
+                gl[stage[0]] = plan
+            if fuse and L["o"].perms is not None:
+                p = L["o"].perms.long()
+                inv = torch.empty_like(p)
+                inv.scatter_(1, p, torch.arange(p.shape[1], device=p.device).expand_as(p).contiguous())
+                gl["oinv"] = inv.to(torch.int16).contiguous()
+            self.groups.append(gl)
+        lins = [lm_head] + [l for L in layers for l in L.values() if isinstance(l, RunsLin)]
+        lins += [lin for G in self.groups for st in ("q", "gate") for lin, _ in G[st]]
+        for lin in lins:
+            if isinstance(lin, RunsLin):
+                lin.pdl = self.pdl
         self.logits = torch.empty(lm_head.R, **f16)
         self.kc = torch.zeros(len(layers), NKV, cfg.max_len, HD, **f16)
         self.vc = torch.zeros(len(layers), NKV, cfg.max_len, HD, **f16)
@@ -328,7 +499,11 @@ class DecodeEngine:
     def _launch(self, name, grid, block, args, smem=0):
         import cupy as cp
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-            _fn(name, self.cfg)((grid,), (block,), args, shared_mem=smem)
+            if self.pdl:
+                from . import pdl as pdl_mod
+                pdl_mod.launch(_fn(name, self.cfg), grid, block, args, smem)
+            else:
+                _fn(name, self.cfg)((grid,), (block,), args, shared_mem=smem)
 
     def _addnorm(self, add, w, lin):
         import cupy as cp
@@ -354,34 +529,44 @@ class DecodeEngine:
         import cupy as cp
         cfg = self.cfg
         if self.only_linears:   # GEMV-only timing: the same linears in the same order, nothing else
-            for L in self.layers:
-                for n, y in (("q", self.yq), ("k", self.yk), ("v", self.yv), ("o", self.yo), ("gate", self.yg),
-                             ("up", self.yu), ("down", self.yd)):
-                    L[n].run(self.xp, y)
+            for L, G in zip(self.layers, self.groups):
+                for lin, y in G["q"]:
+                    lin.run(self.xp, y)
+                L["o"].run(self.xp, self.yo)
+                for lin, y in G["gate"]:
+                    lin.run(self.xp, y)
+                L["down"].run(self.xp, self.yd)
             self.lm_head.run(self.xp, self.logits)
             return
         self.cur = 0
         self._launch("embed", 16, 256, (_ptr(self.embed), _ptr(self.tok), cp.int32(self.embed.shape[0]),
                                         cp.int32(cfg.hidden), _ptr(self.hb[0])))
         add = None
-        for li, L in enumerate(self.layers):
+        for li, (L, G) in enumerate(zip(self.layers, self.groups)):
             self._addnorm(add, L["ln1"], L["q"])
-            L["q"].run(self.xp, self.yq)
-            L["k"].run(self.xp, self.yk)
-            L["v"].run(self.xp, self.yv)
+            for lin, y in G["q"]:
+                lin.run(self.xp, y)
             kc, vc = self.kc[li], self.vc[li]
-            self._launch("rope_cache", cfg.n_heads + cfg.n_kv, cfg.head_dim // 2,
-                         (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
-                          _ptr(L.get("bv")), _ptr(self.pos), cp.float32(cfg.rope_theta), _ptr(self.qr),
-                          _ptr(kc), _ptr(vc)))
-            self._launch("attn", cfg.n_heads, cfg.head_dim,
-                         (_ptr(self.qr), _ptr(kc), _ptr(vc), _ptr(self.pos), cp.float32(cfg.head_dim ** -0.5),
-                          _ptr(self.ao)))
-            self._elementwise("perm_copy", (self.ao,), L["o"])
+            if self.fuse:
+                inv = G.get("oinv")
+                self._launch("attn_rope", cfg.n_heads, cfg.head_dim,
+                             (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
+                              _ptr(L.get("bv")), _ptr(self.pos), cp.float32(cfg.rope_theta), _ptr(kc), _ptr(vc),
+                              cp.float32(cfg.head_dim ** -0.5), _ptr(inv),
+                              cp.int32(1 if inv is None else inv.shape[0]), cp.int32(L["o"].C), _ptr(self.xp)))
+            else:
+                self._launch("rope_cache", cfg.n_heads + cfg.n_kv, cfg.head_dim // 2,
+                             (_ptr(self.yq), _ptr(self.yk), _ptr(self.yv), _ptr(L.get("bq")), _ptr(L.get("bk")),
+                              _ptr(L.get("bv")), _ptr(self.pos), cp.float32(cfg.rope_theta), _ptr(self.qr),
+                              _ptr(kc), _ptr(vc)))
+                self._launch("attn", cfg.n_heads, cfg.head_dim,
+                             (_ptr(self.qr), _ptr(kc), _ptr(vc), _ptr(self.pos), cp.float32(cfg.head_dim ** -0.5),
+                              _ptr(self.ao)))
+                self._elementwise("perm_copy", (self.ao,), L["o"])
             L["o"].run(self.xp, self.yo)
             self._addnorm(self.yo, L["ln2"], L["gate"])
-            L["gate"].run(self.xp, self.yg)
-            L["up"].run(self.xp, self.yu)
+            for lin, y in G["gate"]:
+                lin.run(self.xp, y)
             self._elementwise("silu_mul_perm", (self.yg, self.yu), L["down"])
             L["down"].run(self.xp, self.yd)
             add = self.yd
@@ -443,7 +628,8 @@ class DecodeEngine:
 
 def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int = 1, large=(512, 1),
                   small=(0, 1), pipe=False, embed_rows: int = 32768, seed: int = 0, dev="cuda",
-                  G: int = 1, alloc: dict | None = None, head_bits: int | None = None) -> DecodeEngine:
+                  G: int = 1, alloc: dict | None = None, head_bits: int | None = None, fuse: bool = True,
+                  pdl: bool | None = None) -> DecodeEngine:
     """Random-weight engine (speed only). kind: fp16 | q4 | runs. Column orders are shared within
     q/k/v and gate/up; each layer/group draws its own. embed_rows: the token embedding is only read
     one row per step, so a truncated table (tok % rows) keeps memory down without changing speed.
@@ -485,4 +671,4 @@ def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int =
         torch.cuda.empty_cache()
     head = lin(cfg.vocab, H, perms(H))
     embed = (torch.randn(min(embed_rows, cfg.vocab), H, device=dev, generator=g) * 0.02).half()
-    return DecodeEngine(cfg, embed, layers, vec(H, 0.1, 1.0), head, dev)
+    return DecodeEngine(cfg, embed, layers, vec(H, 0.1, 1.0), head, dev, fuse=fuse, large=large, small=small, pdl=pdl)

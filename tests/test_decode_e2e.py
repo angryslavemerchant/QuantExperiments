@@ -51,7 +51,7 @@ def _packed(R, C, perms, seed, bits=10):
     return lin, tags
 
 
-def _engine(hf, kind):
+def _engine(hf, kind, fuse=True):
     """Engine with `kind` linears; HF weights are replaced by what the engine actually computes with."""
     sd = hf.model
     gc = torch.Generator().manual_seed(3)
@@ -86,13 +86,17 @@ def _engine(hf, kind):
                                down=make(mlp.down_proj, pd), bq=a.q_proj.bias.half(), bk=a.k_proj.bias.half(),
                                bv=a.v_proj.bias.half()))
         head = make(hf.lm_head, perms(CFG.hidden))
-    return de.DecodeEngine(CFG, sd.embed_tokens.weight.half().contiguous(), layers, sd.norm.weight.half(), head)
+    return de.DecodeEngine(CFG, sd.embed_tokens.weight.half().contiguous(), layers, sd.norm.weight.half(), head,
+                           fuse=fuse)
 
 
 @pytest.mark.parametrize("kind", ["dense", "q4", "runs"])
-def test_engine_matches_hf(kind):
+@pytest.mark.parametrize("fuse", [True, False])
+def test_engine_matches_hf(kind, fuse):
     hf = _hf()
-    eng = _engine(hf, kind)
+    eng = _engine(hf, kind, fuse)
+    if fuse and kind == "runs":    # q/k/v and gate/up share bits and orders here: one launch each
+        assert all(len(G["q"]) == 1 and len(G["gate"]) == 1 for G in eng.groups)
     eng.reset(7)
     toks, logits = [7], []
     for _ in range(12):
@@ -118,3 +122,41 @@ def test_graph_replay_matches_eager():
         eng.graph.replay()
         replay.append(int(eng.tok))
     assert replay == eager
+
+
+def test_fused_matches_unfused_exactly():
+    """Fusion changes launches, not arithmetic: same logits bit for bit over 20 steps (tokens
+    from the unfused engine fed to both)."""
+    hf = _hf()
+    a, b = _engine(hf, "runs", fuse=False), _engine(hf, "runs", fuse=True)
+    a.reset(5)
+    b.reset(5)
+    for _ in range(20):
+        a.step()
+        b.step()
+        assert torch.equal(a.logits, b.logits)
+        b.tok.copy_(a.tok)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_pdl_matches_plain_launches(graph):
+    """Programmatic dependent launch changes scheduling only: bit-identical logits and tokens
+    (on sm_90+ this exercises the real overlap; below it, the cuLaunchKernelEx path)."""
+    hf = _hf()
+    a, b = _engine(hf, "runs"), _engine(hf, "runs")
+    a.pdl = False
+    b.pdl = True
+    for eng in (a, b):
+        for lin in [eng.lm_head] + [l for G in eng.groups for st in ("q", "gate") for l, _ in G[st]] + \
+                [L[n] for L in eng.layers for n in ("o", "down")]:
+            lin.pdl = eng.pdl
+    if graph:
+        a.capture()
+        b.capture()
+    a.reset(9)
+    b.reset(9)
+    for _ in range(24):
+        for eng in (a, b):
+            eng.graph.replay() if graph else eng.step()
+        assert torch.equal(a.logits, b.logits)
+        assert int(a.tok) == int(b.tok)

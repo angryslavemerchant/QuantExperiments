@@ -83,11 +83,14 @@ def main() -> int:
     ap.add_argument("--G", type=int, default=4, help="mixture books for s4/s5")
     ap.add_argument("--head-bits", type=int, default=0, help="lm_head bits for s4/s5 (0: 10 for s4, 12 for s5)")
     ap.add_argument("--breakdown", action="store_true", help="also time each linear type alone (us/token)")
+    ap.add_argument("--no-fuse", action="store_true", help="separate rope/attn/perm kernels and unmerged q/k/v, gate/up")
+    ap.add_argument("--pdl", choices=("auto", "on", "off"), default="auto",
+                    help="programmatic dependent launch (auto: on for sm_90+)")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     cfg = de.Cfg(layers=a.layers)
     print(f"{torch.cuda.get_device_name(0)}; Qwen2.5-7B shapes, {a.layers} layers, tg{a.tokens}, "
-          f"runs: RU{a.ru} large {a.large} small {a.small} pipe {a.pipe}", flush=True)
+          f"runs: RU{a.ru} large {a.large} small {a.small} pipe {a.pipe} fuse {not a.no_fuse} pdl {a.pdl}", flush=True)
     print(f"{'variant':10s} {'weights GB':>10s} {'tok/s':>8s} {'ms/tok':>8s} {'GEMV ms':>8s} {'other ms':>9s} {'GEMV GB/s':>10s}")
     rows = []
     for v in a.variants.split(","):
@@ -98,7 +101,8 @@ def main() -> int:
             extra = dict(alloc=load_alloc(ALLOC[v]), G=a.G, head_bits=a.head_bits or bits)
         try:
             eng = de.random_engine(cfg, kind, bits=bits or 10, ru=a.ru, large=cfg_pair(a.large),
-                                   small=cfg_pair(a.small), pipe=a.pipe, **extra)
+                                   small=cfg_pair(a.small), pipe=a.pipe, fuse=not a.no_fuse,
+                                   pdl=None if a.pdl == "auto" else a.pdl == "on", **extra)
         except torch.OutOfMemoryError:
             print(f"{v:10s} out of memory", flush=True)
             torch.cuda.empty_cache()

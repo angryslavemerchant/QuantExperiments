@@ -24,6 +24,8 @@ import math
 
 import torch
 
+from .pdl import PDL_DEFS
+
 _SRC = r"""
 #include <cuda_fp16.h>
 typedef unsigned int u32;
@@ -97,6 +99,7 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
           __half* __restrict__ y, const int* __restrict__ tiles, int ntiles, int table_n,
           const float* __restrict__ yscale, const int4* __restrict__ blk)
 {
+    PDL_TRIGGER();      // dependents may launch once every block is running (see pdl.py)
     const float ys = yscale[0];
     extern __shared__ uint2 stab[];
     const int lane = threadIdx.x & 31;
@@ -155,6 +158,7 @@ gemv_runs(const u32* __restrict__ words, const uint2* __restrict__ table,
 #else
     const uint2* tab = table;
 #endif
+    PDL_WAIT();         // x / y belong to the neighbouring kernels: everything above is weights only
     constexpr int NPAIR = (NFULL * 8 + JT) * 32;   // chunk pairs per row
     for (; ti < ntiles; ti += tstride) {
         const uint2* tbr[RU];
@@ -312,7 +316,7 @@ def _kernel(bits, nch, smem, has_mask, threads, ru, pipe=True, books=False):
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define SMEM {int(smem)}\n"
                f"#define HAS_MASK {int(has_mask)}\n#define THREADS {threads}\n#define RU {ru}\n"
-               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n") + _SRC
+               f"#define PIPE {int(pipe)}\n#define BOOKS {int(books)}\n") + PDL_DEFS + _SRC
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs")
     return _mods[key]
 
@@ -346,13 +350,16 @@ def prep_x(rl: RunsLinear, x: torch.Tensor) -> torch.Tensor:
 
 
 def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, blocks_per_sm: int = 4,
-         threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = False) -> torch.Tensor:
+         threads: int = 256, xp: torch.Tensor | None = None, table: str = "auto", pipe: bool = False,
+         pdl: bool = False) -> torch.Tensor:
     """table: "books" (and "auto" when the G-book table is over the limit but one book fits):
     book-major blocks that each copy one book. "smem" copies the codebook into shared memory per block, "global" reads it through
     L1 (no per-block copy: cheaper for small matrices, where the copies dominate), "auto" = smem
     when it fits. threads=0: one block per SM sized to cover all tiles in one round (small
     matrices; capped at 1024 threads). pipe: load the next
-    batch's weight words while decoding the current one (skipped where it would spill)."""
+    batch's weight words while decoding the current one (skipped where it would spill).
+    pdl: programmatic dependent launch (sm_90+, see pdl.py): the codebook copy overlaps the
+    previous kernel."""
     import cupy as cp
     y = out if out is not None else torch.empty(rl.R, dtype=torch.float16, device=x.device)
     if xp is None:
@@ -381,12 +388,15 @@ def gemv(rl: RunsLinear, x: torch.Tensor, out: torch.Tensor | None = None, block
     if books:
         blk = book_blocks(rl, K, grid, threads // 32)
         grid = blk.shape[0]
-    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-        fn((grid,), (threads,),
-           (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()),
+    args = (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()),
             cp.uint64(rl.row_scale.data_ptr()), cp.uint64(rl.book_off.data_ptr()),
             cp.uint64(rl.row_mask.data_ptr()), cp.uint64(xp.data_ptr()), cp.uint64(y.data_ptr()),
             cp.uint64(tiles.data_ptr()), cp.int32(nt), cp.int32(K if books else rl.table.shape[0]),
-            cp.uint64(yscale.data_ptr()), cp.uint64(blk.data_ptr())),
-           shared_mem=table_bytes if smem else 0)
+            cp.uint64(yscale.data_ptr()), cp.uint64(blk.data_ptr()))
+    if pdl:
+        from . import pdl as pdl_mod
+        pdl_mod.launch(fn, grid, threads, args, table_bytes if smem else 0)
+        return y
+    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+        fn((grid,), (threads,), args, shared_mem=table_bytes if smem else 0)
     return y
