@@ -90,3 +90,42 @@ def test_rotated_ldlq_fit_roundtrips_through_finetune_wrapper():
         assert torch.allclose(y, x @ out.T, atol=1e-4), float((y - x @ out.T).abs().max())
         baked = wrap.bake()
     assert torch.allclose(baked, out, atol=2e-3)                 # fp16 rounding of books/scales only
+
+
+def test_float32_factor_matches_float64(monkeypatch):
+    from shapequant import ldlq
+    H = _correlated_H(192, seed=6)
+    u64, _ = ldlq.upper_chol_inv(H, 0.01)
+    monkeypatch.setattr(ldlq, "F64_MAX_C", 64)            # force the float32 path
+    u32, _ = ldlq.upper_chol_inv(H, 0.01)
+    assert float((u32 - u64).abs().max() / u64.abs().max()) < 1e-3
+
+
+def test_ldlq_refit_keeps_or_lowers_output_error():
+    g = torch.Generator().manual_seed(7)
+    R, C = 128, 128
+    w = torch.randn(R, C, generator=g).to(DEV)
+    H = _correlated_H(C, seed=7).to(DEV)
+    h = torch.diag(H).contiguous()
+    kw = dict(G=2, M=2, rounds=1, iters=5, refit_iters=2, seed=3, keep_tags=True, H=H, ldlq_damp=1e-3)
+    a = mk.compress_mixture(w, h, 4, 32, **kw)
+    b = mk.compress_mixture(w, h, 4, 32, ldlq_refit=2, **kw)
+    ea, eb = output_error(w, a.decoded, H), output_error(w, b.decoded, H)
+    assert torch.isfinite(b.decoded).all() and b.tags[0].shape == a.tags[0].shape
+    assert eb <= ea * 1.02, (ea, eb)
+
+
+def test_ldlq_with_large_mixture_table_uses_int32_tags():
+    """3 bpw recipe shape: G * K > 32767 (int32 tags), LDLQ, fine-tune wrapper decode."""
+    g = torch.Generator().manual_seed(8)
+    R, C, K = 512, 256, 16384
+    w = torch.randn(R, C, generator=g).to(DEV)
+    H = _correlated_H(C, seed=8).to(DEV)
+    fit = mk.compress_mixture(w, torch.diag(H).contiguous(), 4, K, G=4, M=2, rounds=1, iters=2, refit_iters=1,
+                              seed=1, keep_tags=True, H=H)
+    assert fit.tags[0].dtype == torch.int32 and int(fit.tags[0].max()) < 4 * K
+    lin = torch.nn.Linear(C, R, bias=False).to(DEV)
+    lin.weight.data.copy_(fit.decoded)
+    wrap = CodebookLinear(lin, fit, 4).to(DEV)
+    with torch.no_grad():
+        assert torch.allclose(wrap.bake(), fit.decoded, atol=2e-3)

@@ -16,32 +16,55 @@ from __future__ import annotations
 import torch
 
 
+F64_MAX_C = 4096   # above this, factor in float32 (as GPTQ does): fp64 is slow on consumer GPUs
+
+
 def upper_chol_inv(H: torch.Tensor, damp: float = 0.01) -> tuple[torch.Tensor, torch.Tensor]:
-    """Upper Cholesky factor of (H + damp * mean(diag H) * I)^-1 (float64 math, float32 out)
-    and the mask of dead columns (zero activation), which get unit diagonal."""
-    H = H.to(torch.float64).clone()
+    """Upper Cholesky factor of (H + damp * mean(diag H) * I)^-1 (float32 out) and the mask
+    of dead columns (zero activation), which get unit diagonal. float64 math up to
+    F64_MAX_C columns; float32 above, falling back to float64 if a factorization fails."""
     dead = torch.diag(H) == 0
-    H[dead, dead] = 1.0
-    H.diagonal().add_(damp * float(torch.diag(H).mean()))
-    L = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(L)
-    return torch.linalg.cholesky(Hinv, upper=True).to(torch.float32), dead
+
+    def factor(dtype):
+        Hd = H.to(dtype).clone()
+        Hd[dead, dead] = 1.0
+        Hd.diagonal().add_(damp * float(torch.diag(Hd).mean()))
+        L, info = torch.linalg.cholesky_ex(Hd)
+        if int(info):
+            return None
+        Uf, info = torch.linalg.cholesky_ex(torch.cholesky_inverse(L), upper=True)
+        if int(info) or not torch.isfinite(Uf).all():
+            return None
+        return Uf.to(torch.float32)
+
+    U = factor(torch.float32) if H.shape[0] > F64_MAX_C else None
+    if U is None:
+        U = factor(torch.float64)
+    if U is None:
+        raise RuntimeError("LDLQ: Cholesky failed even in float64; raise ldlq_damp")
+    return U, dead
 
 
 @torch.no_grad()
 def ldlq_assign(u: torch.Tensor, H: torch.Tensor, books: list[torch.Tensor], row_book: torch.Tensor,
-                d: int, damp: float = 0.01, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+                d: int, damp: float = 0.01, block: int = 128, targets: torch.Tensor | None = None,
+                U: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """u [n, C]: rows (row-normalized) in the group's column order; H [C, C] in the same
     order. books: G codebooks [K, d]; row_book [n]: each row's book.
-    Returns tags [n, C // d] (index within the row's book) and the decoded rows [n, C]."""
+    Returns tags [n, C // d] (index within the row's book) and the decoded rows [n, C].
+    targets [n, C] (optional, filled in): each chunk's feedback-adjusted value at the
+    moment it was snapped (what a codebook refit should fit). U: a precomputed
+    upper_chol_inv(H, damp)[0] (reused across refit rounds)."""
     n, C = u.shape
     if C % d:
         raise ValueError("LDLQ needs C divisible by d")
     block = max(d, block - block % d)
-    U, dead = upper_chol_inv(H, damp)
+    dead = (torch.diag(H) == 0).to(u.device)
+    if U is None:
+        U = upper_chol_inv(H, damp)[0]
     U = U.to(u.device)
     W = u.to(torch.float32).clone()
-    W[:, dead.to(u.device)] = 0.0
+    W[:, dead] = 0.0
     allb = torch.cat([b.to(torch.float32) for b in books]).to(u.device)       # [G*K, d]
     K = books[0].shape[0]
     pen = torch.full((n, allb.shape[0]), float("inf"), device=u.device)
@@ -55,6 +78,8 @@ def ldlq_assign(u: torch.Tensor, H: torch.Tensor, books: list[torch.Tensor], row
         for i in range(b0, b1, d):
             j = slice(i, i + d)
             X = W[:, j]
+            if targets is not None:
+                targets[:, j] = X
             Uss = U[j, j]
             A = torch.linalg.inv(Uss.T @ Uss)
             A = 0.5 * (A + A.T)

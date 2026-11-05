@@ -1,0 +1,54 @@
+# 0.5B follow-up to screen_qtip_0p5b (s14): does the LDLQ gain survive fine-tuning, and
+# LDLQ tuning (damping, codebook refit on feedback-adjusted targets). Same settings as s14.
+# Run: python scripts/run_parallel.py --config configs/screen_qtip_ft_0p5b.yaml --shards 3
+stage: 8
+output_dir: artifacts/screens/qtip_ft_0p5b
+model: Qwen/Qwen2.5-0.5B-Instruct
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 256
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 2048, num_windows: 40}
+  gsm8k: {enabled: false}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 128, context: 1024,
+  batch_size: 4}
+kmeans: {iters: 15, refit_iters: 5, max_fit_chunks: 300000, assign_batch: 32768}
+runs:
+- name: stack
+  method: stack
+  d: 4
+  K: 1024
+  G: 4
+  M: 16
+  rounds: 2
+  finetune: &id001 {steps: 256, seq_len: 1024, lr_books: 0.0001, lr_gain: 0.001, log_every: 32}
+- name: stack_ldlq
+  method: stack
+  d: 4
+  K: 1024
+  G: 4
+  M: 16
+  rounds: 2
+  ldlq: true
+  finetune: *id001
+- name: stack_rotboth_ldlq
+  method: stack
+  d: 4
+  K: 1024
+  G: 4
+  M: 16
+  rounds: 2
+  ldlq: true
+  rotate: both
+  finetune: *id001
+- name: plain_rotboth_ldlq
+  method: stack
+  d: 4
+  K: 1024
+  ldlq: true
+  rotate: both
+  finetune: *id001
+- {name: stack_ldlq_damp0.001, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, ldlq: true, ldlq_damp: 0.001}
+- {name: stack_ldlq_damp0.1, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, ldlq: true, ldlq_damp: 0.1}
+- {name: stack_ldlq_refit1, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, ldlq: true, ldlq_refit: 1}
+- {name: stack_ldlq_refit2, method: stack, d: 4, K: 1024, G: 4, M: 16, rounds: 2, ldlq: true, ldlq_refit: 2}

@@ -1,0 +1,35 @@
+# Stage 8 (7B): the s4_full recipe (Fisher allocation over K {256,1024,4096}, G=4, M=16, fine-tune) + LDLQ error feedback; compare with s4_full / s4_full_ft (KL 0.204 / 0.154).
+# Everything else (eval, calibration, allocation, k-means) is copied from configs/stage4_stack_7b.yaml.
+# Run: python scripts/run_experiment.py --config configs/stage8_ldlq_2p5b_7b.yaml
+stage: 8
+output_dir: artifacts/qwen_s01/stage8_ldlq_2p5b_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 256
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 2048, num_windows: 49}
+  gsm8k: {enabled: true, dataset: openai/gsm8k, subset: main, split: test, num_problems: 200, max_new_tokens: 512,
+    batch_size: 50}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 128, context: 2048,
+  batch_size: 4}
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 32768}
+runs:
+- name: s8_full_ldlq
+  method: stack
+  d: 4
+  alloc: fisher
+  budget: uniform:1024
+  G: 4
+  M: 16
+  rounds: 2
+  select_frac: 1.0
+  ldlq: true
+  finetune: {steps: 512, seq_len: 1024, lr_books: 0.0001, lr_gain: 0.001, log_every: 32}

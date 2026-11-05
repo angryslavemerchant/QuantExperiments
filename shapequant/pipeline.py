@@ -164,6 +164,7 @@ def compress_matrix(w: torch.Tensor, run: dict, kcfg: dict, seed: int, name: str
             max_fit_chunks=kcfg["max_fit_chunks"], seed=cb.layer_seed(seed, name),
             batch=kcfg["assign_batch"], keep_tags=bool(run.get("finetune") or run.get("export")),
             H=H if use_ldlq else None, ldlq_damp=run.get("ldlq_damp", 0.01),
+            ldlq_refit=run.get("ldlq_refit", 0),
         )
         fit.stats["pack"] = {"d": run["d"], "K": K, "G": run.get("G", 1), "M": run.get("M", 1),
                              "seed": cb.layer_seed(seed, name)}
