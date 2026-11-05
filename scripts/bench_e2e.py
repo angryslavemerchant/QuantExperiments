@@ -87,8 +87,8 @@ def main() -> int:
     ap.add_argument("--pdl", choices=("auto", "on", "off"), default="auto",
                     help="programmatic dependent launch (auto: on for sm_90+)")
     ap.add_argument("--attn-split", type=int, default=4, help="blocks per head in the fused attention kernel")
-    ap.add_argument("--no-epilogue", action="store_true", help="separate add+norm / silu kernels")
-    ap.add_argument("--epi-blocks", type=int, default=8, help="blocks running each epilogue")
+    ap.add_argument("--epilogue", action="store_true", help="run-kernel epilogues instead of add+norm / silu kernels")
+    ap.add_argument("--epi-blocks", type=int, default=64, help="blocks running each epilogue")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     cfg = de.Cfg(layers=a.layers)
@@ -105,7 +105,7 @@ def main() -> int:
         try:
             eng = de.random_engine(cfg, kind, bits=bits or 10, ru=a.ru, large=cfg_pair(a.large),
                                    small=cfg_pair(a.small), pipe=a.pipe, fuse=not a.no_fuse,
-                                   pdl=None if a.pdl == "auto" else a.pdl == "on", attn_split=a.attn_split, epilogue=not a.no_epilogue, epi_blocks=a.epi_blocks,
+                                   pdl=None if a.pdl == "auto" else a.pdl == "on", attn_split=a.attn_split, epilogue=a.epilogue, epi_blocks=a.epi_blocks,
                                    **extra)
         except torch.OutOfMemoryError:
             print(f"{v:10s} out of memory", flush=True)

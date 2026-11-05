@@ -462,7 +462,7 @@ class DecodeEngine:
 
     def __init__(self, cfg: Cfg, embed: torch.Tensor, layers: list, final_norm: torch.Tensor, lm_head, dev="cuda",
                  fuse: bool = True, large=(512, 2), small=(0, 1), pdl: bool | None = None,
-                 attn_split: int = 4, epilogue: bool = True, epi_blocks: int = 8):
+                 attn_split: int = 4, epilogue: bool = False, epi_blocks: int = 64):
         """fuse: rope + attention + the o input's copies in one kernel, and linears reading the same
         input with the same tag bits (q/k/v, gate/up) merged into one launch (launch config
         `large` for merged matrices over 4096 rows, else `small`)."""
@@ -491,7 +491,8 @@ class DecodeEngine:
         self.fuse = fuse
         self.attn_split = attn_split   # blocks per head in attn_rope (they split the copies)
         # run-kernel epilogues (fuse only): o -> add+norm for gate/up, gate/up -> silu*mul for down,
-        # down -> add+norm for the next layer / lm_head, written by the last epi_blocks blocks
+        # down -> add+norm for the next layer / lm_head, written by the last epi_blocks blocks.
+        # Off by default: on the 5090 (s15) it only breaks even at 64 blocks, and loses below that
         self.epilogue, self.epi_blocks = fuse and epilogue, epi_blocks
         from . import pdl as pdl_mod
         self.pdl = pdl_mod.supported(dev) if pdl is None else pdl
@@ -716,8 +717,8 @@ class DecodeEngine:
 def random_engine(cfg: Cfg, kind: str, *, bits: int = 10, M: int = 16, ru: int = 1, large=(512, 1),
                   small=(0, 1), pipe=False, embed_rows: int = 32768, seed: int = 0, dev="cuda",
                   G: int = 1, alloc: dict | None = None, head_bits: int | None = None, fuse: bool = True,
-                  pdl: bool | None = None, attn_split: int = 4, epilogue: bool = True,
-                  epi_blocks: int = 8) -> DecodeEngine:
+                  pdl: bool | None = None, attn_split: int = 4, epilogue: bool = False,
+                  epi_blocks: int = 64) -> DecodeEngine:
     """Random-weight engine (speed only). kind: fp16 | q4 | runs. Column orders are shared within
     q/k/v and gate/up; each layer/group draws its own. embed_rows: the token embedding is only read
     one row per step, so a truncated table (tok % rows) keeps memory down without changing speed.
