@@ -184,7 +184,7 @@ def create_app(eng, tok, model_name: str):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--packed", required=True)
-    ap.add_argument("--head", default="q4", choices=("q4", "fp16"))
+    ap.add_argument("--head", default="q4", choices=("q4", "q8", "fp16"))
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)

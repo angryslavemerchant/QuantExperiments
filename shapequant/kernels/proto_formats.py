@@ -405,3 +405,55 @@ def gemv_q4(q, scales, x, y, R, C):
         fn((_grid(R),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
                                  cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R), cp.int32(C // 32)))
     return y
+
+
+_SRC_Q8 = r"""
+#include <cuda_fp16.h>
+typedef unsigned int u32;
+__device__ __forceinline__ float dot4(u32 w, uint2 xv) {
+    const float2 a = __half22float2(*(const __half2*)&xv.x), b = __half22float2(*(const __half2*)&xv.y);
+    return (float)(signed char)(w & 0xff) * a.x + (float)(signed char)((w >> 8) & 0xff) * a.y
+         + (float)(signed char)((w >> 16) & 0xff) * b.x + (float)(signed char)(w >> 24) * b.y;
+}
+extern "C" __global__ void __launch_bounds__(256)
+gemv_q8(const uint4* __restrict__ q, const __half* __restrict__ scales, const uint2* __restrict__ x,
+        __half* __restrict__ y, int R, int NB)
+{
+    const int lane = threadIdx.x & 31;
+    for (int row = blockIdx.x * 8 + (threadIdx.x >> 5); row < R; row += gridDim.x * 8) {
+        const uint4* qr = q + (size_t)row * NB * 2;
+        const __half* sr = scales + (size_t)row * NB;
+        float acc = 0.f;
+        #pragma unroll 2
+        for (int b = lane; b < NB; b += 32) {
+            const uint4 q0 = __ldg(qr + 2 * b), q1 = __ldg(qr + 2 * b + 1);
+            const u32 w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+            float part = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) part += dot4(w[j], __ldg(x + b * 8 + j));
+            acc += part * __half2float(sr[b]);
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) y[row] = __float2half(acc);
+    }
+}
+"""
+
+
+def q8_pack(w: torch.Tensor):
+    """w [R, C] float -> (q int8 [R, C], scales fp16 [R, C/32], dequantized fp32): Q8_0-style blocks of 32."""
+    R, C = w.shape
+    blocks = w.reshape(R, C // 32, 32).float()
+    scale = (blocks.abs().amax(-1).clamp_min(1e-8) / 127.0).half().float()
+    n = (blocks / scale[..., None]).round().clamp(-127, 127)
+    return n.reshape(R, C).to(torch.int8), scale.half(), (n * scale[..., None]).reshape(R, C)
+
+
+def gemv_q8(q, scales, x, y, R, C):
+    import cupy as cp
+    fn = _fn("gemv_q8", _SRC_Q8, {})
+    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+        fn((_grid(R),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
+                                 cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R), cp.int32(C // 32)))
+    return y

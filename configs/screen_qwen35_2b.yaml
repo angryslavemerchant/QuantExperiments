@@ -1,0 +1,20 @@
+# Local bring-up (RTX 2060): Qwen3.5-2B, the small model with Qwen3.8-27B's architecture (qwen3_5:
+# 3 of 4 layers Gated DeltaNet, 1 of 4 gated full attention, head_dim 256). First check that the
+# 7B stack transfers: uniform K1024 G4 (2.5 bpw) with and without LDLQ, then fine-tuned.
+# Run: python scripts/run_experiment.py --config configs/screen_qwen35_2b.yaml
+stage: 13
+output_dir: artifacts/prescreen/qwen35_2b
+model: Qwen/Qwen3.5-2B
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 128
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 1024, num_windows: 24}
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 64, context: 1024, batch_size: 2}
+allocation: {d: 4, Ks: [256, 1024, 4096], fisher_sequences: 8, fisher_seq_len: 1024, proxy_iters: 10, proxy_fit_chunks: 250000}
+kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 32768}
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: g4, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false}
+  - {name: g4_ldlq, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

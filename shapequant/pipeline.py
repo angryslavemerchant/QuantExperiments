@@ -14,19 +14,27 @@ from . import masks as mk
 from . import memory
 from .rtn import rtn_quantize, ternary_quantize
 
-BLOCK_LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+BLOCK_LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+                 # Qwen3.5 / 3.8 Gated DeltaNet layers (in_proj_a / in_proj_b: one row per head, kept 16-bit)
+                 "in_proj_qkv", "in_proj_z", "out_proj")
+ATTN_KINDS = ({"q_proj", "k_proj", "v_proj", "o_proj"}, {"in_proj_qkv", "in_proj_z", "out_proj"})
+MLP_KINDS = {"gate_proj", "up_proj", "down_proj"}
 
 
 def compressible_linears(model) -> list[tuple[str, torch.nn.Linear]]:
-    """Attention Q/K/V/O and MLP gate/up/down in every block. Embedding, lm_head,
-    norms and biases are left alone."""
-    found = []
+    """Every block's token-mixer projections (attention q/k/v/o, or Gated DeltaNet
+    in_proj_qkv/in_proj_z/out_proj) and MLP gate/up/down. Embedding, lm_head, norms,
+    biases, convolutions and the per-head DeltaNet gates are left alone."""
+    found, per_layer = [], {}
     for name, mod in model.model.layers.named_modules():
-        if isinstance(mod, torch.nn.Linear) and name.split(".")[-1] in BLOCK_LINEARS:
+        kind = name.split(".")[-1]
+        if isinstance(mod, torch.nn.Linear) and kind in BLOCK_LINEARS:
             found.append((f"model.layers.{name}", mod))
-    expected = len(BLOCK_LINEARS) * len(model.model.layers)
-    if len(found) != expected:
-        raise RuntimeError(f"expected {expected} block linears, found {len(found)}")
+            per_layer.setdefault(int(name.split(".")[0]), set()).add(kind)
+    for i in range(len(model.model.layers)):
+        kinds = per_layer.get(i, set())
+        if kinds - MLP_KINDS not in ATTN_KINDS or not MLP_KINDS <= kinds:
+            raise RuntimeError(f"layer {i}: unexpected block linears {sorted(kinds)}")
     return found
 
 

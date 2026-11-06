@@ -66,7 +66,7 @@ def column_importance(model, sequences: torch.Tensor, batch_size: int = 4) -> di
 @torch.no_grad()
 def input_hessians(model, sequences: torch.Tensor, batch_size: int = 4) -> dict[str, torch.Tensor]:
     """Full input second-moment matrix H = E[x x^T] per block linear (CPU fp32), for LDLQ
-    and rotations. Linears reading the same input (q/k/v, gate/up) share one tensor.
+    and rotations. Linears reading the same input (q/k/v, gate/up, in_proj_qkv/z) share one tensor.
     diag(H) equals `column_importance`."""
     sums: dict[str, torch.Tensor] = {}
     rep: dict[str, str] = {}          # linear name -> name whose input it shares
@@ -76,7 +76,7 @@ def input_hessians(model, sequences: torch.Tensor, batch_size: int = 4) -> dict[
     for name, _ in lins:
         kind = name.rsplit(".", 1)[1]
         first = {"q_proj": "q_proj", "k_proj": "q_proj", "v_proj": "q_proj", "gate_proj": "gate_proj",
-                 "up_proj": "gate_proj"}.get(kind, kind)
+                 "up_proj": "gate_proj", "in_proj_z": "in_proj_qkv"}.get(kind, kind)
         prefix = name[: -len(kind)]
         rep[name] = prefix + first
 

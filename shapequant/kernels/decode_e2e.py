@@ -354,6 +354,26 @@ class Q4Lin:
         return self.q.numel() * 4 + self.sc.numel() * 2
 
 
+class Q8Lin:
+    """Q8_0-like head kernel (int8 + fp16 scale per 32 weights = 8.5 bpw)."""
+
+    def __init__(self, q, sc, R, C):
+        self.q, self.sc, self.R, self.C, self.perms = q, sc, R, C, None
+
+    @classmethod
+    def from_weight(cls, w: torch.Tensor, dev="cuda"):
+        from . import proto_formats as pf
+        q, sc, _ = pf.q8_pack(w.float().cpu())
+        return cls(q.to(dev), sc.to(dev), *w.shape)
+
+    def run(self, xp, y):
+        from . import proto_formats as pf
+        pf.gemv_q8(self.q, self.sc, xp, y, self.R, self.C)
+
+    def nbytes(self):
+        return self.q.numel() + self.sc.numel() * 2
+
+
 class RunsLin:
     """Lane-interleaved run kernel (proto_runs). threads = 0: one block per SM (small matrices)."""
 

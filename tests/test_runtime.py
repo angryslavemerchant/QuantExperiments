@@ -62,7 +62,8 @@ def _write_packed(path, M, G):
     packed.save(path, items, base_model="tiny")
 
 
-@pytest.mark.parametrize("M,G,head,tied", [(1, 4, "q4", True), (4, 1, "fp16", False), (1, 1, "q4", False)])
+@pytest.mark.parametrize("M,G,head,tied", [(1, 4, "q4", True), (4, 1, "fp16", False), (1, 1, "q4", False),
+                                                  (1, 4, "q8", False)])
 def test_engine_from_packed_matches_hf(tmp_path, M, G, head, tied):
     path = tmp_path / "m.safetensors"
     _write_packed(path, M, G)
@@ -85,3 +86,15 @@ def test_engine_from_packed_matches_hf(tmp_path, M, G, head, tied):
     assert gen == r.argmax(-1).tolist() or rel < 5e-3
     # eager and graph decoding agree
     assert runtime.generate(eng, prompt, 10, graph=False) == gen
+
+
+def test_q8_gemv_matches_dense():
+    from shapequant.kernels import proto_formats as pf
+    g = torch.Generator().manual_seed(0)
+    w = torch.randn(1000, 512, generator=g) * 0.05
+    q, sc, deq = pf.q8_pack(w)
+    x = (torch.randn(512, generator=g)).half()
+    y = torch.empty(1000, dtype=torch.float16, device="cuda")
+    pf.gemv_q8(q.cuda(), sc.cuda(), x.cuda(), y, 1000, 512)
+    ref = deq @ x.float()
+    assert float((y.float().cpu() - ref).norm() / ref.norm()) < 2e-3

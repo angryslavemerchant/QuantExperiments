@@ -5,7 +5,8 @@ Every block linear runs on the lane-interleaved run kernel from the file's codes
 books and scales; embeddings, norms and q/k/v biases come from the base checkpoint
 named in the file. The lm_head is not part of the packed format (the pipeline only
 compresses block linears): `head` picks fp16 (cuBLAS) or our Q4_0-like kernel
-(4.5 bpw, the usual GGUF practice of keeping the output matrix at higher precision).
+(4.5 bpw) or Q8_0-like kernel (8.5 bpw). q4 costs real quality: on Qwen2.5-1.5B a 4-bit head alone
+adds ~0.07 KL, an 8-bit head ~0.0002 (scratchpad measurement, 2026-11-06).
 
     eng, info = engine_from_packed("model.safetensors", head="q4", max_len=2048)
     out = generate(eng, prompt_ids, 64)
@@ -70,7 +71,7 @@ def engine_from_packed(packed_path, *, model=None, head: str = "q4", max_len: in
         names.append({k: f"model.layers.{i}.{n}" for k, n in NAMES.items()})
         for k, full in names[-1].items():
             t = pf.local_tags(full, dev)
-            if prefill:
+            if prefill and pf.meta[full]["M"] > 1:      # M = 1 prefill decodes from the run words
                 tag_cache[full] = t.to(torch.int16)
             L[k] = runs_linear(pf, full, dev, ru, small, large, tags=t)
             del t
@@ -82,14 +83,14 @@ def engine_from_packed(packed_path, *, model=None, head: str = "q4", max_len: in
     if head == "fp16":
         lm_head = de.DenseLin(hw.to(dev))
         dense_head = lm_head.w if prefill else None
-    elif head == "q4":
+    elif head in ("q4", "q8"):
         from .kernels import proto_formats
-        q, sc, deq = proto_formats.q4_pack(hw.float().cpu())
-        lm_head = de.Q4Lin(q.to(dev), sc.to(dev), *hw.shape)
+        q, sc, deq = (proto_formats.q4_pack if head == "q4" else proto_formats.q8_pack)(hw.float().cpu())
+        lm_head = (de.Q4Lin if head == "q4" else de.Q8Lin)(q.to(dev), sc.to(dev), *hw.shape)
         dense_head = deq.half() if prefill else None
         del deq
     else:
-        raise ValueError(f"head {head!r}: fp16 | q4")
+        raise ValueError(f"head {head!r}: fp16 | q8 | q4")
     eng = de.DecodeEngine(cfg, half(body.embed_tokens.weight), layers, half(body.norm.weight), lm_head, dev,
                           small=small, large=large, **engine_kw)
     eng.prefill_lins = None
@@ -104,9 +105,9 @@ def engine_from_packed(packed_path, *, model=None, head: str = "q4", max_len: in
 def head_reference_weight(model, head: str) -> torch.Tensor:
     """The lm_head weight the engine actually multiplies by (for reference comparisons)."""
     w = model.lm_head.weight.detach().float().cpu()
-    if head == "q4":
+    if head in ("q4", "q8"):
         from .kernels import proto_formats as pf
-        return pf.q4_pack(w)[2]
+        return (pf.q4_pack if head == "q4" else pf.q8_pack)(w)[2]
     return w.half().float()
 
 

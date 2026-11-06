@@ -9,9 +9,10 @@ cos/sin, rotated k and biased v written to the engine's cache (kc/vc [layer, kv,
 SiLU and the gate*up product in fp16. Afterwards the engine continues decoding exactly where
 `runtime.feed` would have left it (pos advanced, tok = greedy next token, logits = last row).
 
-Memory: the int16 tags are 4 extra bits per weight next to the run kernel's packed words (a
-fused dequant from the packed words would remove them); the lm_head is kept as a dense fp16
-copy (the Q4 head's dequantized values for head="q4").
+Weights are decoded per matrix into one shared fp16 scratch buffer (the largest matrix) right
+before its matmul: on the GPU from the run kernel's own packed words (RunsPrefill) when the matrix
+has no column orders, else from int16 tags kept for it (PrefillLinear, 4 extra bits per weight).
+The lm_head is kept as a dense fp16 copy (the Q4 head's dequantized values for head="q4").
 
 Prefill appends at the engine's current position: from a reset engine (pos 0) it is a fresh
 prompt; otherwise the tokens extend the cached context (multi-turn, or eval continuations).
@@ -69,6 +70,23 @@ class PrefillLinear:
 
     def nbytes(self) -> int:
         return self.tags.numel() * 2
+
+
+class RunsPrefill:
+    """Dense fp16 weight decoded on the GPU from the decode kernel's own packed words
+    (kernels.cuda_dequant): no extra copy of the codes. dense() writes into a scratch buffer
+    shared by every matrix of the engine (each result is consumed by the next matmul on the
+    same stream before the buffer is reused)."""
+
+    def __init__(self, rl, scratch: torch.Tensor):
+        self.rl, self.scratch, self.R, self.C = rl, scratch, rl.R, rl.nch * 4
+
+    def dense(self) -> torch.Tensor:
+        from .kernels import cuda_dequant
+        return cuda_dequant.dequant(self.rl, self.scratch)
+
+    def nbytes(self) -> int:
+        return 0
 
 
 def _rmsnorm(h: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
@@ -143,12 +161,22 @@ def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all") -> torch
 
 def attach(eng, pf: PackedFile, names: list[dict], dense_head: torch.Tensor, local_tags: dict | None = None,
            dev="cuda") -> None:
-    """Give an engine what prefill needs: per layer {q, k, ..., down: PrefillLinear} (names: per
-    layer {short: full matrix name}) and the dense fp16 lm_head."""
-    eng.prefill_lins = [{k: PrefillLinear.from_packed(pf, n, dev, (local_tags or {}).get(n))
-                         for k, n in layer.items()} for layer in names]
+    """Give an engine what prefill needs: per layer {q, k, ..., down: RunsPrefill | PrefillLinear}
+    (names: per layer {short: full matrix name}) and the dense fp16 lm_head. Matrices the GPU
+    dequant handles (no column orders) decode from the engine's run-kernel words; the rest keep
+    int16 tags (local_tags, else unpacked from the file)."""
+    from .kernels import cuda_dequant
+    rls = [{k: getattr(eng.layers[i][k], "rl", None) for k in layer} for i, layer in enumerate(names)]
+    fast = [{k: rl is not None and cuda_dequant.supported(rl) for k, rl in L.items()} for L in rls]
+    n = max([rls[i][k].R * rls[i][k].nch * 4 for i, F_ in enumerate(fast) for k, ok in F_.items() if ok] or [0])
+    scratch = torch.empty(n, dtype=torch.float16, device=dev) if n else None
+    eng.prefill_lins = [{k: (RunsPrefill(rls[i][k], scratch) if fast[i][k]
+                             else PrefillLinear.from_packed(pf, nm, dev, (local_tags or {}).get(nm)))
+                         for k, nm in layer.items()} for i, layer in enumerate(names)]
+    eng.prefill_scratch_bytes = n * 2
     eng.dense_head = dense_head.to(dev, torch.float16).contiguous()
 
 
 def prefill_bytes(eng) -> int:
-    return sum(p.nbytes() for L in eng.prefill_lins for p in L.values()) + eng.dense_head.numel() * 2
+    return (sum(p.nbytes() for L in eng.prefill_lins for p in L.values()) + eng.dense_head.numel() * 2
+            + getattr(eng, "prefill_scratch_bytes", 0))

@@ -484,6 +484,7 @@ class RunsLinear:
         self.words = pack_lane_major(tags.to(lin.table.device), lin.bits)
         self.table, self.row_scale, self.book_off = lin.table, lin.row_scale, lin.book_off
         self.row_mask, self.perms_l, self.has_mask = lin.row_mask, lin.perms_l, lin.has_mask
+        self.table_raw = lin.table          # unscaled fp16 codebook (exact dequant for batched prefill)
         self.table, self.yscale = scaled_table(lin.table, TABLE_MAX)
 
     def clone(self):
