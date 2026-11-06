@@ -29,10 +29,13 @@ from . import masks as mk
 from .pipeline import compressible_linears
 
 
-def fisher_diag(model, seqs: torch.Tensor, log=print) -> dict[str, torch.Tensor]:
+def fisher_diag(model, seqs: torch.Tensor, log=print, names: list[str] | None = None) -> dict[str, torch.Tensor]:
     """E[g^2] of next-token CE per block-linear weight (float32, on the model's device
-    when it fits, else CPU)."""
+    when it fits, else CPU). names: only these matrices (the others get no gradient; each
+    weight's gradient is the same either way), so a big model can be done in groups."""
     mods = dict(compressible_linears(model))
+    if names is not None:
+        mods = {n: mods[n] for n in names}
     for p in model.parameters():
         p.requires_grad_(False)
     dev = next(model.parameters()).device

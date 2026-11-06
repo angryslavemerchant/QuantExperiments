@@ -204,7 +204,8 @@ def main() -> int:
     hessians = None
     if any((r.get("ldlq") or r.get("rotate")) and r["name"] not in finished for r in cfg["runs"]):
         from shapequant.calibrate import input_hessians
-        hessians = input_hessians(model, seqs, ccfg.get("batch_size", 4))
+        hessians = input_hessians(model, seqs, ccfg.get("batch_size", 4), max_gpu_bytes=ccfg.get("hessian_group_bytes"),
+                                  log=log)
         log(f"calibration: full input Hessians for {len(set(map(id, hessians.values())))} distinct inputs")
     for run in cfg["runs"]:
         if run.get("alloc_from"):
@@ -241,14 +242,34 @@ def main() -> int:
         names = [n for n, _ in compressible_linears(model)]
         fseqs = seqs[: acfg["fisher_sequences"]].reshape(-1, acfg["fisher_seq_len"])
         log(f"allocation: Fisher on {fseqs.shape[0]} x {fseqs.shape[1]} calibration tokens")
-        fisher = al.fisher_diag(model, fseqs, log=log)
-        restore_originals(model, originals)
-        log(f"allocation: proxy fits d={acfg['d']} K in {Ks}")
-        err, bits = al.proxy_table(originals, importance, fisher, names, acfg["d"], Ks, seed,
-                                   acfg["proxy_iters"], acfg["proxy_fit_chunks"],
-                                   cfg["kmeans"]["assign_batch"], args.device, log=log)
-        del fisher
+        # Fisher accumulators for every weight (fp32, ~100 GB at 27B) need not fit at once: layer
+        # groups of at most a third of the free GPU memory, each Fisher pass followed by its proxy
+        # fits (identical result, the fits only read their own matrix's Fisher)
+        from shapequant.calibrate import layer_groups
         torch.cuda.empty_cache()
+        budget = int(acfg.get("fisher_group_bytes") or torch.cuda.mem_get_info()[0] // 3)
+        per_layer: dict[int, int] = {}
+        for n in names:
+            li = int(n.split(".")[2])
+            per_layer[li] = per_layer.get(li, 0) + originals[n].numel() * 4
+        groups = layer_groups(sorted(per_layer.items()), budget)
+        if len(groups) > 1:
+            log(f"allocation: Fisher + proxy fits in {len(groups)} layer groups")
+        err, bits = [], []
+        for g in groups:
+            gset = set(g)
+            gnames = [n for n in names if int(n.split(".")[2]) in gset]
+            fisher = al.fisher_diag(model, fseqs, log=log, names=gnames)
+            restore_originals(model, originals)
+            log(f"allocation: proxy fits d={acfg['d']} K in {Ks} (layers {g[0]}-{g[-1]})")
+            e, b = al.proxy_table(originals, importance, fisher, gnames, acfg["d"], Ks, seed,
+                                  acfg["proxy_iters"], acfg["proxy_fit_chunks"],
+                                  cfg["kmeans"]["assign_batch"], args.device, log=log)
+            err += e
+            bits += b
+            del fisher
+            torch.cuda.empty_cache()
+        assert len(err) == len(names)
         n_layers = model.config.num_hidden_layers
         table = {"Ks": Ks, "names": names, "err": err, "bits": bits, "choices": {}}
         for run in alloc_runs:

@@ -63,44 +63,101 @@ def column_importance(model, sequences: torch.Tensor, batch_size: int = 4) -> di
     return {n: (v / count).cpu() for n, v in sums.items()}
 
 
+def _layer_index(name: str) -> int:
+    return int(name.split(".")[2])
+
+
+def layer_groups(sizes: list[tuple[int, int]], budget: int) -> list[list[int]]:
+    """Contiguous groups of layer indices whose summed sizes stay within budget (bytes).
+    sizes: (layer index, bytes) in layer order; a single layer over budget gets its own group."""
+    groups: list[list[int]] = []
+    cur, tot = [], 0
+    for li, b in sizes:
+        if cur and tot + b > budget:
+            groups.append(cur)
+            cur, tot = [], 0
+        cur.append(li)
+        tot += b
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+class _StopForward(Exception):
+    pass
+
+
 @torch.no_grad()
-def input_hessians(model, sequences: torch.Tensor, batch_size: int = 4) -> dict[str, torch.Tensor]:
+def input_hessians(model, sequences: torch.Tensor, batch_size: int = 4,
+                   max_gpu_bytes: int | None = None, log=None) -> dict[str, torch.Tensor]:
     """Full input second-moment matrix H = E[x x^T] per block linear (CPU fp32), for LDLQ
     and rotations. Linears reading the same input (q/k/v, gate/up, in_proj_qkv/z) share one tensor.
-    diag(H) equals `column_importance`."""
-    sums: dict[str, torch.Tensor] = {}
+    diag(H) equals `column_importance`.
+
+    The fp32 accumulators of all layers at once (~100 GB at 27B) need not fit on the GPU: layers
+    are collected in groups of at most max_gpu_bytes (default: a third of the free GPU memory),
+    one calibration pass per group, each pass stopping after the group's last layer. Every
+    accumulator sums the same batches in the same order either way, so the result is identical."""
     rep: dict[str, str] = {}          # linear name -> name whose input it shares
-    count = 0
-    hooks = []
     lins = compressible_linears(model)
+    mods = dict(lins)
     for name, _ in lins:
         kind = name.rsplit(".", 1)[1]
         first = {"q_proj": "q_proj", "k_proj": "q_proj", "v_proj": "q_proj", "gate_proj": "gate_proj",
                  "up_proj": "gate_proj", "in_proj_z": "in_proj_qkv"}.get(kind, kind)
         prefix = name[: -len(kind)]
         rep[name] = prefix + first
+    owners = [n for n, _ in lins if rep[n] == n]
+    dev = next(model.parameters()).device
+    per_layer: dict[int, int] = {}
+    for n in owners:
+        C = mods[n].weight.shape[1]
+        per_layer[_layer_index(n)] = per_layer.get(_layer_index(n), 0) + C * C * 4
+    if max_gpu_bytes is None:
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+            max_gpu_bytes = torch.cuda.mem_get_info(dev)[0] // 3
+        else:
+            max_gpu_bytes = 1 << 62
+    groups = layer_groups(sorted(per_layer.items()), max_gpu_bytes)
+    if log and len(groups) > 1:
+        log(f"  input Hessians: {sum(per_layer.values()) / 1e9:.1f} GB of accumulators in {len(groups)} passes "
+            f"(<= {max_gpu_bytes / 1e9:.1f} GB each)")
+    layers = model.model.layers
+    out: dict[str, torch.Tensor] = {}
+    for g in groups:
+        gset = set(g)
+        sums: dict[str, torch.Tensor] = {}
+        count = 0
 
-    def make_hook(name):
-        def hook(_mod, args):
-            x = args[0].detach().reshape(-1, args[0].shape[-1]).to(torch.float32)
-            s = x.T @ x
-            if name in sums:
-                sums[name] += s
-            else:
-                sums[name] = s
-        return hook
+        def make_hook(name):
+            def hook(_mod, args):
+                x = args[0].detach().reshape(-1, args[0].shape[-1]).to(torch.float32)
+                s = x.T @ x
+                if name in sums:
+                    sums[name] += s
+                else:
+                    sums[name] = s
+            return hook
 
-    for name, mod in lins:
-        if rep[name] == name:
-            hooks.append(mod.register_forward_pre_hook(make_hook(name)))
-    try:
-        dev = next(model.parameters()).device
-        for s in range(0, sequences.shape[0], batch_size):
-            b = sequences[s : s + batch_size].to(dev)
-            model.model(input_ids=b, use_cache=False)
-            count += b.numel()
-    finally:
-        for h in hooks:
-            h.remove()
-    out = {n: (v / count).cpu() for n, v in sums.items()}
+        def stop(_mod, _args, _out):
+            raise _StopForward
+
+        hooks = [mods[n].register_forward_pre_hook(make_hook(n)) for n in owners if _layer_index(n) in gset]
+        if g[-1] < len(layers) - 1:
+            hooks.append(layers[g[-1]].register_forward_hook(stop))
+        try:
+            for s in range(0, sequences.shape[0], batch_size):
+                b = sequences[s : s + batch_size].to(dev)
+                try:
+                    model.model(input_ids=b, use_cache=False)
+                except _StopForward:
+                    pass
+                count += b.numel()
+        finally:
+            for h in hooks:
+                h.remove()
+        for n, v in sums.items():
+            out[n] = (v / count).cpu()
+        del sums
     return {n: out[rep[n]] for n, _ in lins}
