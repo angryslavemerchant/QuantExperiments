@@ -1,14 +1,14 @@
 """Real-weight runtime: the batch-1 decode engine (kernels/decode_e2e.py) built from a
-packed file (shapequant.packed) plus the base checkpoint's other tensors.
+packed file (shapequant.packed).
 
-Every block linear runs on the lane-interleaved run kernel from the file's codes,
-books and scales; embeddings, norms and q/k/v biases come from the base checkpoint
-named in the file. The lm_head is not part of the packed format (the pipeline only
-compresses block linears): `head` picks fp16 (cuBLAS) or our Q4_0-like kernel
-(4.5 bpw) or Q8_0-like kernel (8.5 bpw, the default). q4 costs real quality: on Qwen2.5-7B a 4-bit
-head alone adds 0.043 KL (top-1 88.2%), an 8-bit head 0.0001 (scripts/head_kl.py, run s26c).
+Every block linear runs on the lane-interleaved run kernel from the file's codes, books and
+scales. A self-contained file (packed aux section, the deployed format) also carries the 4-bit
+embedding, the 8-bit head, norms/biases and the config, so nothing else is loaded. Older files
+take those from the base checkpoint named in the file; `head` then picks fp16 (cuBLAS), q8
+(Q8_0-like, 8.5 bpw, the default) or q4 (Q4_0-like, 4.5 bpw). On Qwen2.5-7B a 4-bit head alone
+adds 0.043 KL, an 8-bit head 0.0001; 8-bit head + 4-bit embedding on the stacks +0.0003 (s27).
 
-    eng, info = engine_from_packed("model.safetensors", head="q8", max_len=2048)
+    eng, info = engine_from_packed("model.safetensors", max_len=2048)
     out = generate(eng, prompt_ids, 64)
 """
 
@@ -51,22 +51,56 @@ def runs_linear(pf: PackedFile, name: str, dev="cuda", ru: int = 1, small=(0, 1)
     return de.RunsLin(rl, threads=th, blocks_per_sm=bps)
 
 
+class _AuxSource:
+    """The non-block tensors and config of a self-contained packed file (packed aux section)."""
+
+    def __init__(self, pf: PackedFile):
+        import types
+        self.pf = pf
+        self.config = types.SimpleNamespace(**pf.aux["config"])
+        self.names = set(pf.aux["dense"])
+
+    def get(self, name: str):
+        return self.pf.aux_tensor(f"dense.{name}") if name in self.names else None
+
+
+class _ModelSource:
+    """The non-block tensors and config of a loaded HF model."""
+
+    def __init__(self, model):
+        self.config = model.config
+        self.params = dict(model.named_parameters())
+
+    def get(self, name: str):
+        p = self.params.get(name)
+        return None if p is None else p.detach()
+
+
 def engine_from_packed(packed_path, *, model=None, head: str = "q8", max_len: int = 2048, dev="cuda",
-                       ru: int = 1, small=(0, 1), large=(512, 1), prefill: bool = False, **engine_kw):
-    """Build a DecodeEngine from a packed file. model: an already-loaded HF causal LM to take the
-    non-block tensors from (default: the file's base model, loaded on the CPU in bf16).
-    prefill: also keep what batched prefill needs (shapequant.prefill: int16 tags, +4 bits per
-    weight, and a dense fp16 lm_head copy).
+                       ru: int = 1, small=(0, 1), large=(512, 1), prefill: bool = False, embed: str = "auto",
+                       **engine_kw):
+    """Build a DecodeEngine from a packed file. A self-contained file (packed aux section) needs
+    nothing else: 4-bit embedding, 8-bit head, norms/biases and config all come from the file.
+    Otherwise (or with `model` given) the non-block tensors come from `model` (default: the file's
+    base model, loaded on the CPU in bf16) and `head` picks fp16 | q8 | q4, embed fp16.
+    embed: "auto" (q4 from the file's aux section, else fp16) | "fp16".
+    prefill: also keep what batched prefill needs (shapequant.prefill).
     Returns (engine, info) where info has the file summary and the engine's weight bytes."""
     pf = PackedFile(packed_path)
-    if model is None:
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(pf.summary["base_model"], dtype=torch.bfloat16)
-    cfg = cfg_from_hf(model.config, max_len)
-    body = model.model
+    use_aux = pf.aux is not None and model is None
+    if use_aux:
+        src = _AuxSource(pf)
+        if head != "q8":
+            raise ValueError(f"a self-contained file carries an 8-bit head (asked for {head!r}); pass model= for others")
+    else:
+        if model is None:
+            from transformers import AutoModelForCausalLM
+            model = AutoModelForCausalLM.from_pretrained(pf.summary["base_model"], dtype=torch.bfloat16)
+        src = _ModelSource(model)
+    cfg = cfg_from_hf(src.config, max_len)
     half = lambda t: None if t is None else t.detach().to(dev, torch.float16).contiguous()  # noqa: E731
     layers, names, tag_cache = [], [], {}
-    for i, blk in enumerate(body.layers):
+    for i in range(cfg.layers):
         L = {}
         names.append({k: f"model.layers.{i}.{n}" for k, n in NAMES.items()})
         for k, full in names[-1].items():
@@ -75,35 +109,52 @@ def engine_from_packed(packed_path, *, model=None, head: str = "q8", max_len: in
                 tag_cache[full] = t.to(torch.int16)
             L[k] = runs_linear(pf, full, dev, ru, small, large, tags=t)
             del t
-        a = blk.self_attn
-        L.update(ln1=half(blk.input_layernorm.weight), ln2=half(blk.post_attention_layernorm.weight),
-                 bq=half(a.q_proj.bias), bk=half(a.k_proj.bias), bv=half(a.v_proj.bias))
+        p = f"model.layers.{i}."
+        L.update(ln1=half(src.get(p + "input_layernorm.weight")), ln2=half(src.get(p + "post_attention_layernorm.weight")),
+                 bq=half(src.get(p + "self_attn.q_proj.bias")), bk=half(src.get(p + "self_attn.k_proj.bias")),
+                 bv=half(src.get(p + "self_attn.v_proj.bias")))
         layers.append(L)
-    hw = model.lm_head.weight.detach()
-    if head == "fp16":
-        lm_head = de.DenseLin(hw.to(dev))
-        dense_head = lm_head.w if prefill else None
-    elif head in ("q4", "q8"):
-        from .kernels import proto_formats
-        q, sc, deq = (proto_formats.q4_pack if head == "q4" else proto_formats.q8_pack)(hw.float().cpu())
-        lm_head = (de.Q4Lin if head == "q4" else de.Q8Lin)(q.to(dev), sc.to(dev), *hw.shape)
-        dense_head = deq.half() if prefill else None
-        del deq
+    dense_head = None
+    if use_aux:
+        R, C = pf.aux["vocab"], pf.aux["hidden"]
+        lm_head = de.Q8Lin(pf.aux_tensor("lm_head.q").to(dev), pf.aux_tensor("lm_head.scale").to(dev), R, C)
     else:
-        raise ValueError(f"head {head!r}: fp16 | q8 | q4")
-    eng = de.DecodeEngine(cfg, half(body.embed_tokens.weight), layers, half(body.norm.weight), lm_head, dev,
+        hw = model.lm_head.weight.detach()
+        if head == "fp16":
+            lm_head = de.DenseLin(hw.to(dev))
+            dense_head = lm_head.w if prefill else None
+        elif head == "q8":
+            lm_head = de.Q8Lin.from_weight(hw, dev)
+        elif head == "q4":
+            from .kernels import proto_formats
+            q, sc, deq = proto_formats.q4_pack(hw.float().cpu())
+            lm_head = de.Q4Lin(q.to(dev), sc.to(dev), *hw.shape)
+            dense_head = deq.half() if prefill else None
+            del deq
+        else:
+            raise ValueError(f"head {head!r}: fp16 | q8 | q4")
+    if embed == "auto" and pf.aux is not None:
+        emb = de.Q4Embed(pf.aux_tensor("embed.q").to(dev), pf.aux_tensor("embed.scale").to(dev))
+    elif embed in ("auto", "fp16"):
+        if use_aux:
+            raise ValueError("a self-contained file has only the 4-bit embedding")
+        emb = half(model.model.embed_tokens.weight)
+    else:
+        raise ValueError(f"embed {embed!r}: auto | fp16")
+    eng = de.DecodeEngine(cfg, emb, layers, half(src.get("model.norm.weight")), lm_head, dev,
                           small=small, large=large, **engine_kw)
     eng.prefill_lins = None
     if prefill:
         from . import prefill as pre
         pre.attach(eng, pf, names, dense_head, tag_cache, dev)
-    info = {"summary": pf.summary, "head": head, "weight_bytes": eng.weight_bytes(),
-            "embed_bytes": eng.embed.numel() * 2}
+    info = {"summary": pf.summary, "head": head, "self_contained": use_aux, "weight_bytes": eng.weight_bytes(),
+            "embed_bytes": emb.nbytes() if isinstance(emb, de.Q4Embed) else emb.numel() * 2}
     return eng, info
 
 
 def head_reference_weight(model, head: str) -> torch.Tensor:
-    """The lm_head weight the engine actually multiplies by (for reference comparisons)."""
+    """The lm_head weight the engine actually multiplies by (for reference comparisons). A
+    self-contained file's head equals head="q8" exactly."""
     w = model.lm_head.weight.detach().float().cpu()
     if head in ("q4", "q8"):
         from .kernels import proto_formats as pf

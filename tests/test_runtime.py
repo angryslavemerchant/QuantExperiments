@@ -33,7 +33,7 @@ def _hf(tied):
     return m
 
 
-def _write_packed(path, M, G):
+def _write_packed(path, M, G, aux_model=None):
     """Random codes for every block linear: K cycles 256/1024/4096, G books, M column orders."""
     items = {}
     g = torch.Generator().manual_seed(1)
@@ -59,7 +59,8 @@ def _write_packed(path, M, G):
             meta = {"R": R, "C": C, "d": 4, "K": K, "G": G, "M": M, "seed": seed, "perm_crc": packed.perm_crc(perms),
                     "bits": 0}
             items[f"model.layers.{i}.{n}"] = (t, meta)
-    packed.save(path, items, base_model="tiny")
+    aux = packed.aux_from_model(aux_model, list(items)) if aux_model is not None else None
+    return packed.save(path, items, base_model="tiny", aux=aux)
 
 
 @pytest.mark.parametrize("M,G,head,tied", [(1, 4, "q4", True), (4, 1, "fp16", False), (1, 1, "q4", False),
@@ -98,3 +99,34 @@ def test_q8_gemv_matches_dense():
     pf.gemv_q8(q.cuda(), sc.cuda(), x.cuda(), y, 1000, 512)
     ref = deq @ x.float()
     assert float((y.float().cpu() - ref).norm() / ref.norm()) < 2e-3
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_self_contained_file(tmp_path, tied):
+    """A file with the aux section runs without the HF model: 4-bit embedding, 8-bit head, the
+    norms/biases/config from the file. Matches HF with exactly those weights, decode and prefill."""
+    from shapequant.evaluate import block_quant
+    path = tmp_path / "m.safetensors"
+    summary = _write_packed(path, 1, 4, aux_model=_hf(tied))
+    assert summary["aux"] and summary["bpw_all"] > 0
+    eng, info = runtime.engine_from_packed(path, max_len=64, prefill=True)
+    assert info["self_contained"] and info["embed_bytes"] == V * H // 2 + V * H // 32 * 2
+    ref = _hf(tied)
+    packed.apply_to_model(ref, path)
+    with torch.no_grad():
+        e0 = ref.model.embed_tokens.weight.detach().clone()
+        ref.lm_head.weight = torch.nn.Parameter(block_quant(ref.lm_head.weight.detach(), 8).half().float())
+        ref.model.embed_tokens.weight.data = block_quant(e0, 4).half().float()
+    ref = ref.cuda()
+    prompt = [5, 17, 300, 2, 999, 64]
+    gen = runtime.generate(eng, prompt, 8, graph=True, use_prefill=False)
+    seq = prompt + gen[:-1]
+    lg = torch.stack(runtime.feed(eng, seq, keep_logits=True))
+    with torch.no_grad():
+        r = ref(torch.tensor([seq], device="cuda")).logits[0].float()
+    rel = float((lg - r).norm() / r.norm())
+    assert rel < 2e-2, rel
+    assert gen == r[len(prompt) - 1:].argmax(-1).tolist() or rel < 5e-3
+    pre = runtime.start(eng, seq, all_logits=True, use_prefill=True)
+    rel_p = float((pre - r).norm() / r.norm())
+    assert rel_p < 2e-2, rel_p

@@ -129,13 +129,16 @@ def stage0_checks(cfg: dict, model, rows: dict[str, dict], out_dir: Path) -> dic
     return report
 
 
-def export_packed(fits: dict, path: Path, cfg: dict, row_name: str, log) -> dict:
-    """Write the run's compressed matrices in the packed format (shapequant.packed)."""
+def export_packed(fits: dict, path: Path, cfg: dict, row_name: str, log, model=None) -> dict:
+    """Write the run's compressed matrices in the packed format (shapequant.packed); with `model`,
+    also the aux section (4-bit embedding, 8-bit head, the other tensors, the config)."""
     from shapequant import packed
     items = {n: packed.pack_matrix(f, **f.stats["pack"]) for n, f in fits.items()}
-    summary = packed.save(path, items, base_model=cfg["model"], extra={"run": row_name})
+    aux = packed.aux_from_model(model, list(items)) if model is not None else None
+    summary = packed.save(path, items, base_model=cfg["model"], extra={"run": row_name}, aux=aux)
     log(f"  exported {summary['matrices']} matrices to {path}: {summary['bpw']:.4f} bpw "
-        f"({path.stat().st_size / 1e6:.1f} MB)")
+        + (f"(all tensors {summary['bpw_all']:.4f}) " if aux else "")
+        + f"({path.stat().st_size / 1e6:.1f} MB)")
     return summary
 
 
@@ -297,6 +300,14 @@ def main() -> int:
                 dm = scorer.score_deploy(model, ecfg["deploy"])
                 metrics.update(dm)
                 names = [v["name"] for v in ecfg["deploy"]]
+                if run["method"] == "gguf" and ecfg.get("deploy_gguf_own"):
+                    # the GGUF file's own head and embedding (what llama.cpp would run)
+                    from shapequant import gguf_ref
+                    he = gguf_ref.GGUFSource(gguf_ref.resolve(run)).head_and_embed(*model.lm_head.weight.shape)
+                    dm.update(scorer.score_deploy(model, [{"name": "own", "head_w": he["head"], "embed_w": he["embed"]}]))
+                    dm.update({k: he[k] for k in ("head_type", "embed_type", "head_bits", "embed_bits")})
+                    metrics.update(dm)
+                    names.append("own")
                 log(f"  [{row_name}] deployed: " + "  ".join(f"{n} KL {dm[f'deploy_{n}_kl']:.5f}" for n in names))
             if problems is not None and run.get("gsm8k", True):
                 g = run_gsm8k(model, tok, problems, gcfg, out_dir / "gsm8k" / f"{row_name}.jsonl")
@@ -330,7 +341,7 @@ def main() -> int:
 
         evaluate(name, False, {})
         if run.get("export") and not run.get("finetune"):
-            export_packed(fits, out_dir / "packed" / f"{name}.safetensors", cfg, name, log)
+            export_packed(fits, out_dir / "packed" / f"{name}.safetensors", cfg, name, log, model)
         if run.get("finetune"):
             from transformers import AutoModelForCausalLM as _AM
             from shapequant.finetune import finetune
@@ -339,7 +350,7 @@ def main() -> int:
             d_by_name = {n: run["d"] for n in fits}
             ft_stats = finetune(model, teacher, fits, d_by_name, seqs, run["finetune"], log=log)
             if run.get("export"):
-                export_packed(fits, out_dir / "packed" / f"{name}_ft.safetensors", cfg, f"{name}_ft", log)
+                export_packed(fits, out_dir / "packed" / f"{name}_ft.safetensors", cfg, f"{name}_ft", log, model)
             del teacher, fits
             torch.cuda.empty_cache()
             log(f"  fine-tune KL {ft_stats['ft_kl_first']:.4f} -> {ft_stats['ft_kl_last']:.4f}")

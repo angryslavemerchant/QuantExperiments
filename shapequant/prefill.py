@@ -12,7 +12,7 @@ SiLU and the gate*up product in fp16. Afterwards the engine continues decoding e
 Weights are decoded per matrix into one shared fp16 scratch buffer (the largest matrix) right
 before its matmul: on the GPU from the run kernel's own packed words (RunsPrefill) when the matrix
 has no column orders, else from int16 tags kept for it (PrefillLinear, 4 extra bits per weight).
-The lm_head is kept as a dense fp16 copy (the Q4 head's dequantized values for head="q4").
+The lm_head: an 8-bit head is dequantized in row chunks at the end (no dense copy); fp16 and q4 heads keep a dense fp16 copy.
 
 Prefill appends at the engine's current position: from a reset engine (pos 0) it is a fresh
 prompt; otherwise the tokens extend the cached context (multi-turn, or eval continuations).
@@ -112,7 +112,8 @@ def _rope(x: torch.Tensor, bias, pos: torch.Tensor, theta: float, hd: int) -> to
 @torch.no_grad()
 def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all") -> torch.Tensor:
     """Run `tokens` through the engine at its current position in one pass. Needs
-    eng.prefill_lins (runtime.engine_from_packed(..., prefill=True)) and eng.dense_head.
+    eng.prefill_lins (runtime.engine_from_packed(..., prefill=True)); the head is eng.dense_head when
+    kept (fp16 / q4 heads), else the engine's 8-bit head dequantized in chunks.
     logits: "all" -> fp32 [T, vocab] (row i predicts token i+1), "last" -> fp32 [vocab].
     Leaves eng.pos += T, eng.tok = argmax of the last row, eng.logits = last row (fp16)."""
     cfg = eng.cfg
@@ -124,7 +125,8 @@ def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all") -> torch
         raise ValueError(f"context {p0 + T} > max_len {cfg.max_len}")
     NH, NKV, HD = cfg.n_heads, cfg.n_kv, cfg.head_dim
     pos = torch.arange(p0, p0 + T, device=dev)
-    h = eng.embed[ids % eng.embed.shape[0]].float()                     # [T, H] fp32 residual
+    rid = ids % eng.embed.shape[0]
+    h = eng.embed.rows(rid) if hasattr(eng.embed, "rows") else eng.embed[rid].float()   # [T, H] fp32 residual
     mask = None
     if p0 > 0:
         mask = (torch.arange(p0 + T, device=dev)[None, :] <= pos[:, None])   # [T, p0+T]
@@ -152,14 +154,31 @@ def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all") -> torch
         act = F.silu(g.float()).half() * u                                  # fp16, as silu_mul_perm
         h = h + F.linear(act, P["down"].dense()).float()
     x = _rmsnorm(h if logits == "all" else h[-1:], eng.final_norm, cfg.eps)
-    lg = F.linear(x, eng.dense_head).float()
+    lg = _head(eng, x)
     eng.logits.copy_(lg[-1].half())
     eng.tok.copy_(lg[-1].half().float().argmax().view(1))
     eng.pos.fill_(p0 + T)
     return lg if logits == "all" else lg[-1]
 
 
-def attach(eng, pf: PackedFile, names: list[dict], dense_head: torch.Tensor, local_tags: dict | None = None,
+HEAD_CHUNK = 16384      # rows of the 8-bit head dequantized at a time (no dense head copy)
+
+
+def _head(eng, x: torch.Tensor) -> torch.Tensor:
+    """fp32 logits of the normed rows x [T, H]: the dense fp16 head if the engine keeps one,
+    else the 8-bit head dequantized chunk by chunk."""
+    if eng.dense_head is not None:
+        return F.linear(x, eng.dense_head).float()
+    from .packed import q8_rows
+    hd = eng.lm_head
+    out = torch.empty(x.shape[0], hd.R, dtype=torch.float32, device=x.device)
+    for s in range(0, hd.R, HEAD_CHUNK):
+        e = min(s + HEAD_CHUNK, hd.R)
+        out[:, s:e] = F.linear(x, q8_rows(hd.q, hd.sc, s, e).to(x.dtype)).float()
+    return out
+
+
+def attach(eng, pf: PackedFile, names: list[dict], dense_head: torch.Tensor | None, local_tags: dict | None = None,
            dev="cuda") -> None:
     """Give an engine what prefill needs: per layer {q, k, ..., down: RunsPrefill | PrefillLinear}
     (names: per layer {short: full matrix name}) and the dense fp16 lm_head. Matrices the GPU
@@ -174,9 +193,10 @@ def attach(eng, pf: PackedFile, names: list[dict], dense_head: torch.Tensor, loc
                              else PrefillLinear.from_packed(pf, nm, dev, (local_tags or {}).get(nm)))
                          for k, nm in layer.items()} for i, layer in enumerate(names)]
     eng.prefill_scratch_bytes = n * 2
-    eng.dense_head = dense_head.to(dev, torch.float16).contiguous()
+    eng.dense_head = None if dense_head is None else dense_head.to(dev, torch.float16).contiguous()
 
 
 def prefill_bytes(eng) -> int:
-    return (sum(p.nbytes() for L in eng.prefill_lins for p in L.values()) + eng.dense_head.numel() * 2
+    dh = 0 if eng.dense_head is None else eng.dense_head.numel() * 2
+    return (sum(p.nbytes() for L in eng.prefill_lins for p in L.values()) + dh
             + getattr(eng, "prefill_scratch_bytes", 0))

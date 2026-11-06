@@ -58,6 +58,23 @@ class GGUFSource:
         return torch.from_numpy(w.reshape(shape).copy()), float(t.n_bytes) * 8, t.tensor_type.name
 
 
+    def head_and_embed(self, vocab: int, hidden: int) -> dict:
+        """The file's own output / token_embd, dequantized float32 [vocab, hidden] (output falls
+        back to token_embd for tied files), with their ggml types and storage bits."""
+        from gguf import dequantize
+
+        out = {}
+        for key, name in (("embed", "token_embd.weight"), ("head", "output.weight")):
+            t = self.tensors.get(name) or self.tensors["token_embd.weight"]
+            w = np.asarray(dequantize(t.data, t.tensor_type), dtype=np.float32)
+            if w.size != vocab * hidden:
+                raise ValueError(f"{t.name}: {w.shape} does not match [{vocab}, {hidden}]")
+            out[key] = torch.from_numpy(w.reshape(vocab, hidden).copy())
+            out[f"{key}_type"] = t.tensor_type.name
+            out[f"{key}_bits"] = float(t.n_bytes) * 8
+        return out
+
+
 def resolve(run: dict) -> str:
     """Local path of the run's GGUF file, downloading from the Hub if needed."""
     if run.get("path"):

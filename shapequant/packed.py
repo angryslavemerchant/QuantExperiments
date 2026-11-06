@@ -26,6 +26,19 @@ row's column order. Rows are stored in their original order; a runtime may
 regroup them (by mask, by codebook) at load time.
 
 Storage bits are the real tensor bytes plus 32 bits per matrix for the seed.
+
+Optional aux section (metadata key "aux"; files without it still load, with the rest taken from
+the base checkpoint): everything else the runtime needs, so the file stands alone (tokenizer aside).
+
+  aux.embed.q        uint8 [V, C/2]   4-bit embedding, block 32 symmetric: n = clamp(round(w/s),
+                                      -8, 7) + 8, low nibble = even column
+  aux.embed.scale    fp16  [V, C/32]  s = fp16(amax / 7) (an all-zero block stores s = 1)
+  aux.lm_head.q      int8  [V, C]     8-bit head (Q8_0-like): n = clamp(round(w/s), -127, 127)
+  aux.lm_head.scale  fp16  [V, C/32]  s = fp16(amax / 127)
+  aux.dense.<name>   the remaining parameters (norms, biases, ...) under their HF names, as stored
+
+metadata "aux" = {"embed": "q4_b32", "lm_head": "q8_b32", "dense": [names], "config": {HF config}}.
+Dequantized values equal evaluate.block_quant(w, 4 | 8) exactly (the formats scored by eval.deploy).
 """
 
 from __future__ import annotations
@@ -118,8 +131,62 @@ def pack_matrix(fit, *, d: int, K: int, G: int, M: int, seed: int) -> tuple[dict
     return t, meta
 
 
-def save(path, packed: dict[str, tuple[dict, dict]], *, base_model: str, extra: dict | None = None) -> dict:
-    """Write {name: (tensors, meta)} to one safetensors file; returns the summary."""
+def q4_embed_pack(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """w [V, C] -> (q uint8 [V, C/2], scale fp16 [V, C/32]); see the module doc."""
+    V, C = w.shape
+    q = torch.empty(V, C // 2, dtype=torch.uint8, device=w.device)
+    sc = torch.empty(V, C // 32, dtype=torch.float16, device=w.device)
+    for s in range(0, V, 8192):
+        b = w[s:s + 8192].float().view(-1, C // 32, 32)
+        k = (b.abs().amax(-1).clamp_min(1e-8) / 7.0).half().float()
+        k = torch.where(k == 0, torch.ones_like(k), k)
+        n = ((b / k[..., None]).round().clamp(-8, 7) + 8).to(torch.uint8).view(-1, C // 2, 2)
+        q[s:s + 8192] = n[..., 0] | (n[..., 1] << 4)
+        sc[s:s + 8192] = k.half()
+    return q, sc
+
+
+def q4_embed_rows(q: torch.Tensor, sc: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """fp32 [len(ids), C] dequantized embedding rows."""
+    b = q[ids]
+    n = torch.stack([b & 15, b >> 4], -1).view(b.shape[0], -1).float() - 8
+    return (n.view(b.shape[0], -1, 32) * sc[ids].float()[..., None]).view(b.shape[0], -1)
+
+
+def q8_rows(q: torch.Tensor, sc: torch.Tensor, s: int = 0, e: int | None = None) -> torch.Tensor:
+    """fp32 rows s:e of an 8-bit block-32 matrix."""
+    b = q[s:e]
+    return (b.float().view(b.shape[0], -1, 32) * sc[s:e].float()[..., None]).view(b.shape[0], -1)
+
+
+def aux_from_model(model, block_names) -> tuple[dict, dict]:
+    """The aux section for `model` (block_names: the packed block linears, left out of dense)."""
+    from .kernels.proto_formats import q8_pack
+    body = model.model
+    E = body.embed_tokens.weight.detach()
+    H = model.lm_head.weight.detach()
+    eq, es = q4_embed_pack(E)
+    hq, hs, _ = q8_pack(H.float().cpu())
+    skip = {f"{n}.weight" for n in block_names} | {"lm_head.weight", "model.embed_tokens.weight"}
+    dense = {n: p.detach().cpu().contiguous() for n, p in model.named_parameters() if n not in skip}
+    t = {"aux.embed.q": eq.cpu(), "aux.embed.scale": es.cpu(), "aux.lm_head.q": hq, "aux.lm_head.scale": hs}
+    t.update({f"aux.dense.{n}": v for n, v in dense.items()})
+    meta = {"embed": "q4_b32", "lm_head": "q8_b32", "dense": sorted(dense),
+            "config": model.config.to_dict(), "vocab": E.shape[0], "hidden": E.shape[1],
+            "tied": bool(getattr(model.config, "tie_word_embeddings", False))}
+    return t, meta
+
+
+def aux_bits(meta: dict) -> dict:
+    """Storage bits of the aux parts: embed 4.5 bpw, head 8.5 bpw (fp16 scale per 32)."""
+    n = meta["vocab"] * meta["hidden"]
+    return {"embed": n * 4.5, "lm_head": n * 8.5}
+
+
+def save(path, packed: dict[str, tuple[dict, dict]], *, base_model: str, extra: dict | None = None,
+         aux: tuple[dict, dict] | None = None) -> dict:
+    """Write {name: (tensors, meta)} to one safetensors file; returns the summary.
+    aux: (tensors, meta) from aux_from_model, to make the file self-contained."""
     from safetensors.torch import save_file
     tensors, metas = {}, {}
     for name, (t, m) in packed.items():
@@ -130,8 +197,20 @@ def save(path, packed: dict[str, tuple[dict, dict]], *, base_model: str, extra: 
     numel = sum(m["R"] * m["C"] for m in metas.values())
     summary = {"format": FORMAT, "base_model": base_model, "matrices": len(metas),
                "bits": total_bits, "numel": numel, "bpw": total_bits / numel, **(extra or {})}
+    md = {"summary": None, "matrices": json.dumps(metas)}
+    if aux is not None:
+        at, am = aux
+        tensors.update(at)
+        md["aux"] = json.dumps(am, default=str)
+        ab = aux_bits(am)
+        dense_bits = sum(v.numel() * v.element_size() * 8 for k, v in at.items() if k.startswith("aux.dense."))
+        n_all = numel + 2 * am["vocab"] * am["hidden"] + sum(
+            v.numel() for k, v in at.items() if k.startswith("aux.dense."))
+        summary["bpw_all"] = (total_bits + ab["embed"] + ab["lm_head"] + dense_bits) / n_all
+        summary["aux"] = True
+    md["summary"] = json.dumps(summary)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(path), metadata={"summary": json.dumps(summary), "matrices": json.dumps(metas)})
+    save_file(tensors, str(path), metadata=md)
     return summary
 
 
@@ -146,6 +225,11 @@ class PackedFile:
         if self.summary.get("format") != FORMAT:
             raise ValueError(f"{path}: format {self.summary.get('format')!r} != {FORMAT}")
         self.meta = json.loads(md["matrices"])
+        self.aux = json.loads(md["aux"]) if "aux" in md else None
+
+    def aux_tensor(self, name: str) -> torch.Tensor:
+        """aux.<name>, e.g. "embed.q" or "dense.model.norm.weight"."""
+        return self.f.get_tensor(f"aux.{name}")
 
     def tensors(self, name: str) -> dict:
         m = self.meta[name]

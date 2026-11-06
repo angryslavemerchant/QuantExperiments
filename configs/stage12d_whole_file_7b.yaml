@@ -1,0 +1,57 @@
+# Stage 12d: whole-file comparison. Both stage-12a stacks (same recipe and seed) exported as
+# self-contained files (4-bit embedding + 8-bit head in the file; checked and timed by
+# scripts/check_runtime.py, then deleted before packaging), and the six GGUF references scored with
+# their own token_embd / output (eval.deploy_gguf_own) next to the deployed-format variants.
+# Run: python scripts/run_experiment.py --config configs/stage12d_whole_file_7b.yaml
+stage: 12
+output_dir: artifacts/qwen_s01/stage12d_whole_file_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: false
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+  deploy:                  # block-32 symmetric, fp16 scale; head 4/8 = runtime q4/q8 kernels
+    - {name: h8, head: 8}
+    - {name: e4, embed: 4}
+    - {name: h8e4, head: 8, embed: 4}
+  deploy_gguf_own: true    # GGUF rows: also their own output / token_embd ("own")
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s12_30, method: stack, d: 4, K: 4096, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s12_25, method: stack, d: 4, alloc_from: configs/alloc/s4_full.json, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: gguf_i1_iq2_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ2_XS.gguf, gsm8k: false}
+  - {name: gguf_i1_iq2_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ2_M.gguf, gsm8k: false}
+  - {name: gguf_i1_iq3_xxs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_XXS.gguf, gsm8k: false}
+  - {name: gguf_i1_iq3_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_XS.gguf, gsm8k: false}
+  - {name: gguf_i1_q3_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q3_K_M.gguf, gsm8k: false}
+  - {name: gguf_i1_q4_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q4_K_M.gguf, gsm8k: false}

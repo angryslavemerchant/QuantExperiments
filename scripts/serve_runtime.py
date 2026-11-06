@@ -27,7 +27,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from shapequant import runtime  # noqa: E402
+from shapequant import packed, runtime  # noqa: E402
 
 
 def _as_prompts(p):
@@ -195,6 +195,8 @@ def main() -> int:
     from shapequant.packed import PackedFile
     base = PackedFile(args.packed).summary["base_model"]
     tok = AutoTokenizer.from_pretrained(base)
+    if packed.PackedFile(args.packed).aux is not None:     # self-contained file: its own q8 head
+        args.head = "q8"
     eng, info = runtime.engine_from_packed(args.packed, head=args.head, max_len=args.max_len, prefill=True)
     eng.capture()
     name = args.name or Path(args.packed).stem

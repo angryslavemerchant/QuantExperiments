@@ -46,10 +46,16 @@ def main() -> int:
     base = pf.summary["base_model"]
     tok = AutoTokenizer.from_pretrained(base)
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16)
-    eng, info = runtime.engine_from_packed(args.packed, model=model, head=args.head, max_len=args.max_len,
-                                           prefill=args.pp > 0)
-    load_s = time.time() - t0
+    if pf.aux is not None:          # self-contained file: the deployed path, nothing but the file
+        args.head = "q8"
+        eng, info = runtime.engine_from_packed(args.packed, max_len=args.max_len, prefill=args.pp > 0)
+        load_s = time.time() - t0
+        model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16)
+        eng, info = runtime.engine_from_packed(args.packed, model=model, head=args.head, max_len=args.max_len,
+                                               prefill=args.pp > 0)
+        load_s = time.time() - t0
     torch.cuda.synchronize()
     eng_mem = torch.cuda.max_memory_allocated() / 1e9
 
@@ -67,7 +73,11 @@ def main() -> int:
             for lin in (blk.self_attn.q_proj, blk.self_attn.k_proj, blk.self_attn.v_proj):
                 lin.bias.copy_(lin.bias.half().float())
         ref.model.norm.weight.copy_(ref.model.norm.weight.half().float())
-        ref.model.embed_tokens.weight.copy_(ref.model.embed_tokens.weight.half().float())
+        if pf.aux is not None:      # the file's 4-bit embedding
+            from shapequant.evaluate import block_quant
+            ref.model.embed_tokens.weight.copy_(block_quant(ref.model.embed_tokens.weight, 4).half().float())
+        else:
+            ref.model.embed_tokens.weight.copy_(ref.model.embed_tokens.weight.half().float())
 
     rows = []
     for p in PROMPTS:
@@ -91,6 +101,7 @@ def main() -> int:
         print(f"[{len(ids)} tok] rel err {rel:.2e}  greedy agree {agree:.3f}  | {rows[-1]['text'][:90]!r}")
 
     res = {"packed": str(args.packed), "summary": pf.summary, "head": args.head, "load_s": load_s,
+           "self_contained": info.get("self_contained", False),
            "engine_weight_bytes": info["weight_bytes"], "embed_bytes": info["embed_bytes"],
            "engine_peak_gb": eng_mem, "prompts": rows,
            "max_rel_logit_err": max(r["rel_logit_err"] for r in rows),

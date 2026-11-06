@@ -76,16 +76,22 @@ class Scorer:
     @torch.no_grad()
     def score_deploy(self, model, variants: list[dict]) -> dict:
         """KL vs the original with the deployed head/embedding formats on top of whatever the
-        model's block linears currently are. variants: [{name, head: bits|None, embed: bits|None}].
-        Returns {"deploy_<name>_kl", "deploy_<name>_top1"} per variant."""
+        model's block linears currently are. variants: [{name, head: bits|None, embed: bits|None}];
+        instead of bits, head_w / embed_w give the weights directly (e.g. a GGUF file's own
+        output / token_embd). Returns {"deploy_<name>_kl", "deploy_<name>_top1"} per variant."""
         out: dict = {}
         emb = _decoder(model).embed_tokens.weight
         e0 = emb.detach().clone()
         try:
             for v in variants:
                 hb, eb = v.get("head"), v.get("embed")
-                head = block_quant(self.head_w, hb) if hb else self.head_w
-                if eb:
+                if v.get("head_w") is not None:
+                    head = v["head_w"].to(self.head_w.device, torch.float32)
+                else:
+                    head = block_quant(self.head_w, hb) if hb else self.head_w
+                if v.get("embed_w") is not None:
+                    emb.data.copy_(v["embed_w"].to(e0.device, e0.dtype))
+                elif eb:
                     emb.data.copy_(block_quant(e0, eb).to(e0.dtype))
                 kl, agree, n = 0.0, 0, 0
                 for w, ref_h in zip(self.windows, self.ref_hidden):

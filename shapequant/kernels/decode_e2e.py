@@ -68,6 +68,19 @@ extern "C" __global__ void embed(const __half* E, const long long* tok, int rows
         h[i] = __half2float(E[t * C + i]);
 }
 
+// 4-bit block-32 embedding row (shapequant.packed aux.embed): h[i] = (nibble - 8) * scale
+extern "C" __global__ void embed_q4(const unsigned char* Q, const __half* S, const long long* tok, int rows, int C,
+                                    float* h) {
+    PDL_TRIGGER();
+    PDL_WAIT();
+    const long long t = tok[0] % rows;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x) {
+        const unsigned char b = Q[t * (C / 2) + (i >> 1)];
+        const int n = (i & 1) ? (b >> 4) : (b & 15);
+        h[i] = (float)(n - 8) * __half2float(S[t * (C / 32) + (i >> 5)]);
+    }
+}
+
 // h_out = h_in + add (add may be null); out[m, i] = rmsnorm(h_out)[perm[m, i]] (perm null: M = 1,
 // identity). Every block recomputes the norm (C is small) and writes its share of the M copies;
 // block 0 writes h_out (ping-pong buffers, so no block reads a half-updated residual).
@@ -354,6 +367,21 @@ class Q4Lin:
         return self.q.numel() * 4 + self.sc.numel() * 2
 
 
+class Q4Embed:
+    """4-bit block-32 token embedding (shapequant.packed aux.embed): q uint8 [V, C/2], sc fp16 [V, C/32]."""
+
+    def __init__(self, q, sc):
+        self.q, self.sc = q, sc
+        self.shape = (q.shape[0], q.shape[1] * 2)
+
+    def rows(self, ids: torch.Tensor) -> torch.Tensor:
+        from ..packed import q4_embed_rows
+        return q4_embed_rows(self.q, self.sc, ids)
+
+    def nbytes(self):
+        return self.q.numel() + self.sc.numel() * 2
+
+
 class Q8Lin:
     """Q8_0-like head kernel (int8 + fp16 scale per 32 weights = 8.5 bpw)."""
 
@@ -629,8 +657,13 @@ class DecodeEngine:
         self.cur = 0
         on = lambda k: k not in self.skip   # noqa: E731  (leave-one-out timing; outputs then meaningless)
         if on("embed"):
-            self._launch("embed", 16, 256, (_ptr(self.embed), _ptr(self.tok), cp.int32(self.embed.shape[0]),
-                                            cp.int32(cfg.hidden), _ptr(self.hb[0])))
+            if isinstance(self.embed, Q4Embed):
+                self._launch("embed_q4", 16, 256, (_ptr(self.embed.q), _ptr(self.embed.sc), _ptr(self.tok),
+                                                   cp.int32(self.embed.shape[0]), cp.int32(cfg.hidden),
+                                                   _ptr(self.hb[0])))
+            else:
+                self._launch("embed", 16, 256, (_ptr(self.embed), _ptr(self.tok), cp.int32(self.embed.shape[0]),
+                                                cp.int32(cfg.hidden), _ptr(self.hb[0])))
         add = None
         normed = False      # the next matmul's input was already written by an epilogue
         nlay = len(self.layers)
