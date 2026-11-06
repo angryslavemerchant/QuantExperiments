@@ -38,6 +38,7 @@ def main() -> int:
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--ref-device", default="cpu", help="where the fp32 HF reference runs")
     ap.add_argument("--tg", type=int, default=128, help="tokens for the tok/s timing (0: skip)")
+    ap.add_argument("--pp", type=int, default=512, help="prompt tokens for the prefill timing (0: no prefill)")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -46,7 +47,8 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained(base)
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16)
-    eng, info = runtime.engine_from_packed(args.packed, model=model, head=args.head, max_len=args.max_len)
+    eng, info = runtime.engine_from_packed(args.packed, model=model, head=args.head, max_len=args.max_len,
+                                           prefill=args.pp > 0)
     load_s = time.time() - t0
     torch.cuda.synchronize()
     eng_mem = torch.cuda.max_memory_allocated() / 1e9
@@ -93,11 +95,10 @@ def main() -> int:
            "engine_peak_gb": eng_mem, "prompts": rows,
            "max_rel_logit_err": max(r["rel_logit_err"] for r in rows),
            "min_greedy_agree": min(r["greedy_agree"] for r in rows)}
-    if args.tg:
-        s = eng.time_tokens(args.tg)
-        res["tg_tok_s"] = 1 / s
-        print(f"tg{args.tg}: {1 / s:.1f} tok/s; weights {info['weight_bytes'] / 1e9:.3f} GB "
-              f"(+ embed {info['embed_bytes'] / 1e9:.3f} GB)")
+    if args.tg or args.pp:
+        b = runtime.bench(eng, pp=min(args.pp, args.max_len), tg=args.tg)
+        res.update(b)
+        print(f"bench: {b}; weights {info['weight_bytes'] / 1e9:.3f} GB (+ embed {info['embed_bytes'] / 1e9:.3f} GB)")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(res, indent=2))
     ok = res["max_rel_logit_err"] < 2e-2

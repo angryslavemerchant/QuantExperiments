@@ -17,7 +17,7 @@ Config (eval.lm_eval):
 
 Each task is evaluated with its own few-shot count and example limit (lm-eval takes
 one num_fewshot per call). The headline metric per task is reported as lme_<task>
-(acc_norm where the task defines it for multiple choice, else acc; gsm8k: strict-match
+(acc_norm where the task defines it for multiple choice, else acc; gsm8k: flexible-extract
 exact match); the full lm-eval results go to the row's JSON file.
 """
 
@@ -34,7 +34,7 @@ HEADLINE = {
     "hellaswag": ("acc_norm,none", "acc,none"),
     "winogrande": ("acc,none",),
     "piqa": ("acc_norm,none", "acc,none"),
-    "gsm8k": ("exact_match,strict-match", "exact_match,flexible-extract"),
+    "gsm8k": ("exact_match,flexible-extract", "exact_match,strict-match"),
 }
 
 
