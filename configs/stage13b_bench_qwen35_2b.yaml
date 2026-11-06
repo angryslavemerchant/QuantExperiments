@@ -1,0 +1,61 @@
+# Stage 13b: Qwen3.5-2B (the small model with Qwen3.8-27B's architecture: 3 of 4 layers Gated DeltaNet,
+# every 4th gated full attention, tied 248K vocab) against llama.cpp's imatrix GGUFs, same protocol as
+# the 7B benchmark (KL on ~100k wikitext tokens vs the 16-bit model; block linears only, plus the
+# deployed head/embedding formats: ours 8-bit head + 4-bit embedding, GGUF its own token_embd).
+# Our two recipes from 7B: 2.5 bpw (Fisher allocation over K {256, 1024, 4096} at the uniform-1024
+# budget) and 3.0 bpw (uniform K4096), both G4 M1, LDLQ, fine-tuned 512 steps. The 2.5 stack is
+# exported self-contained (for the Qwen3.5 runtime work).
+# Run: python scripts/run_experiment.py --config configs/stage13b_bench_qwen35_2b.yaml
+stage: 13
+output_dir: artifacts/qwen35_2b/stage13b_bench
+model: Qwen/Qwen3.5-2B
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 128
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+  deploy:
+    - {name: h8, head: 8}
+    - {name: e4, embed: 4}
+    - {name: h8e4, head: 8, embed: 4}
+  deploy_gguf_own: true
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: gguf_i1_iq2_xs, method: gguf, repo: mradermacher/Qwen3.5-2B-i1-GGUF, file: Qwen3.5-2B.i1-IQ2_XS.gguf, gsm8k: false}
+  - {name: gguf_i1_iq2_m, method: gguf, repo: mradermacher/Qwen3.5-2B-i1-GGUF, file: Qwen3.5-2B.i1-IQ2_M.gguf, gsm8k: false}
+  - {name: gguf_i1_iq3_xxs, method: gguf, repo: mradermacher/Qwen3.5-2B-i1-GGUF, file: Qwen3.5-2B.i1-IQ3_XXS.gguf, gsm8k: false}
+  - {name: gguf_i1_iq3_xs, method: gguf, repo: mradermacher/Qwen3.5-2B-i1-GGUF, file: Qwen3.5-2B.i1-IQ3_XS.gguf, gsm8k: false}
+  - {name: gguf_i1_q3_k_m, method: gguf, repo: mradermacher/Qwen3.5-2B-i1-GGUF, file: Qwen3.5-2B.i1-Q3_K_M.gguf, gsm8k: false}
+  - {name: gguf_i1_q4_k_m, method: gguf, repo: mradermacher/Qwen3.5-2B-i1-GGUF, file: Qwen3.5-2B.i1-Q4_K_M.gguf, gsm8k: false}
+  - {name: s13_25, method: stack, d: 4, alloc: fisher, budget: "uniform:1024", G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s13_30, method: stack, d: 4, K: 4096, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

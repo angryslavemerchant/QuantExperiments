@@ -12,6 +12,9 @@ from shapequant.pipeline import compress_matrix  # noqa: E402
 def test_tensor_name_mapping():
     assert gguf_ref.gguf_tensor_name("model.layers.3.mlp.down_proj") == "blk.3.ffn_down.weight"
     assert gguf_ref.gguf_tensor_name("model.layers.0.self_attn.o_proj") == "blk.0.attn_output.weight"
+    assert gguf_ref.gguf_tensor_name("model.layers.2.linear_attn.in_proj_qkv") == "blk.2.attn_qkv.weight"
+    assert gguf_ref.gguf_tensor_name("model.layers.2.linear_attn.in_proj_z") == "blk.2.attn_gate.weight"
+    assert gguf_ref.gguf_tensor_name("model.layers.2.linear_attn.out_proj") == "blk.2.ssm_out.weight"
     with pytest.raises(ValueError):
         gguf_ref.gguf_tensor_name("lm_head")
 

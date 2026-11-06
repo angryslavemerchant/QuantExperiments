@@ -21,6 +21,10 @@ _GGUF_NAMES = {
     "mlp.gate_proj": "ffn_gate",
     "mlp.up_proj": "ffn_up",
     "mlp.down_proj": "ffn_down",
+    # Qwen3.5 / 3.8 (qwen35) Gated DeltaNet layers
+    "linear_attn.in_proj_qkv": "attn_qkv",
+    "linear_attn.in_proj_z": "attn_gate",
+    "linear_attn.out_proj": "ssm_out",
 }
 
 # A correctly mapped matrix from any real quant is far below this relative error;
