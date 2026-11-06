@@ -41,6 +41,7 @@ COLUMNS = [
     "recon_mse", "recon_rel_mse", "compress_seconds", "eval_tokens",
     "G", "alloc", "mean_log2K", "mask_nonidentity_frac", "ft_kl_first", "ft_kl_last",
     "rotate", "ldlq", "out_rel_err_fullH",
+    "lme_mmlu", "lme_arc_challenge", "lme_hellaswag", "lme_winogrande", "lme_gsm8k",
 ]
 
 T0 = time.time()
@@ -183,6 +184,7 @@ def main() -> int:
     log(f"wikitext: {windows.shape[0]} windows x {windows.shape[1]} tokens; caching reference")
     scorer = Scorer(model, windows, ecfg["logit_chunk"])
     gcfg = ecfg.get("gsm8k", {})
+    lcfg = ecfg.get("lm_eval", {})
     problems = load_gsm8k(gcfg) if gcfg.get("enabled") else None
 
     importance = None
@@ -295,6 +297,12 @@ def main() -> int:
                 g = run_gsm8k(model, tok, problems, gcfg, out_dir / "gsm8k" / f"{row_name}.jsonl")
                 log(f"  [{row_name}] GSM8K {g['gsm8k_acc']:.1f}% ({g['gsm8k_seconds']:.0f}s)")
                 metrics.update(g)
+            # standard benchmarks (lm-eval): rows of runs with lm_eval: true; for fine-tuned
+            # stacks only the fine-tuned row
+            if lcfg.get("tasks") and run.get("lm_eval") and (ft or not run.get("finetune")):
+                from shapequant.lmeval import run_lm_eval
+                log(f"  [{row_name}] lm-eval: {[t['task'] for t in lcfg['tasks']]}")
+                metrics.update(run_lm_eval(model, tok, lcfg, out_dir / "lm_eval" / f"{row_name}.json", log=log))
             row = {
                 "stage": run.get("stage", cfg.get("stage")), "run_name": row_name, "method": run["method"],
                 "model": cfg["model"], "d": run.get("d"), "K": run.get("K"),

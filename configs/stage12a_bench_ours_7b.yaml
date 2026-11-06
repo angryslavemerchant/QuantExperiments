@@ -1,0 +1,53 @@
+# Stage 12a (benchmark, our side): both final stacks with LDLQ, fine-tuned, exported (packed files are
+# checked against HF by scripts/check_runtime.py and timed, then deleted before packaging), and the
+# lm-eval suite (MMLU 0-shot, ARC-C, HellaSwag 2000, Winogrande, GSM8K 5-shot 400) on the fine-tuned rows.
+# Stage 12b runs the same suite on the original and the GGUF references.
+# Run: python scripts/run_experiment.py --config configs/stage12a_bench_ours_7b.yaml
+stage: 12
+output_dir: artifacts/qwen_s01/stage12a_bench_ours_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: false
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+  lm_eval:
+    batch_size: 16
+    tasks:
+      - {task: mmlu, fewshot: 0}
+      - {task: arc_challenge, fewshot: 0}
+      - {task: hellaswag, fewshot: 0, limit: 2000}
+      - {task: winogrande, fewshot: 0}
+      - {task: gsm8k, fewshot: 5, limit: 400}
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: s12_30, method: stack, d: 4, K: 4096, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true, lm_eval: true, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s12_25, method: stack, d: 4, alloc_from: configs/alloc/s4_full.json, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true, lm_eval: true, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}

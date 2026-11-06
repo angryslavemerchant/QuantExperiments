@@ -1,0 +1,56 @@
+# Stage 12b (benchmark, references): the lm-eval suite of stage 12a on the 16-bit original and imatrix GGUF
+# quants bracketing our 2.5 / 3.0 bpw stacks (same protocol: block linears from the GGUF, the rest 16-bit).
+# Run: python scripts/run_experiment.py --config configs/stage12b_bench_refs_7b.yaml
+stage: 12
+output_dir: artifacts/qwen_s01/stage12b_bench_refs_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: false
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+  lm_eval:
+    batch_size: 8
+    tasks:
+      - {task: mmlu, fewshot: 0}
+      - {task: arc_challenge, fewshot: 0}
+      - {task: hellaswag, fewshot: 0, limit: 2000}
+      - {task: winogrande, fewshot: 0}
+      - {task: gsm8k, fewshot: 5, limit: 400}
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false, lm_eval: true}
+  - {name: gguf_i1_iq2_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ2_XS.gguf, gsm8k: false, lm_eval: true}
+  - {name: gguf_i1_iq2_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ2_M.gguf, gsm8k: false, lm_eval: true}
+  - {name: gguf_i1_iq3_xxs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_XXS.gguf, gsm8k: false, lm_eval: true}
+  - {name: gguf_i1_iq3_xs, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-IQ3_XS.gguf, gsm8k: false, lm_eval: true}
+  - {name: gguf_i1_q3_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q3_K_M.gguf, gsm8k: false, lm_eval: true}
+  - {name: gguf_i1_q4_k_m, method: gguf, repo: mradermacher/Qwen2.5-7B-Instruct-i1-GGUF, file: Qwen2.5-7B-Instruct.i1-Q4_K_M.gguf, gsm8k: false, lm_eval: true}
