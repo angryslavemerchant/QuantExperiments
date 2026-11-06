@@ -293,6 +293,11 @@ def main() -> int:
             metrics = scorer.score(model)
             log(f"  [{row_name}] mean KL {metrics['mean_kl']:.5f}  p99 {metrics['p99_kl']:.4f}  "
                 f"top1 {metrics['top1_agree']:.2f}%  ppl {metrics['perplexity']:.3f}")
+            if ecfg.get("deploy"):
+                dm = scorer.score_deploy(model, ecfg["deploy"])
+                metrics.update(dm)
+                names = [v["name"] for v in ecfg["deploy"]]
+                log(f"  [{row_name}] deployed: " + "  ".join(f"{n} KL {dm[f'deploy_{n}_kl']:.5f}" for n in names))
             if problems is not None and run.get("gsm8k", True):
                 g = run_gsm8k(model, tok, problems, gcfg, out_dir / "gsm8k" / f"{row_name}.jsonl")
                 log(f"  [{row_name}] GSM8K {g['gsm8k_acc']:.1f}% ({g['gsm8k_seconds']:.0f}s)")

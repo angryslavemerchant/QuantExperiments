@@ -5,10 +5,10 @@ Every block linear runs on the lane-interleaved run kernel from the file's codes
 books and scales; embeddings, norms and q/k/v biases come from the base checkpoint
 named in the file. The lm_head is not part of the packed format (the pipeline only
 compresses block linears): `head` picks fp16 (cuBLAS) or our Q4_0-like kernel
-(4.5 bpw) or Q8_0-like kernel (8.5 bpw). q4 costs real quality: on Qwen2.5-1.5B a 4-bit head alone
-adds ~0.07 KL, an 8-bit head ~0.0002 (scratchpad measurement, 2026-11-06).
+(4.5 bpw) or Q8_0-like kernel (8.5 bpw, the default). q4 costs real quality: on Qwen2.5-7B a 4-bit
+head alone adds 0.043 KL (top-1 88.2%), an 8-bit head 0.0001 (scripts/head_kl.py, run s26c).
 
-    eng, info = engine_from_packed("model.safetensors", head="q4", max_len=2048)
+    eng, info = engine_from_packed("model.safetensors", head="q8", max_len=2048)
     out = generate(eng, prompt_ids, 64)
 """
 
@@ -51,7 +51,7 @@ def runs_linear(pf: PackedFile, name: str, dev="cuda", ru: int = 1, small=(0, 1)
     return de.RunsLin(rl, threads=th, blocks_per_sm=bps)
 
 
-def engine_from_packed(packed_path, *, model=None, head: str = "q4", max_len: int = 2048, dev="cuda",
+def engine_from_packed(packed_path, *, model=None, head: str = "q8", max_len: int = 2048, dev="cuda",
                        ru: int = 1, small=(0, 1), large=(512, 1), prefill: bool = False, **engine_kw):
     """Build a DecodeEngine from a packed file. model: an already-loaded HF causal LM to take the
     non-block tensors from (default: the file's base model, loaded on the CPU in bf16).

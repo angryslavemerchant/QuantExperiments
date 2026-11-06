@@ -38,6 +38,20 @@ def _decoder(model):
     return model.model
 
 
+def block_quant(w: torch.Tensor, bits: int, block: int = 32) -> torch.Tensor:
+    """Symmetric per-block quant with an fp16 scale (amax / qmax), dequantized to float32. bits 4
+    and 8 match the runtime's q4/q8 head kernels (kernels.proto_formats.q4_pack / q8_pack)."""
+    R, C = w.shape
+    qmax = 2 ** (bits - 1) - 1
+    out = torch.empty(R, C, dtype=torch.float32, device=w.device)
+    for s in range(0, R, 8192):                                   # bounded fp32 temporaries
+        b = w[s:s + 8192].float().view(-1, C // block, block)
+        sc = (b.abs().amax(-1, keepdim=True).clamp_min(1e-8) / qmax).half().float()
+        sc = torch.where(sc == 0, torch.ones_like(sc), sc)       # all-zero block: fp16 underflow
+        out[s:s + 8192] = ((b / sc).round().clamp(-qmax - 1, qmax) * sc).view(-1, C)
+    return out
+
+
 class Scorer:
     """Holds the evaluation windows, the cached reference hidden states, and a
     float32 copy of the (never-compressed) lm_head weight."""
@@ -58,6 +72,39 @@ class Scorer:
 
     def _logprobs(self, h: torch.Tensor) -> torch.Tensor:
         return F.log_softmax(F.linear(h.to(torch.float32), self.head_w, self.head_b), dim=-1)
+
+    @torch.no_grad()
+    def score_deploy(self, model, variants: list[dict]) -> dict:
+        """KL vs the original with the deployed head/embedding formats on top of whatever the
+        model's block linears currently are. variants: [{name, head: bits|None, embed: bits|None}].
+        Returns {"deploy_<name>_kl", "deploy_<name>_top1"} per variant."""
+        out: dict = {}
+        emb = _decoder(model).embed_tokens.weight
+        e0 = emb.detach().clone()
+        try:
+            for v in variants:
+                hb, eb = v.get("head"), v.get("embed")
+                head = block_quant(self.head_w, hb) if hb else self.head_w
+                if eb:
+                    emb.data.copy_(block_quant(e0, eb).to(e0.dtype))
+                kl, agree, n = 0.0, 0, 0
+                for w, ref_h in zip(self.windows, self.ref_hidden):
+                    h = self._hidden(model, w)
+                    T = w.numel() - 1
+                    for s in range(0, T, self.logit_chunk):
+                        e = min(s + self.logit_chunk, T)
+                        ref_lp = self._logprobs(ref_h[s:e])
+                        lp = F.log_softmax(F.linear(h[s:e].float(), head, self.head_b), dim=-1)
+                        kl += float((ref_lp.exp() * (ref_lp - lp)).sum(-1).clamp_min(0).sum())
+                        agree += int((ref_lp.argmax(-1) == lp.argmax(-1)).sum())
+                        n += e - s
+                emb.data.copy_(e0)
+                del head
+                out[f"deploy_{v['name']}_kl"] = kl / n
+                out[f"deploy_{v['name']}_top1"] = 100.0 * agree / n
+        finally:
+            emb.data.copy_(e0)
+        return out
 
     @torch.no_grad()
     def score(self, model) -> dict:

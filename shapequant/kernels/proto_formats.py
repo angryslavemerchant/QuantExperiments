@@ -387,6 +387,7 @@ def q4_pack(w: torch.Tensor):
     blocks = w.reshape(R, C // 32, 32).float()
     amax = blocks.abs().amax(-1).clamp_min(1e-8)
     scale = (amax / 7.0).half().float()
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)          # all-zero block: fp16 underflow
     n = (blocks / scale[..., None]).round().clamp(-8, 7) + 8               # 0..15
     deq = ((n - 8) * scale[..., None]).reshape(R, C)
     words8 = n.reshape(R, C // 8, 8).to(torch.int64)                       # 8 weights per word
@@ -446,6 +447,7 @@ def q8_pack(w: torch.Tensor):
     R, C = w.shape
     blocks = w.reshape(R, C // 32, 32).float()
     scale = (blocks.abs().amax(-1).clamp_min(1e-8) / 127.0).half().float()
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)          # all-zero block: fp16 underflow
     n = (blocks / scale[..., None]).round().clamp(-127, 127)
     return n.reshape(R, C).to(torch.int8), scale.half(), (n * scale[..., None]).reshape(R, C)
 

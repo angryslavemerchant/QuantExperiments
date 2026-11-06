@@ -33,7 +33,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--packed", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--head", default="q4", choices=("q4", "q8", "fp16"))
+    ap.add_argument("--head", default="q8", choices=("q4", "q8", "fp16"))
     ap.add_argument("--new-tokens", type=int, default=48)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--ref-device", default="cpu", help="where the fp32 HF reference runs")

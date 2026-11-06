@@ -1,0 +1,52 @@
+# Stage 12c: the two stage-12a stacks again (same recipe and seed), scored with the deployed head and
+# embedding formats on top (eval.deploy; s12a/s24 measured them with the 16-bit head). Head-only costs
+# on the original model come from the original row. No lm-eval, no export.
+# Run: python scripts/run_experiment.py --config configs/stage12c_deploy_kl_7b.yaml
+stage: 12
+output_dir: artifacts/qwen_s01/stage12c_deploy_kl_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: false
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+  deploy:                  # block-32 symmetric, fp16 scale; head 4/8 = runtime q4/q8 kernels
+    - {name: h8, head: 8}
+    - {name: h6, head: 6}
+    - {name: h4, head: 4}
+    - {name: e4, embed: 4}
+    - {name: h8e4, head: 8, embed: 4}
+    - {name: h6e4, head: 6, embed: 4}
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s12_30, method: stack, d: 4, K: 4096, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
+  - {name: s12_25, method: stack, d: 4, alloc_from: configs/alloc/s4_full.json, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
