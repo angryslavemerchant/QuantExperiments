@@ -108,7 +108,8 @@ class CodebookLinear(nn.Module):
             self._cap["nA"] += 1
 
     def start_capture(self, dtype=torch.bfloat16):
-        if len(self.groups) != 1 or self.groups[0][2] is not None or self.rot_in is not None                 or self.rot_out is not None:
+        if (len(self.groups) != 1 or self.groups[0][2] is not None or self.rot_in is not None
+                or self.rot_out is not None):
             raise ValueError("repick supports M=1 without rotations")
         dev = self.rs.device
         self._cap = {"g": torch.zeros(self.R, self.C, device=dev, dtype=dtype), "n": 0,
@@ -116,21 +117,25 @@ class CodebookLinear(nn.Module):
                      "mode": "grad"}
 
     @torch.no_grad()
-    def repick(self, frac: float, damp: float = 0.1, batch: int = 16384) -> dict:
-        """Discrete code update from the captured statistics (then capture stops).
+    def propose(self, frac: float, damp: float = 0.1, etas=(1.0,), batch: int = 16384) -> list:
+        """Candidate code changes from the captured statistics (capture stops); nothing applied.
 
         Loss model around the current weights: gradient g (mean over the captured steps)
         and diagonal K-FAC curvature F_ij = A_i B_j with A_i = mean_t dy_ti^2 from the
-        sampled-token ("true Fisher") backward and B_j = mean_t x_tj^2. For the token-mean
-        KL this estimates the Gauss-Newton curvature, which (unlike the empirical Fisher
-        of the KL gradient) does not scale with the current error. In the unscaled codeword space u (w = u * s per row) each chunk gets
-        a Newton target t = u - g/F and predicted change dL(c') = 1/2 |c' - t|_F^2 -
-        1/2 |c - t|_F^2; F is damped by damp * mean. Each chunk's best codeword in its
-        row's book is found exhaustively; the top `frac` of chunks by predicted decrease
-        (decreasing ones only) switch."""
+        sampled-token ("true Fisher") backward and B_j = mean_t x_tj^2 (the Gauss-Newton
+        curvature of the token-mean KL; unlike the empirical Fisher of the KL gradient it
+        does not scale with the current error). In the unscaled codeword space u (w = u * s
+        per row) each chunk gets a target t = u - eta * g/F and score
+        |c' - t|_F^2 - |c - t|_F^2; F is damped by damp * mean. Each chunk's best codeword in
+        its row's book is found exhaustively; the top `frac` by decrease are proposed.
+
+        The diagonal model ignores input correlations, so eta = 1 (the diagonal Newton step)
+        overshoots badly when many correlated weights each try to cancel the same gradient;
+        the caller picks eta by the real loss (see _repick_round). Returns, per eta,
+        (chunk indices, new tags, predicted decrease), or None if nothing was captured."""
         cap, self._cap = self._cap, None
         if len(self.books) != 1 or cap["n"] == 0 or cap["nf"] == 0 or cap["nA"] == 0:
-            return {"changed": 0, "chunks": 0, "pred_drop": 0.0}
+            return [None for _ in etas]
         d, R, C = self.d, self.R, self.C
         book = self.books[0].detach()
         tags = self.tags0
@@ -142,51 +147,72 @@ class CodebookLinear(nn.Module):
         Bc = cap["B"] / cap["nf"]
         Fr = A[:, None] * Bc[None, :]
         Fr = Fr + damp * Fr.mean()
-        g = torch.zeros(R, Cp, device=dev)
+        step = torch.zeros(R, Cp, device=dev)
         F = torch.full((R, Cp), float(Fr.mean()), device=dev)   # padded columns: no gradient
-        g[:, :C] = cap["g"].float() / cap["n"] * s[:, None]
+        step[:, :C] = cap["g"].float() / cap["n"] * s[:, None] / Fr
         F[:, :C] = Fr
         del cap, Fr
         cur = tags.long().view(-1)
-        u = book[cur].view(R, Cp)
-        t = (u - g / F).view(-1, d)
+        u = book[cur]
+        step = step.view(-1, d)
         F = F.view(-1, d)
-        del g, u
-        cost_cur = (F * (book[cur] - t) ** 2).sum(1)
-        best = cur.clone()
-        cost_best = cost_cur.clone()
         G = 1 if self.row_book is None else int(self.row_book.max()) + 1
         K = book.shape[0] // G
         chunk_book = (torch.zeros(R, dtype=torch.long, device=dev) if self.row_book is None
                       else self.row_book.long())[:, None].expand(R, nch).reshape(-1)
-        for gi in range(G):
-            idx = (chunk_book == gi).nonzero().squeeze(1)
-            if idx.numel() == 0:
+        groups = [(gi, (chunk_book == gi).nonzero().squeeze(1)) for gi in range(G)]
+        out = []
+        for eta in etas:
+            t = u - eta * step
+            cost_cur = (F * (u - t) ** 2).sum(1)
+            best = cur.clone()
+            cost_best = cost_cur.clone()
+            for gi, idx in groups:
+                if idx.numel() == 0:
+                    continue
+                B = book[gi * K:(gi + 1) * K]
+                B2T = (B * B).T.contiguous()
+                BT = B.T.contiguous()
+                for b0 in range(0, idx.numel(), batch):
+                    ii = idx[b0:b0 + batch]
+                    f, tt = F[ii], t[ii]
+                    sc = torch.addmm(f @ B2T, f * tt, BT, alpha=-2.0)   # sum F c^2 - 2 sum F t c
+                    m, a = sc.min(1)
+                    cb_ = m + (f * tt * tt).sum(1)
+                    better = cb_ < cost_best[ii]
+                    best[ii[better]] = a[better] + gi * K
+                    cost_best[ii[better]] = cb_[better]
+            # the expanded search form cancels badly near zero: re-score winners directly
+            cost_best = (F * (book[best] - t) ** 2).sum(1)
+            gain = torch.where(best != cur, cost_cur - cost_best, torch.zeros_like(cost_cur))
+            gain = torch.where(gain > 1e-6 * cost_cur.abs().mean().clamp_min(1e-30), gain,
+                               torch.zeros_like(gain))
+            k = int(frac * gain.numel())
+            if k == 0:
+                out.append((cur[:0], cur[:0].to(tags.dtype), 0.0))
                 continue
-            B = book[gi * K:(gi + 1) * K]
-            B2T = (B * B).T.contiguous()
-            BT = B.T.contiguous()
-            for b0 in range(0, idx.numel(), batch):
-                ii = idx[b0:b0 + batch]
-                f, tt = F[ii], t[ii]
-                sc = torch.addmm(f @ B2T, f * tt, BT, alpha=-2.0)   # sum F c^2 - 2 sum F t c
-                m, a = sc.min(1)
-                cb_ = m + (f * tt * tt).sum(1)
-                better = cb_ < cost_best[ii]
-                best[ii[better]] = a[better] + gi * K
-                cost_best[ii[better]] = cb_[better]
-        # the expanded search form cancels badly near zero: re-score winners directly
-        cost_best = (F * (book[best] - t) ** 2).sum(1)
-        gain = torch.where(best != cur, cost_cur - cost_best, torch.zeros_like(cost_cur))
-        gain = torch.where(gain > 1e-6 * cost_cur.abs().mean().clamp_min(1e-30), gain, torch.zeros_like(gain))
-        k = int(frac * gain.numel())
-        if k == 0:
-            return {"changed": 0, "chunks": int(gain.numel()), "pred_drop": 0.0}
-        top = torch.topk(gain, k).indices
-        top = top[gain[top] > 0]
-        tags.view(-1)[top] = best[top].to(tags.dtype)
-        return {"changed": int(top.numel()), "chunks": int(gain.numel()),
-                "pred_drop": float(gain[top].sum() / 2)}
+            top = torch.topk(gain, k).indices
+            top = top[gain[top] > 0]
+            out.append((top, best[top].to(tags.dtype), float(gain[top].sum() / 2)))
+            del t, best, cost_best, cost_cur, gain
+        return out
+
+    @torch.no_grad()
+    def swap_tags(self, idx: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+        """Write tags at idx; return the previous values (to revert)."""
+        flat = self.tags0.view(-1)
+        old = flat[idx].clone()
+        flat[idx] = vals
+        return old
+
+    @torch.no_grad()
+    def repick(self, frac: float, damp: float = 0.1, eta: float = 1.0) -> dict:
+        """propose() with one step size, applied unconditionally."""
+        p = self.propose(frac, damp, (eta,))[0]
+        if p is None:
+            return {"changed": 0, "chunks": 0, "pred_drop": 0.0}
+        self.swap_tags(p[0], p[1])
+        return {"changed": int(p[0].numel()), "chunks": self.tags0.numel(), "pred_drop": p[2]}
 
     def forward(self, x):
         w = self.sorted_weight()
@@ -235,6 +261,51 @@ class CodebookLinear(nn.Module):
         if self.rot_out is not None:
             out = self.rot_out.T @ out
         return out
+
+
+@torch.no_grad()
+def _repick_round(model, teacher, wrappers, seqs, step, dev, rp, log) -> dict:
+    """One V step: a proposal per step size eta, each scored by the real KL on
+    `eval_seqs` held calibration sequences (half the epoch away from the ones just
+    trained on); the best is kept, or none if no proposal beats the current codes. A
+    trust region on the actual loss, since the diagonal model's predictions are not."""
+    etas = tuple(rp.get("etas", (1.0, 0.1, 0.01, 0.001)))
+    props = {n: w.propose(rp.get("frac", 0.02), rp.get("damp", 0.1), etas)
+             for n, (_, _, _, w) in wrappers.items()}
+    ne = rp.get("eval_seqs", 2)
+    pick = [(step + 1 + seqs.shape[0] // 2 + i) % seqs.shape[0] for i in range(ne)]
+    batches = []
+    for i in pick:
+        ids = seqs[i][None].to(dev)
+        batches.append((ids, teacher(input_ids=ids, use_cache=False).logits))
+
+    def kl_now():
+        return sum(float(kl_loss(t, model(input_ids=ids, use_cache=False).logits))
+                   for ids, t in batches) / len(batches)
+
+    base = kl_now()
+    kls = []
+    for e in range(len(etas)):
+        olds = {n: wrappers[n][3].swap_tags(p[e][0], p[e][1])
+                for n, p in props.items() if p[e] is not None}
+        kls.append(kl_now())
+        for n, old in olds.items():
+            wrappers[n][3].swap_tags(props[n][e][0], old)
+    e_best = min(range(len(etas)), key=lambda e: kls[e])
+    ch = 0
+    if kls[e_best] < base:
+        for n, p in props.items():
+            if p[e_best] is not None:
+                wrappers[n][3].swap_tags(p[e_best][0], p[e_best][1])
+                ch += int(p[e_best][0].numel())
+    tot = sum(w.tags0.numel() for _, _, _, w in wrappers.values())
+    pred = [sum(p[e][2] for p in props.values() if p[e] is not None) for e in range(len(etas))]
+    kept = etas[e_best] if ch else None
+    trials = ", ".join(f"eta {e:g}: {k:.4f} (pred -{pr:.3g})" for e, k, pr in zip(etas, kls, pred))
+    kept_s = "none" if kept is None else f"eta {kept:g}"
+    log(f"  repick at step {step + 1}: held-out KL {base:.4f} -> {trials}; kept {kept_s}, {ch}/{tot} chunks")
+    return {"step": step + 1, "base_kl": base, "etas": list(etas), "kls": kls, "pred_drop": pred,
+            "kept_eta": kept, "changed": ch, "chunks": tot}
 
 
 def set_capture_mode(wrappers: dict, mode: str) -> None:
@@ -320,14 +391,7 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
             opt.step()
             losses.append(float(loss.detach()))
             if rp and (step + 1) % rp["every"] == 0 and next(iter(wrappers.values()))[3]._cap is not None:
-                ch = tot = 0
-                drop = 0.0
-                for _, _, _, w in wrappers.values():
-                    r = w.repick(rp.get("frac", 0.02), rp.get("damp", 0.1))
-                    ch += r["changed"]; tot += r["chunks"]; drop += r.get("pred_drop", 0.0)
-                rp_log.append({"step": step + 1, "changed": ch, "chunks": tot, "pred_drop": drop})
-                log(f"  repick at step {step + 1}: {ch}/{tot} chunks ({100 * ch / max(1, tot):.2f}%), "
-                    f"predicted KL drop {drop:.4f}")
+                rp_log.append(_repick_round(model, teacher, wrappers, seqs, step, dev, rp, log))
             if step % fcfg.get("log_every", 16) == 0 or step == steps - 1:
                 recent = sum(losses[-16:]) / len(losses[-16:])
                 log(f"  finetune step {step + 1}/{steps}: KL {recent:.4f} ({time.time() - t0:.0f}s)")

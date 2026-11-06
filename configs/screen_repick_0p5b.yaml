@@ -17,7 +17,7 @@ kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 3276
 runs:
   - {name: original, method: original, gsm8k: false}
   - {name: g4, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
-  - {name: g4_rp2, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32, repick: {every: 64, accum: 8, frac: 0.02, damp: 0.1}}}
-  - {name: g4_rp05, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32, repick: {every: 64, accum: 8, frac: 0.005, damp: 0.1}}}
+  - {name: g4_rp2, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32, repick: {every: 64, accum: 8, frac: 0.02, damp: 0.1, etas: [0.1, 0.01, 0.001, 0.0001]}}}
+  - {name: g4_rp05, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32, repick: {every: 64, accum: 8, frac: 0.005, damp: 0.1, etas: [0.1, 0.01, 0.001, 0.0001]}}}
   - {name: g4_ldlq, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
-  - {name: g4_ldlq_rp2, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32, repick: {every: 64, accum: 8, frac: 0.02, damp: 0.1}}}
+  - {name: g4_ldlq_rp2, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, gsm8k: false, finetune: {steps: 256, seq_len: 512, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32, repick: {every: 64, accum: 8, frac: 0.02, damp: 0.1, etas: [0.1, 0.01, 0.001, 0.0001]}}}
