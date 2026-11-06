@@ -1,0 +1,17 @@
+# Stage 13c: a quick real-weight Qwen3.5-2B quant (uniform K1024 G4 M1, LDLQ, no fine-tune) exported
+# self-contained, for scripts/check_qwen35_runtime.py (engine vs HF with the same weights). Quality
+# numbers here are not the benchmark (that is stage 13b); the eval is kept small.
+# Run: python scripts/run_experiment.py --config configs/stage13c_runtime_check_qwen35_2b.yaml
+stage: 13
+output_dir: artifacts/qwen35_2b/stage13c_runtime_check
+model: Qwen/Qwen3.5-2B
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 128
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 1024, num_windows: 8}
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 64, context: 1024, batch_size: 4}
+kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 32768}
+runs:
+  - {name: chk, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true}
