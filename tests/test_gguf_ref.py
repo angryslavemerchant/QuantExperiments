@@ -63,3 +63,32 @@ def test_head_and_embed(tmp_path, with_output):
     ref_h = H if with_output else E
     assert float(((he["head"] - torch.from_numpy(ref_h)) ** 2).sum() / (ref_h ** 2).sum()) < 1e-3
     assert float(((he["embed"] - torch.from_numpy(E)) ** 2).sum() / (E ** 2).sum()) < 1e-3
+
+
+def test_qwen35_value_head_reorder(tmp_path):
+    """GGUF files of Qwen3.5 / 3.8 with more value than key heads store the DeltaNet value heads
+    tiled over the key heads (llama.cpp); GGUFSource.matrix returns them in HF order."""
+    HK, HV, DK, DV, H = 2, 6, 4, 4, 32
+    rep = HV // HK
+    g = torch.Generator().manual_seed(0)
+    z = torch.randn(HV * DV, H, generator=g)
+    qkv = torch.randn(2 * HK * DK + HV * DV, H, generator=g)
+    out = torch.randn(H, HV * DV, generator=g)
+    perm = [rep * (j % HK) + j // HK for j in range(HV)]
+    rows = torch.tensor([p * DV + i for p in perm for i in range(DV)])
+    path = tmp_path / "t.gguf"
+    w = gguf.GGUFWriter(str(path), "qwen35")
+    w.add_uint32("qwen35.ssm.group_count", HK)
+    w.add_uint32("qwen35.ssm.time_step_rank", HV)
+    w.add_uint32("qwen35.ssm.inner_size", HV * DV)
+    off = 2 * HK * DK
+    for name, a in [("blk.0.attn_gate.weight", z[rows]),
+                    ("blk.0.attn_qkv.weight", torch.cat([qkv[:off], qkv[off:][rows]])),
+                    ("blk.0.ssm_out.weight", out[:, rows])]:
+        w.add_tensor(name, a.numpy().astype(np.float32))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    src = gguf_ref.GGUFSource(str(path))
+    for hf, ref in [("model.layers.0.linear_attn.in_proj_z", z), ("model.layers.0.linear_attn.in_proj_qkv", qkv),
+                    ("model.layers.0.linear_attn.out_proj", out)]:
+        got, _, _ = src.matrix(hf, tuple(ref.shape))
+        assert torch.equal(got, ref), hf

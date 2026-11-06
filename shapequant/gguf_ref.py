@@ -50,6 +50,34 @@ class GGUFSource:
         self.path = path
         self.reader = GGUFReader(path)
         self.tensors = {t.name: t for t in self.reader.tensors}
+        self.vhead_rows = self._vhead_rows()
+
+    def _field(self, key: str):
+        f = self.reader.fields.get(key)
+        return None if f is None else int(f.parts[-1][0])
+
+    def _vhead_rows(self) -> torch.Tensor | None:
+        """llama.cpp stores Gated DeltaNet value heads reordered when there are more value than
+        key heads (qwen35 / qwen3next, num_v_heads > num_k_heads): it tiles the key heads
+        (value head j uses key head j % HK) where HF repeats them (head h uses key head h // rep),
+        so GGUF value head j is HF head rep * (j % HK) + j // HK. Returns, per GGUF value row, the
+        HF row it holds (None when no reorder applies). Verified on Qwen3.8-27B (HK 16, HV 48)."""
+        arch = None
+        f = self.reader.fields.get("general.architecture")
+        if f is not None:
+            arch = bytes(f.parts[-1]).decode()
+        if arch is None:
+            return None
+        hk = self._field(f"{arch}.ssm.group_count")
+        hv = self._field(f"{arch}.ssm.time_step_rank")
+        inner = self._field(f"{arch}.ssm.inner_size")
+        if not hk or not hv or not inner or hv == hk:
+            return None
+        if hv % hk:
+            raise ValueError(f"{self.path}: {hv} value heads not a multiple of {hk} key heads")
+        dv, rep = inner // hv, hv // hk
+        perm = torch.tensor([rep * (j % hk) + j // hk for j in range(hv)])
+        return (perm[:, None] * dv + torch.arange(dv)[None]).reshape(-1)
 
     def matrix(self, hf_name: str, shape: tuple[int, int]) -> tuple[torch.Tensor, float, str]:
         """Returns (dequantized float32 [R, C], storage bits, ggml type name)."""
@@ -59,7 +87,21 @@ class GGUFSource:
         w = np.asarray(dequantize(t.data, t.tensor_type), dtype=np.float32)
         if w.size != shape[0] * shape[1]:
             raise ValueError(f"{t.name}: {w.shape} does not match HF shape {shape}")
-        return torch.from_numpy(w.reshape(shape).copy()), float(t.n_bytes) * 8, t.tensor_type.name
+        out = torch.from_numpy(w.reshape(shape).copy())
+        rows = self.vhead_rows
+        if rows is not None and ".linear_attn." in hf_name:
+            kind = hf_name.rsplit(".", 1)[1]
+            nv = rows.numel()
+            fixed = out.clone()
+            if kind == "in_proj_z":                       # value_dim rows
+                fixed[rows] = out
+            elif kind == "in_proj_qkv":                   # [q | k | v] rows: only v is reordered
+                off = shape[0] - nv
+                fixed[off + rows] = out[off:]
+            elif kind == "out_proj":                      # value_dim input columns
+                fixed[:, rows] = out
+            out = fixed
+        return out, float(t.n_bytes) * 8, t.tensor_type.name
 
 
     def head_and_embed(self, vocab: int, hidden: int) -> dict:
