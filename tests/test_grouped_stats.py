@@ -60,3 +60,15 @@ def test_fisher_grouped_identical(make):
         part.update(al.fisher_diag(m, seqs, log=lambda *_: None, names=g))
     for n in names:
         assert torch.equal(full[n], part[n]), n
+
+
+@pytest.mark.parametrize("make", [_qwen2, _qwen35])
+def test_fisher_checkpointing_identical(make):
+    """Gradient checkpointing (the default) recomputes activations: same Fisher as without."""
+    m = make()
+    seqs = torch.randint(0, 256, (2, 32), generator=torch.Generator().manual_seed(4))
+    a = al.fisher_diag(m, seqs, log=lambda *_: None, checkpoint=True)
+    b = al.fisher_diag(m, seqs, log=lambda *_: None, checkpoint=False)
+    assert not m.training and not m.is_gradient_checkpointing
+    for n in a:
+        assert torch.equal(a[n], b[n]), n

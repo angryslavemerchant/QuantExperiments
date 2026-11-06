@@ -29,10 +29,13 @@ from . import masks as mk
 from .pipeline import compressible_linears
 
 
-def fisher_diag(model, seqs: torch.Tensor, log=print, names: list[str] | None = None) -> dict[str, torch.Tensor]:
+def fisher_diag(model, seqs: torch.Tensor, log=print, names: list[str] | None = None,
+                checkpoint: bool = True) -> dict[str, torch.Tensor]:
     """E[g^2] of next-token CE per block-linear weight (float32, on the model's device
     when it fits, else CPU). names: only these matrices (the others get no gradient; each
-    weight's gradient is the same either way), so a big model can be done in groups."""
+    weight's gradient is the same either way), so a big model can be done in groups.
+    checkpoint: gradient checkpointing (layer activations recomputed in the backward instead of
+    all kept: the same gradients; a 27B backward otherwise needs > 40 GB of activations)."""
     mods = dict(compressible_linears(model))
     if names is not None:
         mods = {n: mods[n] for n in names}
@@ -54,6 +57,11 @@ def fisher_diag(model, seqs: torch.Tensor, log=print, names: list[str] | None = 
         m.weight.requires_grad_(True)
         acc[n] = torch.zeros(m.weight.shape, dtype=torch.float32, device=acc_dev)
     t0 = time.time()
+    was_training = model.training
+    if checkpoint:
+        # HF only checkpoints in train mode; no dropout in these models (attention_dropout 0)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.train()
     try:
         for i in range(seqs.shape[0]):
             ids = seqs[i : i + 1].to(dev)
@@ -66,6 +74,9 @@ def fisher_diag(model, seqs: torch.Tensor, log=print, names: list[str] | None = 
             if (i + 1) % 16 == 0:
                 log(f"  fisher {i + 1}/{seqs.shape[0]} ({time.time() - t0:.0f}s)")
     finally:
+        if checkpoint:
+            model.gradient_checkpointing_disable()
+            model.train(was_training)
         for m in mods.values():
             m.weight.requires_grad_(False)
             m.weight.grad = None
