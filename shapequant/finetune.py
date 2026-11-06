@@ -1,6 +1,8 @@
 """Stage 5: codebook fine-tune.
 
-Tags and masks are frozen; only the codebook entries and per-row scales train,
+Masks are frozen; the codebook entries and per-row scales train by Adam. Tags are
+frozen too unless `repick` is set: then every `every` steps the last `accum` steps'
+weight gradients drive a discrete code re-pick (PV-tuning style; see CodebookLinear.repick),
 to minimize KL(original || compressed) on calibration text (never evaluation
 text). Each block linear is temporarily replaced by a `CodebookLinear` that
 re-decodes its weight from the trainable codebook(s) on every forward, so the
@@ -60,6 +62,9 @@ class CodebookLinear(nn.Module):
         self.register_buffer("order", order)
         self.register_buffer("unsort", torch.argsort(order))
         self.register_buffer("rs", fit.row_scale.detach().float()[order].clone())
+        rb = fit.stats.get("row_book")
+        self.register_buffer("row_book", None if rb is None else rb.to(order.device)[order].clone())
+        self._cap = None   # gradient / curvature statistics while capturing for a re-pick
         self.log_gain = nn.Parameter(torch.zeros(R, device=lin.weight.device))  # sorted-row order
         for i, t in enumerate(fit.tags):
             self.register_buffer(f"tags{i}", t.view(R, -1)[order].reshape(-1).contiguous())
@@ -88,8 +93,110 @@ class CodebookLinear(nn.Module):
         u = flat.view(self.R, -1)[:, : self.C]
         return u * (self.rs * self.log_gain.exp())[:, None]
 
+    # --- discrete code re-pick (PV-tuning-style V step) -------------------------------
+    # Two backward passes per captured step: "fisher" (log-likelihood of tokens sampled from
+    # the student: per-token output gradients whose squares estimate the curvature) and
+    # "grad" (the real loss: the gradient). Hooks file each into its own statistic.
+    def _accum_w(self, g):
+        if self._cap["mode"] == "grad":
+            self._cap["g"].add_(g.to(self._cap["g"].dtype))
+            self._cap["n"] += 1
+
+    def _accum_y(self, gy):
+        if self._cap["mode"] == "fisher":
+            self._cap["A"].add_(gy.float().pow(2).reshape(-1, gy.shape[-1]).mean(0))
+            self._cap["nA"] += 1
+
+    def start_capture(self, dtype=torch.bfloat16):
+        if len(self.groups) != 1 or self.groups[0][2] is not None or self.rot_in is not None                 or self.rot_out is not None:
+            raise ValueError("repick supports M=1 without rotations")
+        dev = self.rs.device
+        self._cap = {"g": torch.zeros(self.R, self.C, device=dev, dtype=dtype), "n": 0,
+                     "A": torch.zeros(self.R, device=dev), "nA": 0, "B": torch.zeros(self.C, device=dev), "nf": 0,
+                     "mode": "grad"}
+
+    @torch.no_grad()
+    def repick(self, frac: float, damp: float = 0.1, batch: int = 16384) -> dict:
+        """Discrete code update from the captured statistics (then capture stops).
+
+        Loss model around the current weights: gradient g (mean over the captured steps)
+        and diagonal K-FAC curvature F_ij = A_i B_j with A_i = mean_t dy_ti^2 from the
+        sampled-token ("true Fisher") backward and B_j = mean_t x_tj^2. For the token-mean
+        KL this estimates the Gauss-Newton curvature, which (unlike the empirical Fisher
+        of the KL gradient) does not scale with the current error. In the unscaled codeword space u (w = u * s per row) each chunk gets
+        a Newton target t = u - g/F and predicted change dL(c') = 1/2 |c' - t|_F^2 -
+        1/2 |c - t|_F^2; F is damped by damp * mean. Each chunk's best codeword in its
+        row's book is found exhaustively; the top `frac` of chunks by predicted decrease
+        (decreasing ones only) switch."""
+        cap, self._cap = self._cap, None
+        if len(self.books) != 1 or cap["n"] == 0 or cap["nf"] == 0 or cap["nA"] == 0:
+            return {"changed": 0, "chunks": 0, "pred_drop": 0.0}
+        d, R, C = self.d, self.R, self.C
+        book = self.books[0].detach()
+        tags = self.tags0
+        nch = tags.numel() // R
+        Cp = nch * d
+        dev = book.device
+        s = self.rs * self.log_gain.exp()
+        A = cap["A"] / cap["nA"] * s ** 2                    # per row, into u space
+        Bc = cap["B"] / cap["nf"]
+        Fr = A[:, None] * Bc[None, :]
+        Fr = Fr + damp * Fr.mean()
+        g = torch.zeros(R, Cp, device=dev)
+        F = torch.full((R, Cp), float(Fr.mean()), device=dev)   # padded columns: no gradient
+        g[:, :C] = cap["g"].float() / cap["n"] * s[:, None]
+        F[:, :C] = Fr
+        del cap, Fr
+        cur = tags.long().view(-1)
+        u = book[cur].view(R, Cp)
+        t = (u - g / F).view(-1, d)
+        F = F.view(-1, d)
+        del g, u
+        cost_cur = (F * (book[cur] - t) ** 2).sum(1)
+        best = cur.clone()
+        cost_best = cost_cur.clone()
+        G = 1 if self.row_book is None else int(self.row_book.max()) + 1
+        K = book.shape[0] // G
+        chunk_book = (torch.zeros(R, dtype=torch.long, device=dev) if self.row_book is None
+                      else self.row_book.long())[:, None].expand(R, nch).reshape(-1)
+        for gi in range(G):
+            idx = (chunk_book == gi).nonzero().squeeze(1)
+            if idx.numel() == 0:
+                continue
+            B = book[gi * K:(gi + 1) * K]
+            B2T = (B * B).T.contiguous()
+            BT = B.T.contiguous()
+            for b0 in range(0, idx.numel(), batch):
+                ii = idx[b0:b0 + batch]
+                f, tt = F[ii], t[ii]
+                sc = torch.addmm(f @ B2T, f * tt, BT, alpha=-2.0)   # sum F c^2 - 2 sum F t c
+                m, a = sc.min(1)
+                cb_ = m + (f * tt * tt).sum(1)
+                better = cb_ < cost_best[ii]
+                best[ii[better]] = a[better] + gi * K
+                cost_best[ii[better]] = cb_[better]
+        # the expanded search form cancels badly near zero: re-score winners directly
+        cost_best = (F * (book[best] - t) ** 2).sum(1)
+        gain = torch.where(best != cur, cost_cur - cost_best, torch.zeros_like(cost_cur))
+        gain = torch.where(gain > 1e-6 * cost_cur.abs().mean().clamp_min(1e-30), gain, torch.zeros_like(gain))
+        k = int(frac * gain.numel())
+        if k == 0:
+            return {"changed": 0, "chunks": int(gain.numel()), "pred_drop": 0.0}
+        top = torch.topk(gain, k).indices
+        top = top[gain[top] > 0]
+        tags.view(-1)[top] = best[top].to(tags.dtype)
+        return {"changed": int(top.numel()), "chunks": int(gain.numel()),
+                "pred_drop": float(gain[top].sum() / 2)}
+
     def forward(self, x):
-        w = self.sorted_weight().to(x.dtype)
+        w = self.sorted_weight()
+        cap = self._cap is not None and torch.is_grad_enabled()
+        if cap:
+            if w.requires_grad:
+                w.register_hook(self._accum_w)
+            self._cap["B"].add_(x.detach().float().pow(2).reshape(-1, x.shape[-1]).mean(0))
+            self._cap["nf"] += 1
+        w = w.to(x.dtype)
         if self.rot_in is not None:
             x = F.linear(x, self.rot_in.to(x.dtype))
         outs = []
@@ -102,7 +209,10 @@ class CodebookLinear(nn.Module):
         if self.rot_out is not None:
             y = y @ self.rot_out.to(y.dtype)
         bias = self.lin[0].bias
-        return y if bias is None else y + bias
+        y = y if bias is None else y + bias
+        if cap and y.requires_grad:
+            y.register_hook(self._accum_y)
+        return y
 
     @torch.no_grad()
     def bake(self) -> torch.Tensor:
@@ -125,6 +235,12 @@ class CodebookLinear(nn.Module):
         if self.rot_out is not None:
             out = self.rot_out.T @ out
         return out
+
+
+def set_capture_mode(wrappers: dict, mode: str) -> None:
+    for _, _, _, w in wrappers.values():
+        if w._cap is not None:
+            w._cap["mode"] = mode
 
 
 def write_back(fit, wrap: "CodebookLinear") -> None:
@@ -172,18 +288,46 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
     model.train()
     teacher.eval()
     losses = []
+    rp = fcfg.get("repick")
+    rp_log = []
     t0 = time.time()
     try:
         for step in range(steps):
+            # capture over steps [k*every - accum, k*every); re-pick after step k*every, leaving
+            # at least `every` steps after the last re-pick for the books to settle
+            if rp and ((step + rp.get("accum", 8)) % rp["every"] == 0
+                       and step + rp.get("accum", 8) + rp["every"] <= steps):
+                for _, _, _, w in wrappers.values():
+                    w.start_capture()
             ids = seqs[step % seqs.shape[0]][None].to(dev)
             with torch.no_grad():
                 t_logits = teacher(input_ids=ids, use_cache=False).logits
             s_logits = model(input_ids=ids, use_cache=False).logits
             loss = kl_loss(t_logits, s_logits)
             opt.zero_grad(set_to_none=True)
+            if rp and next(iter(wrappers.values()))[3]._cap is not None:
+                set_capture_mode(wrappers, "fisher")
+                with torch.no_grad():
+                    lp = F.log_softmax(s_logits.detach().float(), dim=-1)
+                    yhat = torch.distributions.Categorical(logits=lp).sample()
+                    del lp
+                fl = F.log_softmax(s_logits.float(), dim=-1).gather(-1, yhat[..., None]).sum()
+                fl.backward(retain_graph=True)
+                del fl
+                opt.zero_grad(set_to_none=True)
+                set_capture_mode(wrappers, "grad")
             loss.backward()
             opt.step()
             losses.append(float(loss.detach()))
+            if rp and (step + 1) % rp["every"] == 0 and next(iter(wrappers.values()))[3]._cap is not None:
+                ch = tot = 0
+                drop = 0.0
+                for _, _, _, w in wrappers.values():
+                    r = w.repick(rp.get("frac", 0.02), rp.get("damp", 0.1))
+                    ch += r["changed"]; tot += r["chunks"]; drop += r.get("pred_drop", 0.0)
+                rp_log.append({"step": step + 1, "changed": ch, "chunks": tot, "pred_drop": drop})
+                log(f"  repick at step {step + 1}: {ch}/{tot} chunks ({100 * ch / max(1, tot):.2f}%), "
+                    f"predicted KL drop {drop:.4f}")
             if step % fcfg.get("log_every", 16) == 0 or step == steps - 1:
                 recent = sum(losses[-16:]) / len(losses[-16:])
                 log(f"  finetune step {step + 1}/{steps}: KL {recent:.4f} ({time.time() - t0:.0f}s)")
@@ -200,4 +344,5 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
             p.requires_grad_(False)
     k = min(16, len(losses))
     return {"ft_kl_first": sum(losses[:k]) / max(1, k), "ft_kl_last": sum(losses[-k:]) / max(1, k),
-            "ft_steps": len(losses), "ft_seconds": time.time() - t0}
+            "ft_steps": len(losses), "ft_seconds": time.time() - t0,
+            **({"ft_repick": rp_log} if rp else {})}
