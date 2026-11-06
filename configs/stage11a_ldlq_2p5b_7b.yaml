@@ -1,0 +1,44 @@
+# Stage 11a: the current 2.5-bpw stack (Fisher allocation over K {256,1024,4096} = configs/alloc/s4_full.json,
+# G4, M1, 512-step finetune; KL 0.158 in s16) + LDLQ error feedback (sped up, 8531b05). 0.5B screen s21c:
+# LDLQ cut KL after finetune 0.337 -> 0.299 on this stack. ldlq_damp 0.1 (best in the qx1 0.5B damping test).
+# Run: python scripts/run_experiment.py --config configs/stage11a_ldlq_2p5b_7b.yaml
+stage: 11
+output_dir: artifacts/qwen_s01/stage11a_ldlq_2p5b_7b
+model: Qwen/Qwen2.5-7B-Instruct
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 256
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k:
+    enabled: true
+    dataset: openai/gsm8k
+    subset: main
+    split: test
+    num_problems: 200
+    max_new_tokens: 512
+    batch_size: 50
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: original, method: original, gsm8k: false}
+  - {name: s11_m1_g4_ldlq, method: stack, d: 4, alloc_from: configs/alloc/s4_full.json, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: {steps: 512, seq_len: 1024, lr_books: 1.0e-4, lr_gain: 1.0e-3, log_every: 32}}
