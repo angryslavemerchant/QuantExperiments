@@ -403,8 +403,10 @@ def gemv_q4(q, scales, x, y, R, C):
     import cupy as cp
     fn = _fn("gemv_q4", _SRC_Q4, {})
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-        fn((_grid(R),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
-                                 cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R), cp.int32(C // 32)))
+        sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        fn((min(sms * 8, (R + 15) // 16),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
+                                                      cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R),
+                                                      cp.int32(C // 32)), shared_mem=C * 2)
     return y
 
 
@@ -416,27 +418,44 @@ __device__ __forceinline__ float dot4(u32 w, uint2 xv) {
     return (float)(signed char)(w & 0xff) * a.x + (float)(signed char)((w >> 8) & 0xff) * a.y
          + (float)(signed char)((w >> 16) & 0xff) * b.x + (float)(signed char)(w >> 24) * b.y;
 }
+// x staged in shared memory (reading it per lane through L1 halved the bandwidth); each warp
+// takes RW = 2 rows at a time for more loads in flight. ~250 GB/s on an RTX 2060 (its ceiling for
+// this access pattern), was ~110.
 extern "C" __global__ void __launch_bounds__(256)
 gemv_q8(const uint4* __restrict__ q, const __half* __restrict__ scales, const uint2* __restrict__ x,
         __half* __restrict__ y, int R, int NB)
 {
-    const int lane = threadIdx.x & 31;
-    for (int row = blockIdx.x * 8 + (threadIdx.x >> 5); row < R; row += gridDim.x * 8) {
-        const uint4* qr = q + (size_t)row * NB * 2;
-        const __half* sr = scales + (size_t)row * NB;
-        float acc = 0.f;
-        #pragma unroll 2
+    extern __shared__ uint2 xs[];
+    for (int i = threadIdx.x; i < NB * 8; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r0 = (blockIdx.x * 8 + warp) * 2; r0 < R; r0 += gridDim.x * 16) {
+        const size_t ra = r0, rb = min(r0 + 1, R - 1);
+        float acc0 = 0.f, acc1 = 0.f;
         for (int b = lane; b < NB; b += 32) {
-            const uint4 q0 = __ldg(qr + 2 * b), q1 = __ldg(qr + 2 * b + 1);
-            const u32 w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-            float part = 0.f;
+            const uint4 a0 = __ldg(q + (ra * NB + b) * 2), a1 = __ldg(q + (ra * NB + b) * 2 + 1);
+            const uint4 b0 = __ldg(q + (rb * NB + b) * 2), b1 = __ldg(q + (rb * NB + b) * 2 + 1);
+            const float sa = __half2float(scales[ra * NB + b]), sb = __half2float(scales[rb * NB + b]);
+            uint2 xv[8];
             #pragma unroll
-            for (int j = 0; j < 8; ++j) part += dot4(w[j], __ldg(x + b * 8 + j));
-            acc += part * __half2float(sr[b]);
+            for (int j = 0; j < 8; ++j) xv[j] = xs[b * 8 + j];
+            const u32 wa[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const u32 wb[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            float pa = 0.f, pb = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) { pa += dot4(wa[j], xv[j]); pb += dot4(wb[j], xv[j]); }
+            acc0 += pa * sa;
+            acc1 += pb * sb;
         }
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-        if (lane == 0) y[row] = __float2half(acc);
+        for (int o = 16; o > 0; o >>= 1) {
+            acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
+            acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+        }
+        if (lane == 0) {
+            y[ra] = __float2half(acc0);
+            if (r0 + 1 < R) y[rb] = __float2half(acc1);
+        }
     }
 }
 """
@@ -456,6 +475,8 @@ def gemv_q8(q, scales, x, y, R, C):
     import cupy as cp
     fn = _fn("gemv_q8", _SRC_Q8, {})
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-        fn((_grid(R),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
-                                 cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R), cp.int32(C // 32)))
+        sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        fn((min(sms * 8, (R + 15) // 16),), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()),
+                                                      cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr()), cp.int32(R),
+                                                      cp.int32(C // 32)), shared_mem=C * 2)
     return y

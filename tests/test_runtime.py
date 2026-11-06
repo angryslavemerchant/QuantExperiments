@@ -89,14 +89,17 @@ def test_engine_from_packed_matches_hf(tmp_path, M, G, head, tied):
     assert runtime.generate(eng, prompt, 10, graph=False) == gen
 
 
-def test_q8_gemv_matches_dense():
+@pytest.mark.parametrize("R", [1000, 999, 17, 1])
+def test_q8_gemv_matches_dense(R):
     from shapequant.kernels import proto_formats as pf
     g = torch.Generator().manual_seed(0)
-    w = torch.randn(1000, 512, generator=g) * 0.05
+    w = torch.randn(R, 512, generator=g) * 0.05
     q, sc, deq = pf.q8_pack(w)
     x = (torch.randn(512, generator=g)).half()
-    y = torch.empty(1000, dtype=torch.float16, device="cuda")
-    pf.gemv_q8(q.cuda(), sc.cuda(), x.cuda(), y, 1000, 512)
+    y = torch.full((R + 1,), 7.0, dtype=torch.float16, device="cuda")
+    pf.gemv_q8(q.cuda(), sc.cuda(), x.cuda(), y, R, 512)
+    assert float(y[R]) == 7.0                    # nothing written past R
+    y = y[:R]
     ref = deq @ x.float()
     assert float((y.float().cpu() - ref).norm() / ref.norm()) < 2e-3
 
