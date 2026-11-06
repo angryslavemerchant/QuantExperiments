@@ -250,7 +250,8 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
             if "fit" in stats:
                 f = stats.pop("fit")
                 if run.get("finetune") or run.get("export"):
-                    fits[name] = f
+                    f.decoded = None        # already written into the model; fine-tune / export use the
+                    fits[name] = f          # codes (keeping it would cost 4 B/weight: ~100 GB at 27B)
                 nonid.append(stats.pop("mask_nonidentity"))
             if "log2K" in stats:
                 log2k.append((stats.pop("log2K"), stats.pop("numel")))

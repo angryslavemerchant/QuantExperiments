@@ -47,8 +47,18 @@ COLUMNS = [
 T0 = time.time()
 
 
+LOG_FILE: Path | None = None   # out_dir/run.log once known (recovered with the artifacts)
+
+
 def log(msg: str) -> None:
-    print(f"[{time.time() - T0:8.1f}s] {msg}", flush=True)
+    mem = ""
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        mem = f" [gpu {torch.cuda.memory_allocated() / 1e9:.1f}/{torch.cuda.max_memory_allocated() / 1e9:.1f} GB]"
+    line = f"[{time.time() - T0:8.1f}s]{mem} {msg}"
+    print(line, flush=True)
+    if LOG_FILE is not None:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def seed_everything(seed: int) -> None:
@@ -160,6 +170,8 @@ def main() -> int:
         out_dir = out_dir / f"shard{args.shard}"
     (out_dir / "runs").mkdir(parents=True, exist_ok=True)
     (out_dir / "gsm8k").mkdir(exist_ok=True)
+    global LOG_FILE
+    LOG_FILE = out_dir / "run.log"
     csv_path = out_dir / "results.csv"
     seed = cfg["seed"]
     seed_everything(seed)
@@ -367,9 +379,15 @@ def main() -> int:
             from transformers import AutoModelForCausalLM as _AM
             from shapequant.finetune import finetune
             log(f"  fine-tuning codebooks + row scales: {run['finetune']}")
-            teacher = _AM.from_pretrained(cfg["model"], dtype=dtype).to(args.device).eval()
+            # teacher: the original model sharing the student's memory (finetune.SharedTeacher),
+            # or teacher: separate for a second loaded copy (the old way; same result)
+            teacher = (_AM.from_pretrained(cfg["model"], dtype=dtype).to(args.device).eval()
+                       if run["finetune"].get("teacher") == "separate" else None)
             d_by_name = {n: run["d"] for n in fits}
-            ft_stats = finetune(model, teacher, fits, d_by_name, seqs, run["finetune"], log=log)
+            torch.cuda.reset_peak_memory_stats()
+            ft_stats = finetune(model, teacher, fits, d_by_name, seqs, run["finetune"], log=log, originals=originals)
+            ft_stats["ft_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+            log(f"  fine-tune peak GPU memory {ft_stats['ft_peak_gb']:.1f} GB")
             if run.get("export"):
                 export_packed(fits, out_dir / "packed" / f"{name}_ft.safetensors", cfg, f"{name}_ft", log, model)
             del teacher, fits

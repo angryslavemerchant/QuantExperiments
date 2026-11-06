@@ -55,6 +55,7 @@ class CodebookLinear(nn.Module):
         R, C = lin.weight.shape
         self.R, self.C, self.d = R, C, d
         self.lin = [lin]  # keep a reference without registering it as a submodule
+        self.teacher = False  # forward with lin's own weight (the original, see SharedTeacher)
         self.books = nn.ParameterList([nn.Parameter(b.detach().float().clone())
                                        for b in fit.stats["books"]])
         row_mask = fit.row_mask
@@ -215,6 +216,8 @@ class CodebookLinear(nn.Module):
         return {"changed": int(p[0].numel()), "chunks": self.tags0.numel(), "pred_drop": p[2]}
 
     def forward(self, x):
+        if self.teacher:
+            return F.linear(x, self.lin[0].weight, self.lin[0].bias)
         w = self.sorted_weight()
         cap = self._cap is not None and torch.is_grad_enabled()
         if cap:
@@ -321,6 +324,33 @@ def write_back(fit, wrap: "CodebookLinear") -> None:
     fit.row_scale = wrap.rs[wrap.unsort].detach().clone()
 
 
+class SharedTeacher:
+    """The original model as the fine-tune teacher without a second copy of it: while the
+    wrappers train, the replaced nn.Linear weights are unused (the wrappers decode their own),
+    so they hold the ORIGINAL weights and a teacher forward runs the same model with every
+    wrapper passing through to them. Same logits as a separately loaded original model (same
+    weights and ops; only block linears differ between student and teacher), half the memory."""
+
+    def __init__(self, model, wrappers: dict, originals: dict):
+        self.model, self.wrappers = model, wrappers
+        with torch.no_grad():
+            for name, (_, _, lin, _) in wrappers.items():
+                lin.weight.copy_(originals[name].to(lin.weight.device, lin.weight.dtype))
+
+    def eval(self):
+        return self
+
+    @torch.no_grad()
+    def __call__(self, **kw):
+        for *_, w in self.wrappers.values():
+            w.teacher = True
+        try:
+            return self.model(**kw)
+        finally:
+            for *_, w in self.wrappers.values():
+                w.teacher = False
+
+
 def _swap(model, fits: dict, d_by_name: dict):
     wrappers = {}
     for name, lin in compressible_linears(model):
@@ -339,8 +369,10 @@ def kl_loss(teacher_logits: torch.Tensor, student_logits: torch.Tensor) -> torch
 
 
 def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tensor,
-             fcfg: dict, log=print) -> dict:
-    """Train codebooks + row gains in place; write baked weights into `model`."""
+             fcfg: dict, log=print, originals: dict | None = None) -> dict:
+    """Train codebooks + row gains in place; write baked weights into `model`.
+    teacher: the original model, or None with `originals` (the block linears' original
+    weights) for a SharedTeacher (no second model copy)."""
     steps = fcfg.get("steps", 256)
     seq_len = fcfg.get("seq_len", 1024)
     seqs = sequences.reshape(-1, seq_len)
@@ -348,6 +380,10 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
     for p in model.parameters():
         p.requires_grad_(False)
     wrappers = _swap(model, fits, d_by_name)
+    if teacher is None:
+        if originals is None:
+            raise ValueError("finetune: teacher=None needs originals")
+        teacher = SharedTeacher(model, wrappers, originals)
     books = [p for _, _, _, w in wrappers.values() for p in w.books]
     gains = [w.log_gain for _, _, _, w in wrappers.values()]
     opt = torch.optim.Adam([
