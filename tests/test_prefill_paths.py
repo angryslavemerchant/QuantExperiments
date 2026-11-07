@@ -62,3 +62,7 @@ def test_qwen35_paths(tmp_path, hv):
     eng.reset()
     lg_last = q35.prefill(eng, seq, logits="last")
     assert _rel(lg_last, ref[-1]) < 5e-3
+    # EXPERIMENTAL fp8 rounding (emulated on any GPU): runs end to end, stays near the fp16 result
+    eng.reset()
+    lg8 = q35.prefill(eng, seq, logits="all", gemm="fp8_emulated")
+    assert torch.isfinite(lg8).all() and _rel(lg8, ref) < 0.15, _rel(lg8, ref)

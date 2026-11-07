@@ -226,7 +226,10 @@ class Gemms:
     gemm "dequant": each group decodes into the shared scratch right before its cuBLAS GEMM;
     "overlap": the next group decodes on a side stream into a second buffer while the current
     GEMM (and whatever runs between GEMMs) proceeds - same values, the dequant mostly hidden;
-    "fused": kernels.runs_gemm straight from the codes (groups it cannot run fall back to dequant)."""
+    "fused": kernels.runs_gemm straight from the codes (groups it cannot run fall back to dequant);
+    "fp8": EXPERIMENTAL, sm_89+ only, changes numerics - kernels.fp8_gemm (e4m3 weights decoded per
+    group, per-tensor e4m3 activations, torch._scaled_mm); "fp8_emulated": the same rounding with
+    an fp32 matmul (any GPU, for tests)."""
 
     def __init__(self, eng, groups, seq: list, gemm: str = "dequant"):
         self.seq, self.gemm, self.i = seq, gemm, 0
@@ -258,6 +261,10 @@ class Gemms:
         if self.gemm == "fused" and g.fused_ok():
             from .kernels import runs_gemm
             return runs_gemm.gemm(x, g.runs)
+        if self.gemm in ("fp8", "fp8_emulated") and g.fused_ok():
+            from .kernels import fp8_gemm        # EXPERIMENTAL: e4m3 weights and activations (numerics change)
+            f = fp8_gemm.gemm if self.gemm == "fp8" else fp8_gemm.gemm_emulated
+            return f(x, g.runs, self.bufs[0])
         if not self.overlap:
             return F.linear(x, g.dense(self.bufs[0]))
         if j == 0:
