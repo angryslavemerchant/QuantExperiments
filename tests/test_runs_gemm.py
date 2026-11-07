@@ -59,12 +59,39 @@ def test_variants_and_groups(table):
     _check(out, _ref(xw[:, :1024].contiguous(), [a, b]))
 
 
-def test_big_codebook_global_table():
-    """K = 4096 x 4 books (128 KB) is read through L1 instead of shared memory."""
-    rl = _rl(130, 512, 12, 4, 5)
-    assert runs_gemm.plan(rl)[0] is False or runs_gemm._smem_optin() >= 128 * 1024
-    x = torch.randn(70, 2048, device="cuda").half()
-    _check(runs_gemm.gemm(x, [rl]), _ref(x, [rl]))
+@pytest.mark.parametrize("table", ["auto", "global", "grouped"])
+def test_big_codebook(table):
+    """K = 4096 x 4 books (128 KB): "auto" groups rows by book (one 32 KB book per block, in shared
+    memory) unless the whole table fits; "global" reads it through L1."""
+    rl = _rl(530, 512, 12, 4, 5)
+    tsmem, _, grouped = runs_gemm.plan(rl, table)
+    if table == "global":
+        assert not tsmem and not grouped
+    if table == "grouped":
+        assert grouped
+    for T in (1, 33, 70):
+        for split in (1, 3):
+            x = torch.randn(T, 2048, device="cuda").half()
+            _check(runs_gemm.gemm(x, [rl], table=table, split=split), _ref(x, [rl]))
+    # stacked with a small-codebook matrix (output offsets), into a strided buffer
+    b2 = _rl(70, 512, 8, 2, 6)
+    x = torch.randn(20, 2048, device="cuda").half()
+    out = torch.full((20, 600 + 8), float("nan"), dtype=torch.float16, device="cuda")
+    runs_gemm.gemm(x, [rl, b2], out=out, table=table)
+    _check(out[:, :600], _ref(x, [rl, b2]))
+
+
+def test_row_map():
+    rl = _rl(300, 128, 12, 4, 7)
+    rmap, nt = runs_gemm.row_map(rl)
+    assert rmap.numel() == nt * 128
+    real = rmap[rmap >= 0].cpu()
+    assert sorted(real.tolist()) == list(range(300))
+    book = (rl.book_off.view(-1).long() // 4096).cpu()
+    for t in range(nt):
+        rows = rmap[t * 128:(t + 1) * 128].cpu()
+        rows = rows[rows >= 0]
+        assert rows.numel() > 0 and book[rows].unique().numel() == 1
 
 
 @pytest.mark.parametrize("split", [1, 2, 3, 7, 40])
