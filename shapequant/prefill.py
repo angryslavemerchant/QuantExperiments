@@ -16,6 +16,14 @@ The lm_head: an 8-bit head is dequantized in row chunks at the end (no dense cop
 
 Prefill appends at the engine's current position: from a reset engine (pos 0) it is a fresh
 prompt; otherwise the tokens extend the cached context (multi-turn, or eval continuations).
+
+Two implementations (prefill(impl=...), default IMPL = "fast"): "ref" is the torch path described
+above; "fast" (_prefill_fast, qwen35_prefill for Qwen3.5) has the same math with fused kernels
+(kernels.prefill_kernels: residual add + RMSNorm, rope + cache write, SiLU * up, ...), one GEMM
+per group of matrices sharing an input (Group: q|k|v, gate|up decoded into adjacent scratch rows)
+and the last-row logits through the decode head GEMV. Its GEMMs (Gemms, prefill(gemm=...)):
+"dequant" (default, decode + cuBLAS), "overlap" (next group's decode on a side stream), "fused"
+(kernels.runs_gemm, no fp16 copy), "fp8" (EXPERIMENTAL, sm_89+, e4m3 numerics).
 """
 
 from __future__ import annotations
@@ -124,8 +132,11 @@ def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all", impl: st
     group of matrices sharing an input (q|k|v, gate|up); "ref" = the original torch path.
     gemm (fast path): "dequant" (default, GEMM) | "fused" (kernels.runs_gemm, no fp16 scratch).
     Leaves eng.pos += T, eng.tok = argmax of the last row, eng.logits = last row (fp16)."""
-    if (impl or IMPL) == "fast":
+    impl = impl or IMPL
+    if impl == "fast":
         return _prefill_fast(eng, tokens, logits, gemm or GEMM)
+    if impl != "ref":
+        raise ValueError(f"impl {impl!r}: 'fast' | 'ref'")
     return _prefill_ref(eng, tokens, logits)
 
 
@@ -231,7 +242,11 @@ class Gemms:
     group, per-tensor e4m3 activations, torch._scaled_mm); "fp8_emulated": the same rounding with
     an fp32 matmul (any GPU, for tests)."""
 
+    MODES = ("dequant", "overlap", "fused", "fp8", "fp8_emulated")
+
     def __init__(self, eng, groups, seq: list, gemm: str = "dequant"):
+        if gemm not in self.MODES:
+            raise ValueError(f"gemm {gemm!r}: one of {self.MODES}")
         self.seq, self.gemm, self.i = seq, gemm, 0
         self.overlap = gemm == "overlap"
         self.bufs = (group_scratch(eng, groups, 2 if self.overlap else 1) if needs_scratch(groups, gemm) else None)

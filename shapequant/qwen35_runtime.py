@@ -383,9 +383,12 @@ def prefill(eng: Qwen35Engine, tokens, logits: str = "last", impl: str | None = 
     chunked DeltaNet scan kernel; gemm "dequant" | "fused" as in prefill.prefill); "ref" = the
     torch path below: HF's chunked gated delta rule (torch_chunk_gated_delta_rule), fp32 SDPA."""
     from . import prefill as pre
-    if (impl or pre.IMPL) == "fast":
+    impl = impl or pre.IMPL
+    if impl == "fast":
         from . import qwen35_prefill
         return qwen35_prefill.prefill(eng, tokens, logits, gemm or pre.GEMM)
+    if impl != "ref":
+        raise ValueError(f"impl {impl!r}: 'fast' | 'ref'")
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
     from .prefill import _head
     c = eng.cfg
