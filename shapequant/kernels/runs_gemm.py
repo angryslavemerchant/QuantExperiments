@@ -60,6 +60,11 @@ __device__ __forceinline__ KT kt_info(const Ctx& c, int kt) {
     return k;
 }
 
+// first k-tile of super-tile s (s = nsup: nk)
+__device__ __forceinline__ int st_start(const Ctx& c, int s) {
+    return s < c.nfull * 8 ? 8 * s : c.nfull * 64 + (s - c.nfull * 8) * c.jt;
+}
+
 // super-tile s: staged words are row words [w0, w0 + nw); tag (q, j, e) of lane 4g+q sits at
 // staged bit off + (q * qs + 2j + e) * BITS
 struct ST { int w0, nw, off, qs, vec; };
@@ -184,7 +189,7 @@ __device__ __forceinline__ void mma16816(float* d, const u32* a, const u32* b) {
 extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
         const u32* __restrict__ words, const uint2* __restrict__ table, const __half* __restrict__ row_scale,
         const int* __restrict__ book_off, const __half* __restrict__ x, __half* __restrict__ y,
-        int T, int R, int W, int nfull, int jt, int ldx, int ldy, int table_n) {
+        int T, int R, int W, int nfull, int jt, int ldx, int ldy, int table_n, int S, float* __restrict__ part) {
     extern __shared__ __align__(16) unsigned char smem[];
     __half* st = (__half*)smem;                       // 2 tile stages
     u32* ws = (u32*)(st + 2 * STAGE);                 // staged words [BN][WS]
@@ -198,7 +203,10 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
     const uint2* tab = table;
 #endif
     const uint2* tb = tab + book_off[min(n0 + (int)threadIdx.x % BN, R - 1)];
-    const int nk = nfull * 64 + 8 * jt;
+    // split-K over super-tiles: slice blockIdx.z of S covers super-tiles [s_lo, s_hi)
+    const int nsup = nfull * 8 + (jt > 0 ? 8 : 0);
+    const int s_lo = (int)(((long long)nsup * blockIdx.z) / S), s_hi = (int)(((long long)nsup * (blockIdx.z + 1)) / S);
+    const int k_lo = st_start(c, s_lo), nk = st_start(c, s_hi);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wm = warp >> 2, wn = warp & 3;
     float acc[4][4][4];
     #pragma unroll
@@ -210,18 +218,18 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
     uint4 xa[2];
     u32 wr[NWR];
     // prologue: words of super-tile 0, tile 0, then the prefetch of super-tile 1's words
-    load_words(c, 0, n0, wr);
-    load_x(c, 0, m0, xa);
-    store_words(c, 0, wr, ws);
-    __syncthreads();
-    store_tile(c, 0, xa, ws, tb, st);
-    int s_next = 1;                                   // super-tile whose words are in wr (if any)
-    const int nsup = nfull * 8 + (jt > 0 ? 8 : 0);
-    if (s_next < nsup) load_words(c, s_next, n0, wr);
+    if (s_lo < s_hi) {
+        load_words(c, s_lo, n0, wr);
+        load_x(c, k_lo, m0, xa);
+        store_words(c, s_lo, wr, ws);
+        __syncthreads();
+        store_tile(c, k_lo, xa, ws, tb, st + (k_lo & 1) * STAGE);
+        if (s_lo + 1 < s_hi) load_words(c, s_lo + 1, n0, wr);
+    }
     __syncthreads();
     const int a_off = (wm * 64 + (lane & 15)) * LDS + 8 * (lane >> 4);
     const int b_off = BM * LDS + (wn * 32 + (lane & 7) + 8 * (lane >> 4)) * LDS + 8 * ((lane >> 3) & 1);
-    for (int kt = 0; kt < nk; ++kt) {
+    for (int kt = k_lo; kt < nk; ++kt) {
         const __half* cur = st + (kt & 1) * STAGE;
         const bool more = kt + 1 < nk;
         if (more) load_x(c, kt + 1, m0, xa);
@@ -247,7 +255,7 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
                 __syncthreads();                      // everyone done decoding from the old words
                 store_words(c, sn, wr, ws);
                 __syncthreads();
-                if (sn + 1 < nsup) load_words(c, sn + 1, n0, wr);
+                if (sn + 1 < s_hi) load_words(c, sn + 1, n0, wr);
             }
             store_tile(c, kt + 1, xa, ws, tb, st + ((kt + 1) & 1) * STAGE);
         }
@@ -266,6 +274,12 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
             for (int hh = 0; hh < 2; ++hh) {
                 const int t = m0 + wm * 64 + i * 16 + gq + 8 * hh;
                 if (t >= T) continue;
+                if (S > 1) {                          // fp32 partial of this slice; split_reduce sums them
+                    float* pp = part + ((size_t)blockIdx.z * T + t) * R + n;
+                    pp[0] = acc[i][j][2 * hh] * s0;
+                    if (n + 1 < R) pp[1] = acc[i][j][2 * hh + 1] * s1;
+                    continue;
+                }
                 __half* yp = y + (size_t)t * ldy + n;
                 if (n + 1 < R && ((size_t)yp & 3) == 0) {
                     *(__half2*)yp = __floats2half2_rn(acc[i][j][2 * hh] * s0, acc[i][j][2 * hh + 1] * s1);
@@ -276,6 +290,16 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
             }
         }
     }
+}
+
+// y[t, n] (fp16, row stride ldy) = sum over the S slices of part[z, t, n], in slice order
+extern "C" __global__ void split_reduce(const float* __restrict__ part, __half* __restrict__ y, int T, int R, int S, int ldy) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x, n = (size_t)T * R;
+    if (i >= n) return;
+    float a = 0.f;
+    for (int z = 0; z < S; ++z) a += part[z * n + i];
+    const size_t t = i / R, r = i - t * R;
+    y[t * ldy + r] = __float2half(a);
 }
 """
 
@@ -293,13 +317,39 @@ def _smem_optin() -> int:
     return int(cp.cuda.runtime.deviceGetAttribute(cp.cuda.runtime.cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))
 
 
-def _fn(bits: int, tsmem: bool):
+def _mod(bits: int, tsmem: bool):
     import cupy as cp
     key = (bits, tsmem)
     if key not in _fns:
         src = f"#define BITS {bits}\n#define TSMEM {int(tsmem)}\n" + _SRC
-        _fns[key] = cp.RawModule(code=src, options=("-std=c++17",)).get_function("runs_gemm")
+        _fns[key] = cp.RawModule(code=src, options=("-std=c++17",))
     return _fns[key]
+
+
+def _fn(bits: int, tsmem: bool):
+    return _mod(bits, tsmem).get_function("runs_gemm")
+
+
+_parts: dict = {}
+
+
+def _part(n: int, dev) -> torch.Tensor:
+    """fp32 split-K partials, one buffer per device (grown as needed; one stream)."""
+    b = _parts.get(str(dev))
+    if b is None or b.numel() < n:
+        b = _parts[str(dev)] = torch.empty(n, dtype=torch.float32, device=dev)
+    return b
+
+
+def auto_split(rl, T: int, sms: int | None = None, max_split: int = 16) -> int:
+    """Split-K slices so the grid covers about two waves of the SMs (small T, few row tiles)."""
+    from .proto_runs import geometry
+    if sms is None:
+        sms = torch.cuda.get_device_properties(rl.words.device).multi_processor_count
+    nfull, jt = geometry(rl.nch)
+    nsup = nfull * 8 + (8 if jt else 0)
+    blocks = ((rl.R + 127) // 128) * ((T + 127) // 128)
+    return max(1, min(max_split, nsup // 2, -(-2 * sms // blocks)))
 
 
 def supported(rl) -> bool:
@@ -319,9 +369,11 @@ def plan(rl, table: str = "auto"):
     return False, base
 
 
-def gemm(x: torch.Tensor, rls: list, out: torch.Tensor | None = None, table: str = "auto") -> torch.Tensor:
+def gemm(x: torch.Tensor, rls: list, out: torch.Tensor | None = None, table: str = "auto",
+         split: int | str = "auto") -> torch.Tensor:
     """x fp16 [T, C] (row stride a multiple of 8) -> fp16 [T, sum R] = x @ [W_1; W_2; ...]^T for
-    RunsLinears without column orders; out: optional [T, >= sum R] buffer."""
+    RunsLinears without column orders; out: optional [T, >= sum R] buffer. split: split-K slices
+    per matrix ("auto": auto_split), summed in slice order by split_reduce (fp32 partials)."""
     import cupy as cp
     from .prefill_kernels import stream
     from .proto_runs import geometry
@@ -336,15 +388,24 @@ def gemm(x: torch.Tensor, rls: list, out: torch.Tensor | None = None, table: str
         assert rl.words.data_ptr() % 16 == 0 and rl.words.shape[1] % 4 == 0
         nfull, jt = geometry(rl.nch)
         tsmem, shm = plan(rl, table)
-        fn = _fn(rl.bits, tsmem)
+        mod = _mod(rl.bits, tsmem)
+        fn = mod.get_function("runs_gemm")
         if shm > 48 * 1024:
             fn.max_dynamic_shared_size_bytes = shm
-        grid = ((rl.R + 127) // 128, (T + 127) // 128)
+        S = auto_split(rl, T) if split == "auto" else int(split)
+        part = _part(S * T * rl.R, x.device) if S > 1 else y
+        grid = ((rl.R + 127) // 128, (T + 127) // 128, S)
         fn(grid, (256,),
            (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table_raw.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),
             cp.uint64(rl.book_off.data_ptr()), cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr() + off * 2),
             cp.int32(T), cp.int32(rl.R), cp.int32(rl.words.shape[1]), cp.int32(nfull), cp.int32(jt),
-            cp.int32(x.stride(0)), cp.int32(y.stride(0)), cp.int32(rl.table_raw.shape[0])),
+            cp.int32(x.stride(0)), cp.int32(y.stride(0)), cp.int32(rl.table_raw.shape[0]),
+            cp.int32(S), cp.uint64(part.data_ptr())),
            shared_mem=shm, stream=stream())
+        if S > 1:
+            n = T * rl.R
+            mod.get_function("split_reduce")(((n + 255) // 256,), (256,),
+                (cp.uint64(part.data_ptr()), cp.uint64(y.data_ptr() + off * 2), cp.int32(T), cp.int32(rl.R),
+                 cp.int32(S), cp.int32(y.stride(0))), stream=stream())
         off += rl.R
     return y

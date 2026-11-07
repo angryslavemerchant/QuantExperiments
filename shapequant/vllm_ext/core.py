@@ -68,7 +68,11 @@ class _Scratch:
 
 class PackedShards:
     def __init__(self, rls: list, *, bmax: int = BMAX, layout: str = "tile", warps: int = 8, bps: int = 2,
-                 max_split: int = 8):
+                 max_split: int = 8, large: str = "dequant", chunk_bytes: int = 24 << 20):
+        # large-M path: "dequant" (whole matrix to scratch + GEMM), "chunked" (L2-sized row chunks,
+        # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
+        assert large in ("dequant", "chunked", "fused"), large
+        self.large, self.chunk_bytes = large, chunk_bytes
         from ..kernels import batched_runs as br
         from ..kernels import cuda_dequant
         self.rls = rls
@@ -137,6 +141,11 @@ class PackedShards:
         return torch.cat(parts, 1)
 
     def _large(self, x16: torch.Tensor) -> torch.Tensor:
+        if self.large == "chunked":
+            return self._large_chunked(x16)
+        if self.large == "fused":
+            from ..kernels import runs_gemm
+            return runs_gemm.gemm(x16, self.rls)
         from ..kernels import cuda_dequant
         scratch = _Scratch.get(max(self.Rs) * self.C, x16.device)
         if len(self.rls) == 1:
@@ -146,6 +155,23 @@ class PackedShards:
             w = cuda_dequant.dequant(rl, scratch).view(R, self.C)
             y[:, off:off + R] = x16 @ w.t()       # the GEMM finishes before the scratch is reused (one stream)
         return y
+
+    def _large_chunked(self, x16: torch.Tensor) -> torch.Tensor:
+        """Row chunks of ~chunk_bytes fp16 decoded and multiplied in turn: a chunk small enough to
+        stay in L2 is read back by the GEMM from cache, so DRAM traffic is ~the packed codes plus
+        activations. Computes Y^T (row chunks of Y^T are contiguous) and transposes at the end."""
+        from ..kernels import cuda_dequant
+        M = x16.shape[0]
+        rc = max(64, (self.chunk_bytes // (2 * self.C)) // 64 * 64)
+        scratch = _Scratch.get(min(rc, max(self.Rs)) * self.C, x16.device)
+        yt = torch.empty(self.R, M, dtype=torch.float16, device=x16.device)
+        xt = x16.t()
+        for rl, off, R in zip(self.rls, self.offs, self.Rs):
+            for r0 in range(0, R, rc):
+                r1 = min(R, r0 + rc)
+                w = cuda_dequant.dequant(rl, scratch, rows=(r0, r1))
+                torch.mm(w, xt, out=yt[off + r0:off + r1])
+        return yt.t().contiguous()
 
 
 # ------------------------------------------------------------------ torch custom op

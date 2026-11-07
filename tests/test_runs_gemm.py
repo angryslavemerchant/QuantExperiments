@@ -65,3 +65,19 @@ def test_big_codebook_global_table():
     assert runs_gemm.plan(rl)[0] is False or runs_gemm._smem_optin() >= 128 * 1024
     x = torch.randn(70, 2048, device="cuda").half()
     _check(runs_gemm.gemm(x, [rl]), _ref(x, [rl]))
+
+
+@pytest.mark.parametrize("split", [1, 2, 3, 7, 40])
+@pytest.mark.parametrize("nch", [128, 1280])
+def test_split_k(split, nch):
+    """Split-K slices (including more slices than super-tiles: empty slices) sum to the same result."""
+    a, b = _rl(150, nch, 10, 4, 11), _rl(70, nch, 10, 1, 12)
+    for T in (1, 64, 200):
+        x = torch.randn(T, nch * 4, device="cuda").half()
+        _check(runs_gemm.gemm(x, [a, b], split=split), _ref(x, [a, b]))
+
+
+def test_auto_split_fills_gpu():
+    rl = _rl(200, 1280, 10, 1, 3)
+    assert runs_gemm.auto_split(rl, 64, sms=188) > 1
+    assert runs_gemm.auto_split(rl, 64, sms=188) <= 16

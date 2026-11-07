@@ -34,11 +34,13 @@ needs_gpu = pytest.mark.skipif(not torch.cuda.is_available() or not PACKED.exist
 @pytest.mark.parametrize("pieces", [("mlp.down_proj",), ("mlp.gate_proj", "mlp.up_proj"),
                                     ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z")])
 @pytest.mark.parametrize("M", [1, 3, 32, 33, 100])
-def test_forward_matches_dense(pieces, M):
+@pytest.mark.parametrize("large", ["dequant", "chunked", "fused"])
+def test_forward_matches_dense(pieces, M, large):
     pytest.importorskip("cupy")
     from shapequant.packed import PackedFile
     pf = PackedFile(PACKED)
-    ps = core.PackedShards.from_packed(pf, [f"model.layers.0.{p}" for p in pieces])
+    ps = core.PackedShards.from_packed(pf, [f"model.layers.0.{p}" for p in pieces], large=large,
+                                       chunk_bytes=1 << 20)     # several chunks per matrix
     W = ps.dense().float()
     assert W.shape == (ps.R, ps.C)
     torch.manual_seed(M)

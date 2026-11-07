@@ -19,17 +19,28 @@ sys.path.insert(0, str(ROOT))
 
 
 def timeit(fn, n=20, reps=3) -> float:
-    fn()
+    """GPU time per call (us), CUDA-graph replay of n calls (as vLLM's captured decode steps; no
+    host launch overhead), min of reps."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        fn()
+        fn()
+    torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(n):
+            fn()
     ts = []
     for _ in range(reps):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
-        for _ in range(n):
-            fn()
+        g.replay()
         b.record()
         torch.cuda.synchronize()
         ts.append(a.elapsed_time(b) / n)
+    del g
     return min(ts) * 1e3          # us
 
 
@@ -38,6 +49,7 @@ def main() -> int:
     ap.add_argument("--packed", required=True)
     ap.add_argument("--names", required=True)
     ap.add_argument("--Ms", default="1,8,32,48,64,96,128,192,256,512,1024")
+    ap.add_argument("--chunks-mb", default="2,8,16,32,64", help="L2-chunked dequant chunk sizes")
     ap.add_argument("--out")
     a = ap.parse_args()
     from shapequant.kernels import batched_runs as br, cuda_dequant, runs_gemm
@@ -69,15 +81,27 @@ def main() -> int:
             def fused():
                 runs_gemm.gemm(x, [rl], out=y)
 
+            def fused1():
+                runs_gemm.gemm(x, [rl], out=y, split=1)
+
+            from shapequant.vllm_ext.core import PackedShards
+            chunked_l2 = {}
+            for mb in map(int, a.chunks_mb.split(",")):
+                ps = PackedShards([rl], large="chunked", chunk_bytes=mb << 20)
+                chunked_l2[mb] = timeit(lambda: ps._large_chunked(x))
+
             def bf16():
                 torch.matmul(xb, Wd.t())
 
             r = {"name": name, "R": R, "C": C, "bits": rl.bits, "M": M,
                  "chunked_us": timeit(chunked), "dequant_gemm_us": timeit(deq),
-                 "fused_us": timeit(fused) if runs_gemm.supported(rl) else None, "bf16_us": timeit(bf16)}
+                 "fused_us": timeit(fused) if runs_gemm.supported(rl) else None,
+                 "fused_nosplit_us": timeit(fused1) if runs_gemm.supported(rl) else None,
+                 "chunked_l2_us": chunked_l2, "bf16_us": timeit(bf16)}
             rows.append(r)
             print(f"{name.split('layers.')[-1]:28s} R={R:6d} C={C:6d} b={rl.bits:2d} M={M:5d}  chunked {r['chunked_us']:8.1f}  "
-                  f"deq+gemm {r['dequant_gemm_us']:8.1f}  fused {r['fused_us'] or float('nan'):8.1f}  bf16 {r['bf16_us']:8.1f} us",
+                  f"deq+gemm {r['dequant_gemm_us']:8.1f}  fused {r['fused_us'] or float('nan'):8.1f}  "
+                  f"l2chunk {' '.join(f'{k}MB:{v:.1f}' for k, v in chunked_l2.items())}  bf16 {r['bf16_us']:8.1f} us",
                   flush=True)
     if a.out:
         Path(a.out).write_text(json.dumps({"gpu": torch.cuda.get_device_name(0), "rows": rows}, indent=1))

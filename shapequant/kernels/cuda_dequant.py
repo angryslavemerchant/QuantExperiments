@@ -76,14 +76,16 @@ def supported(rl) -> bool:
     return not rl.has_mask and rl.nch % 64 == 0 and rl.bits % 2 == 0 and getattr(rl, "table_raw", None) is not None
 
 
-def dequant(rl, out: torch.Tensor | None = None) -> torch.Tensor:
+def dequant(rl, out: torch.Tensor | None = None, rows: tuple[int, int] | None = None) -> torch.Tensor:
     """fp16 [R, nch*4] weight of a RunsLinear without column orders. out: optional buffer with at
-    least R*nch*4 elements (a view of its front is returned)."""
+    least R*nch*4 elements (a view of its front is returned). rows: (r0, r1) decodes only those
+    rows ([r1 - r0, nch*4])."""
     import cupy as cp
     from .proto_runs import geometry
     if not supported(rl):
         raise ValueError("dequant: needs M = 1, nch % 64 == 0, even bits and rl.table_raw")
-    R, nch = rl.R, rl.nch
+    r0, r1 = rows if rows is not None else (0, rl.R)
+    R, nch = r1 - r0, rl.nch
     n = R * nch * 4
     if out is None:
         out = torch.empty(n, dtype=torch.float16, device=rl.words.device)
@@ -94,8 +96,8 @@ def dequant(rl, out: torch.Tensor | None = None) -> torch.Tensor:
     grid = (R * nch // 2 + threads - 1) // threads
     from .prefill_kernels import stream
     _fn(rl.bits)((grid,), (threads,),
-                 (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table_raw.data_ptr()),
-                  cp.uint64(rl.row_scale.data_ptr()), cp.uint64(rl.book_off.data_ptr()),
+                 (cp.uint64(rl.words[r0:r1].data_ptr()), cp.uint64(rl.table_raw.data_ptr()),
+                  cp.uint64(rl.row_scale[r0:r1].data_ptr()), cp.uint64(rl.book_off[r0:r1].data_ptr()),
                   cp.uint64(w.data_ptr()), cp.int32(R), cp.int32(nch), cp.int32(rl.words.shape[1]),
                   cp.int32(nfull), cp.int32(jt)), stream=stream())
     return w

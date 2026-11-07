@@ -45,13 +45,18 @@ def _resolve(file: str) -> str:
 
 @register_quantization_config("shapequant")
 class ShapeQuantConfig(QuantizationConfig):
-    def __init__(self, packed_file: str, bmax: int = core.BMAX, layout: str = "tile"):
+    def __init__(self, packed_file: str, bmax: int = core.BMAX, layout: str = "tile", large: str = "dequant",
+                 chunk_mb: int = 24):
         super().__init__()
         self.packed_file, self.bmax, self.layout = packed_file, bmax, layout
+        # SHAPEQUANT_LARGE / SHAPEQUANT_CHUNK_MB override the checkpoint's choice (benchmarking)
+        self.large = os.environ.get("SHAPEQUANT_LARGE", large)
+        self.chunk_mb = int(os.environ.get("SHAPEQUANT_CHUNK_MB", chunk_mb))
         self._pf = None
 
     def __repr__(self) -> str:
-        return f"ShapeQuantConfig(packed_file={self.packed_file!r}, bmax={self.bmax})"
+        return (f"ShapeQuantConfig(packed_file={self.packed_file!r}, bmax={self.bmax}, large={self.large!r}, "
+                f"chunk_mb={self.chunk_mb})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -72,7 +77,8 @@ class ShapeQuantConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ShapeQuantConfig":
         return cls(packed_file=config["packed_file"], bmax=int(config.get("bmax", core.BMAX)),
-                   layout=config.get("layout", "tile"))
+                   layout=config.get("layout", "tile"), large=config.get("large", "dequant"),
+                   chunk_mb=int(config.get("chunk_mb", 24)))
 
     @property
     def pf(self):
@@ -101,7 +107,8 @@ class ShapeQuantLinearMethod(LinearMethodBase):
             raise NotImplementedError("shapequant: tensor parallelism is not supported (use TP = 1)")
         dev = torch.device("cuda", torch.cuda.current_device())
         ps = core.PackedShards.from_packed(self.cfg.pf, self.pieces, dev=dev, bmax=self.cfg.bmax,
-                                           layout=self.cfg.layout)
+                                           layout=self.cfg.layout, large=self.cfg.large,
+                                           chunk_bytes=self.cfg.chunk_mb << 20)
         if ps.C != input_size or ps.R != output_size:
             raise ValueError(f"{self.prefix}: packed pieces are [{ps.R}, {ps.C}], vLLM layer is "
                              f"[{output_size}, {input_size}] (partitions {output_partition_sizes})")
