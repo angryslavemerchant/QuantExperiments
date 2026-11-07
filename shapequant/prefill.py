@@ -109,13 +109,28 @@ def _rope(x: torch.Tensor, bias, pos: torch.Tensor, theta: float, hd: int) -> to
     return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], -1).half()
 
 
+IMPL = "fast"          # default prefill implementation: "fast" (fused kernels, grouped GEMMs) | "ref"
+GEMM = "dequant"       # default fast-path GEMM: "dequant" (decode to fp16 scratch + cuBLAS) | "fused"
+
+
 @torch.no_grad()
-def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all") -> torch.Tensor:
+def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all", impl: str | None = None,
+            gemm: str | None = None) -> torch.Tensor:
     """Run `tokens` through the engine at its current position in one pass. Needs
     eng.prefill_lins (runtime.engine_from_packed(..., prefill=True)); the head is eng.dense_head when
     kept (fp16 / q4 heads), else the engine's 8-bit head dequantized in chunks.
     logits: "all" -> fp32 [T, vocab] (row i predicts token i+1), "last" -> fp32 [vocab].
+    impl: "fast" (default, IMPL) = fused prefill kernels (kernels.prefill_kernels) and one GEMM per
+    group of matrices sharing an input (q|k|v, gate|up); "ref" = the original torch path.
+    gemm (fast path): "dequant" (default, GEMM) | "fused" (kernels.runs_gemm, no fp16 scratch).
     Leaves eng.pos += T, eng.tok = argmax of the last row, eng.logits = last row (fp16)."""
+    if (impl or IMPL) == "fast":
+        return _prefill_fast(eng, tokens, logits, gemm or GEMM)
+    return _prefill_ref(eng, tokens, logits)
+
+
+@torch.no_grad()
+def _prefill_ref(eng, tokens, logits: str = "all") -> torch.Tensor:
     cfg = eng.cfg
     dev = eng.kc.device
     ids = torch.as_tensor(tokens, dtype=torch.int64, device=dev).view(-1)
@@ -159,6 +174,142 @@ def prefill(eng, tokens: list[int] | torch.Tensor, logits: str = "all") -> torch
     eng.tok.copy_(lg[-1].half().float().argmax().view(1))
     eng.pos.fill_(p0 + T)
     return lg if logits == "all" else lg[-1]
+
+
+class Group:
+    """Prefill matrices sharing one input (q|k|v, gate|up, ...): their weights decode into adjacent
+    rows of one fp16 scratch, so one GEMM computes all outputs ([T, sum R], members in order)."""
+
+    def __init__(self, members: list):
+        self.members = members
+        self.C = members[0].C
+        assert all(m.C == self.C for m in members)
+        self.R = sum(m.R for m in members)
+        self.n = self.R * self.C
+        self.runs = [getattr(m, "rl", None) for m in members]
+
+    def fused_ok(self) -> bool:
+        from .kernels import runs_gemm
+        return all(rl is not None and runs_gemm.supported(rl) for rl in self.runs)
+
+    def dense(self, scratch: torch.Tensor) -> torch.Tensor:
+        from .kernels import cuda_dequant
+        off = 0
+        for m in self.members:
+            n = m.R * m.C
+            if isinstance(m, RunsPrefill):
+                cuda_dequant.dequant(m.rl, scratch[off:off + n])
+            else:
+                scratch[off:off + n].view(m.R, m.C).copy_(m.dense())
+            off += n
+        return scratch[:self.n].view(self.R, self.C)
+
+    def matmul(self, x: torch.Tensor, scratch: torch.Tensor | None, gemm: str = "dequant") -> torch.Tensor:
+        """x fp16 [T, C] -> fp16 [T, R]."""
+        if gemm == "fused" and self.fused_ok():
+            from .kernels import runs_gemm
+            return runs_gemm.gemm(x, self.runs)
+        return F.linear(x, self.dense(scratch))
+
+
+def group_scratch(eng, groups) -> torch.Tensor:
+    """The engine's fp16 scratch for grouped dequant, sized for its largest group (allocated once)."""
+    n = max(g.n for L in groups for g in L.values() if isinstance(g, Group))
+    s = getattr(eng, "prefill_group_scratch", None)
+    if s is None or s.numel() < n:
+        eng.prefill_group_scratch = None
+        s = eng.prefill_group_scratch = torch.empty(n, dtype=torch.float16, device=eng.logits.device)
+    return s
+
+
+def needs_scratch(groups, gemm: str) -> bool:
+    return gemm != "fused" or not all(g.fused_ok() for L in groups for g in L.values() if isinstance(g, Group))
+
+
+def _groups(eng):
+    """Per layer {qkv, o, gu, down: Group} from eng.prefill_lins (cached on the engine)."""
+    gs = getattr(eng, "_prefill_groups", None)
+    if gs is None or gs[0] is not eng.prefill_lins:
+        G = [{"qkv": Group([P["q"], P["k"], P["v"]]), "o": Group([P["o"]]),
+              "gu": Group([P["gate"], P["up"]]), "down": Group([P["down"]])} for P in eng.prefill_lins]
+        gs = eng._prefill_groups = (eng.prefill_lins, G)
+    return gs[1]
+
+
+def _rope_tables(pos: torch.Tensor, theta: float, hd: int):
+    """fp16 cos / sin [T, hd/2] exactly as _rope computes them."""
+    half = hd // 2
+    inv = 1.0 / torch.pow(torch.tensor(theta, dtype=torch.float32, device=pos.device),
+                          torch.arange(half, device=pos.device, dtype=torch.float32) * 2.0 / hd)
+    ang = pos.float()[:, None] * inv[None, :]
+    return torch.cos(ang).half().contiguous(), torch.sin(ang).half().contiguous()
+
+
+@torch.no_grad()
+def _prefill_fast(eng, tokens, logits: str = "all", gemm: str = "dequant") -> torch.Tensor:
+    """prefill() with the fused kernels: same math as _prefill_ref (fp32 residual, fp16 GEMM
+    inputs / outputs, rope with fp16-rounded tables, fp16 SiLU * up), fewer and larger launches."""
+    from .kernels import prefill_kernels as pk
+    cfg = eng.cfg
+    dev = eng.kc.device
+    ids = torch.as_tensor(tokens, dtype=torch.int64, device=dev).view(-1)
+    T = ids.numel()
+    p0 = int(eng.pos)
+    if p0 + T > cfg.max_len:
+        raise ValueError(f"context {p0 + T} > max_len {cfg.max_len}")
+    NH, NKV, HD = cfg.n_heads, cfg.n_kv, cfg.head_dim
+    groups = _groups(eng)
+    scratch = group_scratch(eng, groups) if needs_scratch(groups, gemm) else None
+    pos = torch.arange(p0, p0 + T, device=dev)
+    cs, sn = _rope_tables(pos, cfg.rope_theta, HD)
+    rid = ids % eng.embed.shape[0]
+    h = (eng.embed.rows(rid) if hasattr(eng.embed, "rows") else eng.embed[rid]).float().contiguous()
+    mask = None
+    if p0 > 0:
+        mask = (torch.arange(p0 + T, device=dev)[None, :] <= pos[:, None])
+    add = None
+    for li, (L, G) in enumerate(zip(eng.layers, groups)):
+        x = pk.addnorm(h, add, L["ln1"], cfg.eps)
+        qkv = G["qkv"].matmul(x, scratch, gemm)
+        q = pk.rope_qkv(qkv, L.get("bq"), L.get("bk"), L.get("bv"), cs, sn, NH, NKV, HD, p0, eng.kc[li], eng.vc[li])
+        kk = eng.kc[li, :, :p0 + T].repeat_interleave(NH // NKV, dim=0)
+        vv = eng.vc[li, :, :p0 + T].repeat_interleave(NH // NKV, dim=0)
+        a = F.scaled_dot_product_attention(q[None], kk[None], vv[None],
+                                           attn_mask=None if mask is None else mask[None, None],
+                                           is_causal=mask is None, scale=HD ** -0.5)
+        a = a[0].transpose(0, 1).reshape(T, NH * HD)
+        add = G["o"].matmul(a, scratch, gemm)
+        x = pk.addnorm(h, add, L["ln2"], cfg.eps)
+        act = pk.silu_mul(G["gu"].matmul(x, scratch, gemm), 0)
+        add = G["down"].matmul(act, scratch, gemm)
+    if logits == "all":
+        x = pk.addnorm(h, add, eng.final_norm, cfg.eps)
+    else:
+        x = pk.addnorm(h[-1:], add[-1:], eng.final_norm, cfg.eps)
+    lg = head_fast(eng, x)
+    eng.logits.copy_(lg[-1].half())
+    eng.tok.copy_(lg[-1].half().float().argmax().view(1))
+    eng.pos.fill_(p0 + T)
+    return lg if logits == "all" else lg[-1]
+
+
+def head_fast(eng, x: torch.Tensor) -> torch.Tensor:
+    """_head for the fast paths: one row through the engine's own head kernel (the decode GEMV),
+    several rows through 8-bit chunks dequantized by one kernel each."""
+    if eng.dense_head is not None:
+        return F.linear(x, eng.dense_head).float()
+    hd = eng.lm_head
+    if x.shape[0] == 1 and hasattr(hd, "run"):
+        y = torch.empty(hd.R, dtype=torch.float16, device=x.device)
+        hd.run(x[0].contiguous(), y)
+        return y.float()[None]
+    from .kernels import prefill_kernels as pk
+    out = torch.empty(x.shape[0], hd.R, dtype=torch.float32, device=x.device)
+    buf = torch.empty(min(HEAD_CHUNK, hd.R) * hd.C, dtype=torch.float16, device=x.device)
+    for s in range(0, hd.R, HEAD_CHUNK):
+        e = min(s + HEAD_CHUNK, hd.R)
+        out[:, s:e] = F.linear(x, pk.q8_rows(hd.q, hd.sc, s, e, buf))
+    return out
 
 
 HEAD_CHUNK = 16384      # rows of the 8-bit head dequantized at a time (no dense head copy)
