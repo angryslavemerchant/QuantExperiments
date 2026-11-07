@@ -12,3 +12,7 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["shapequant*"]
+
+# vLLM loads this in every process: registers the "shapequant" quantization method
+[project.entry-points."vllm.general_plugins"]
+shapequant = "shapequant.vllm_ext.plugin:register"
