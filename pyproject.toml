@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shapequant"
+version = "0.1.0"
+description = "Codebook (stack) weight quantization and runtime experiments"
+requires-python = ">=3.10"
+# Runtime dependencies are managed by the environment (requirements-remote.txt on Vast boxes).
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["shapequant*"]
