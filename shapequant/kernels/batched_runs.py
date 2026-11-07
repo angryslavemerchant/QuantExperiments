@@ -190,6 +190,7 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
     for (; it < nitems; it += istride) {
         const int grp = it / S, sl = it - grp * S;
         const int tile = grp * W + warp;
+        if (tiles[tile * 16] < 0) continue;     // all-padding tile (book padding): no work, no output
         const int r0 = tiles[tile * 16 + g], r1 = tiles[tile * 16 + g + 8];
 #if TILE
         // tiles are single-book: book_off holds each tile's table offset
@@ -623,6 +624,8 @@ class RunsBatch:
             if getattr(rl, "_tile_words", None) is None:
                 rl._tile_words = tile_words(rl, self.tiles.view(-1, 16))
             self.wt, self.tile_off = rl._tile_words
+        # the shared buffer as of now (large enough for this launcher); kept referenced, so a graph
+        # captured with it stays valid when later launchers grow the shared one
         self.ws = _Workspace.get(self.S * bmax * self.R if self.S > 1 else 1, dev)
 
     def run(self, X: torch.Tensor, Y: torch.Tensor, B: int | None = None):
@@ -630,8 +633,6 @@ class RunsBatch:
         rl = self.rl
         B = X.shape[0] if B is None else B
         assert B <= self.bmax and X.is_contiguous() and X.dtype == torch.float16
-        if self.S > 1:      # the workspace may have grown (new launchers) since __init__
-            self.ws = _Workspace.get(self.S * self.bmax * self.R, X.device)
         tile = self.layout == "tile"
         fn = _runs_fn(rl.bits, rl.nch, _nb8(B), self.smem, self.books, self.threads, self.acc16, tile)
         shm = self.table_bytes if self.smem else 0

@@ -16,9 +16,12 @@ batch-1 step with a batch dimension everywhere:
   - greedy argmax per sequence; the whole step CUDA-graph capturable (capture() per engine, i.e.
     per B).
 B = 1 runs the batch-1 kernels throughout (bit-identical to Qwen35Engine; batch1_kernels=False
-uses the batched ones). For B > 1 the
-linears accumulate in fp32 (the batch-1 run kernel partially in fp16), so logits match the
-batch-1 engine to fp16 rounding, not bitwise.
+uses the batched ones). For B > 1 the linears accumulate in fp32 (the batch-1 run kernel
+partially in fp16), so logits match the batch-1 engine to fp16 rounding, not bitwise.
+
+Memory per sequence: the DeltaNet states are fp32 (Qwen3.8-27B: 48 layers x 48 heads x 128 x 128
+x 4 B = 151 MB per sequence, read and written every step: at large B this state traffic rivals
+the weights'), plus the KV cache (fp16, max_len positions).
 
 Prompts are loaded per sequence through the batch-1 engine (its batched prefill if attached,
 else step by step) and its states copied into the batch slots (load_slot), or, for equal-length
