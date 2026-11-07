@@ -77,3 +77,45 @@ def test_shared_teacher_matches_separate_teacher():
     assert a["ft_kl_first"] == b["ft_kl_first"] and a["ft_kl_last"] == b["ft_kl_last"]
     for n in wa:
         assert torch.equal(wa[n], wb[n]), n
+
+
+def test_keep_best_heldout_restores_best_step():
+    """With keep_best, a fine-tune that only gets worse on the held-out set bakes its step-0
+    books + gains: the same weights as a zero-step fine-tune; the held-out log covers every check."""
+    import copy
+    import transformers
+    from shapequant.finetune import finetune
+    from shapequant.pipeline import compressible_linears
+    c = transformers.Qwen2Config(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
+                                 num_key_value_heads=2, vocab_size=128, max_position_embeddings=64)
+    c._attn_implementation = "eager"
+    torch.manual_seed(0)
+    orig = transformers.Qwen2ForCausalLM(c).float().eval()
+    originals = {n: m.weight.detach().clone() for n, m in compressible_linears(orig)}
+    fits = {}
+    for n, m in compressible_linears(orig):
+        w = m.weight.detach()
+        fits[n] = compress_masked(w, torch.ones(w.shape[1]), 4, 8, M=1, init="identity", rounds=1, iters=3,
+                                  seed=1, keep_tags=True)
+    g = torch.Generator().manual_seed(5)
+    seqs = torch.randint(0, 128, (4, 16), generator=g)
+    held = {"a": torch.randint(0, 128, (2, 16), generator=g)}
+
+    def run(steps, cfg_extra):
+        student = copy.deepcopy(orig)
+        with torch.no_grad():
+            for n, m in compressible_linears(student):
+                m.weight.copy_(fits[n].decoded)
+        cfg = {"steps": steps, "seq_len": 16, "log_every": 100, **cfg_extra}
+        st = finetune(student, None, copy.deepcopy(fits), {n: 4 for n in fits}, seqs, cfg, log=lambda *_: None,
+                      originals=originals, heldout=held)
+        return st, {n: m.weight.detach().clone() for n, m in compressible_linears(student)}
+
+    # absurd learning rates: every step makes the held-out KL worse
+    st, w = run(4, {"lr_books": 10.0, "lr_gain": 10.0, "heldout_every": 2, "keep_best": "a"})
+    assert [r["step"] for r in st["ft_heldout"]] == [0, 2, 4]
+    assert st["ft_best_step"] == 0
+    assert st["ft_heldout"][-1]["a"] > st["ft_heldout"][0]["a"]
+    _, w0 = run(0, {})
+    for n in w:
+        assert torch.equal(w[n], w0[n]), n

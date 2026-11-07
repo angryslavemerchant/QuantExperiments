@@ -50,6 +50,40 @@ T0 = time.time()
 LOG_FILE: Path | None = None   # out_dir/run.log once known (recovered with the artifacts)
 
 
+def finetune_data(fcfg: dict, cfg: dict, tok, calib: torch.Tensor, seed: int):
+    """Fine-tune sequences and held-out sets.
+
+    Default: the calibration sequences. With fcfg["sequences"] = N: N fresh sequences (calibration
+    context) from the same stream right after the calibration ones (disjoint from them).
+    fcfg["heldout"] = {"fineweb": n, "wikitext_train": n}: n held-out sequences of fcfg["seq_len"]
+    tokens each: fineweb from the stream after the fine-tune ones, wikitext from its TRAIN split
+    (the test split is the evaluation; never used to choose anything)."""
+    from shapequant.calibrate import load_calibration_sequences
+    ccfg = cfg["calibration"]
+    L = fcfg.get("seq_len", 1024)
+    ctx, n_cal = ccfg["context"], ccfg["num_sequences"]
+    n_ft = fcfg.get("sequences", 0)
+    h = fcfg.get("heldout", {}) or {}
+    n_fw = -(-h.get("fineweb", 0) * L // ctx)          # held-out fineweb, in calibration sequences
+    ft_seqs, heldout = calib, {}
+    if n_ft or n_fw:
+        allseq = load_calibration_sequences(tok, {**ccfg, "num_sequences": n_cal + n_ft + n_fw}, seed)
+        if not torch.equal(allseq[:n_cal], calib):
+            raise RuntimeError("calibration stream changed: fine-tune data would overlap calibration")
+        if n_ft:
+            ft_seqs = allseq[n_cal:n_cal + n_ft]
+        if n_fw:
+            heldout["fineweb"] = allseq[n_cal + n_ft:].reshape(-1, L)[: h["fineweb"]]
+    if h.get("wikitext_train"):
+        w = cfg["eval"]["wikitext"]
+        heldout["wikitext_train"] = load_wikitext_windows(
+            tok, {**w, "split": "train", "context": L, "num_windows": h["wikitext_train"]})
+    log(f"  fine-tune data: {ft_seqs.shape[0]} x {ft_seqs.shape[1]} tokens"
+        + ("" if ft_seqs is calib else " (fresh, after the calibration sequences)")
+        + "".join(f"; held-out {k} {v.shape[0]} x {v.shape[1]}" for k, v in heldout.items()))
+    return ft_seqs, heldout
+
+
 def log(msg: str) -> None:
     mem = ""
     if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -384,8 +418,10 @@ def main() -> int:
             teacher = (_AM.from_pretrained(cfg["model"], dtype=dtype).to(args.device).eval()
                        if run["finetune"].get("teacher") == "separate" else None)
             d_by_name = {n: run["d"] for n in fits}
+            ft_seqs, heldout = finetune_data(run["finetune"], cfg, tok, seqs, seed)
             torch.cuda.reset_peak_memory_stats()
-            ft_stats = finetune(model, teacher, fits, d_by_name, seqs, run["finetune"], log=log, originals=originals)
+            ft_stats = finetune(model, teacher, fits, d_by_name, ft_seqs, run["finetune"], log=log, originals=originals,
+                                heldout=heldout)
             ft_stats["ft_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
             log(f"  fine-tune peak GPU memory {ft_stats['ft_peak_gb']:.1f} GB")
             if run.get("export"):

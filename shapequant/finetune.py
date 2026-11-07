@@ -368,11 +368,42 @@ def kl_loss(teacher_logits: torch.Tensor, student_logits: torch.Tensor) -> torch
     return (tlp.exp() * (tlp - slp)).sum(-1).mean()
 
 
+@torch.no_grad()
+def heldout_kl(model, teacher, seqs: torch.Tensor, dev) -> float:
+    """Mean token KL(teacher || student) over held-out sequences (one at a time)."""
+    tot = 0.0
+    for i in range(seqs.shape[0]):
+        ids = seqs[i][None].to(dev)
+        t = teacher(input_ids=ids, use_cache=False).logits
+        tot += float(kl_loss(t, model(input_ids=ids, use_cache=False).logits))
+        del t
+    return tot / seqs.shape[0]
+
+
+def _snapshot(wrappers: dict) -> dict:
+    """The trainable state (books + row gains) on the CPU, to restore the best one."""
+    return {n: ([b.detach().cpu().clone() for b in w.books], w.log_gain.detach().cpu().clone())
+            for n, (*_, w) in wrappers.items()}
+
+
+@torch.no_grad()
+def _restore(wrappers: dict, snap: dict) -> None:
+    for n, (books, gain) in snap.items():
+        w = wrappers[n][3]
+        for b, v in zip(w.books, books):
+            b.copy_(v.to(b.device))
+        w.log_gain.copy_(gain.to(w.log_gain.device))
+
+
 def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tensor,
-             fcfg: dict, log=print, originals: dict | None = None) -> dict:
+             fcfg: dict, log=print, originals: dict | None = None, heldout: dict | None = None) -> dict:
     """Train codebooks + row gains in place; write baked weights into `model`.
     teacher: the original model, or None with `originals` (the block linears' original
-    weights) for a SharedTeacher (no second model copy)."""
+    weights) for a SharedTeacher (no second model copy).
+    heldout: {name: [n, seq_len] token ids} scored (KL vs the teacher) before training and
+    every fcfg["heldout_every"] steps; with fcfg["keep_best"] (a heldout name) the books and
+    gains with the lowest KL on that set are the ones baked, so training cannot end worse than
+    it started on it."""
     steps = fcfg.get("steps", 256)
     seq_len = fcfg.get("seq_len", 1024)
     seqs = sequences.reshape(-1, seq_len)
@@ -397,8 +428,28 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
     losses = []
     rp = fcfg.get("repick")
     rp_log = []
+    heldout = heldout or {}
+    h_every = fcfg.get("heldout_every", 64)
+    keep = fcfg.get("keep_best")
+    if keep is not None and keep not in heldout:
+        raise ValueError(f"finetune: keep_best {keep!r} is not a held-out set ({sorted(heldout)})")
+    h_log: list[dict] = []
+    best = {"kl": float("inf"), "step": None, "snap": None}
+
+    def score_heldout(step):
+        if not heldout:
+            return
+        rec = {"step": step, **{k: heldout_kl(model, teacher, v, dev) for k, v in heldout.items()}}
+        h_log.append(rec)
+        msg = "  ".join(f"{k} {rec[k]:.4f}" for k in heldout)
+        if keep is not None and rec[keep] < best["kl"]:
+            best.update(kl=rec[keep], step=step, snap=_snapshot(wrappers))
+            msg += "  (best)"
+        log(f"  held-out KL at step {step}: {msg}")
+
     t0 = time.time()
     try:
+        score_heldout(0)
         for step in range(steps):
             # capture over steps [k*every - accum, k*every); re-pick after step k*every, leaving
             # at least `every` steps after the last re-pick for the books to settle
@@ -431,6 +482,11 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
             if step % fcfg.get("log_every", 16) == 0 or step == steps - 1:
                 recent = sum(losses[-16:]) / len(losses[-16:])
                 log(f"  finetune step {step + 1}/{steps}: KL {recent:.4f} ({time.time() - t0:.0f}s)")
+            if heldout and ((step + 1) % h_every == 0 or step == steps - 1):
+                score_heldout(step + 1)
+        if keep is not None and best["snap"] is not None and best["step"] != steps:
+            log(f"  keeping the books + gains of step {best['step']} (best {keep} KL {best['kl']:.4f})")
+            _restore(wrappers, best["snap"])
     finally:
         model.gradient_checkpointing_disable()
         model.eval()
@@ -445,4 +501,6 @@ def finetune(model, teacher, fits: dict, d_by_name: dict, sequences: torch.Tenso
     k = min(16, len(losses))
     return {"ft_kl_first": sum(losses[:k]) / max(1, k), "ft_kl_last": sum(losses[-k:]) / max(1, k),
             "ft_steps": len(losses), "ft_seconds": time.time() - t0,
-            **({"ft_repick": rp_log} if rp else {})}
+            **({"ft_repick": rp_log} if rp else {}),
+            **({"ft_heldout": h_log} if h_log else {}),
+            **({"ft_best_step": best["step"]} if keep is not None else {})}
