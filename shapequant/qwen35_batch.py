@@ -41,11 +41,12 @@ class Qwen35BatchEngine:
     memory, slower). head_loop_max: batch sizes up to this run the batch-1 q8 head kernel once per
     sequence (else a tile-major copy of the head). warps / bps / max_split / acc16: RunsBatch.
     attn: "gqa" / "heads" / "auto" (gqa for B > 1); nsplit: gqa position slices (None: ~2 blocks
-    per SM)."""
+    per SM). tune: time the launch configs per matrix shape at this B first (kernels.batched_runs.
+    tune_runs; seconds) and use the fastest."""
 
     def __init__(self, eng: Qwen35Engine, B: int, *, layout: str = "tile", head_loop_max: int = 1, warps: int = 8,
                  bps: int = 2, max_split: int = 8, acc16: bool = False, attn: str = "auto",
-                 nsplit: int | None = None, batch1_kernels: bool = True):
+                 nsplit: int | None = None, batch1_kernels: bool = True, tune: bool = False, tune_log=None):
         from .kernels import batched_runs as br
         from .kernels import qwen35_kernels as qk
         c = eng.cfg
@@ -106,9 +107,16 @@ class Qwen35BatchEngine:
             self.po = torch.zeros(npart * c.head_dim, **f32)
         self.blin = None
         if self.batched:
-            self.blin = [{k: br.RunsBatch(v.rl, bmax=B, warps=warps, bps=bps, max_split=max_split, layout=layout,
-                                          acc16=acc16)
-                          for k, v in L.items() if isinstance(v, de.RunsLin)} for L in eng.layers]
+            cfg = {}
+            if tune:        # per matrix shape: the fastest (warps, bps, max_split) at this B
+                rls = [v.rl for L in eng.layers for v in L.values() if isinstance(v, de.RunsLin)]
+                cfg = br.tune_runs(rls, B, layout=layout, acc16=acc16, log=tune_log)
+            self.launch = cfg
+
+            def mk(rl):
+                w, b, m = cfg.get(br.runs_key(rl), (warps, bps, max_split))
+                return br.RunsBatch(rl, bmax=B, warps=w, bps=b, max_split=m, layout=layout, acc16=acc16)
+            self.blin = [{k: mk(v.rl) for k, v in L.items() if isinstance(v, de.RunsLin)} for L in eng.layers]
         self.graph = None
 
     # -- helpers

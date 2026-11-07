@@ -100,6 +100,7 @@ def main() -> int:
     ap.add_argument("--acc16", action="store_true", help="fp16-accumulate mma (2x tensor rate on GeForce parts)")
     ap.add_argument("--b1-batched", action="store_true", help="B = 1 on the batched kernels too (default: batch-1 kernels)")
     ap.add_argument("--stat", default="median", choices=["median", "min"], help="statistic over reps (min: shared GPUs)")
+    ap.add_argument("--tune", action="store_true", help="per matrix shape and B: pick the fastest launch config first")
     ap.add_argument("--warps", type=int, default=8)
     ap.add_argument("--bps", type=int, default=2)
     ap.add_argument("--max-split", type=int, default=8)
@@ -123,15 +124,17 @@ def main() -> int:
     res = {"gpu": torch.cuda.get_device_name(), "source": src, "ctx": a.ctx, "tg": a.tg,
            "weight_bytes": eng.weight_bytes(), "build_s": round(time.time() - t0, 1),
            "launch": {"layout": a.layout, "acc16": a.acc16, "warps": a.warps, "bps": a.bps, "max_split": a.max_split,
-                      "head_loop_max": a.head_loop_max, "b1_batched": a.b1_batched}, "stat": a.stat,
+                      "head_loop_max": a.head_loop_max, "b1_batched": a.b1_batched, "tune": a.tune}, "stat": a.stat,
            "runs": []}
     print(f"engine built in {res['build_s']} s, weights {res['weight_bytes'] / 1e9:.2f} GB", flush=True)
     for B in a.batch:
         beng = qb.Qwen35BatchEngine(eng, B, layout=a.layout, head_loop_max=a.head_loop_max, warps=a.warps,
-                                    bps=a.bps, max_split=a.max_split, acc16=a.acc16, batch1_kernels=not a.b1_batched)
+                                    bps=a.bps, max_split=a.max_split, acc16=a.acc16, batch1_kernels=not a.b1_batched,
+                                    tune=a.tune, tune_log=(lambda m: print("  " + m, flush=True)) if a.tune else None)
         torch.cuda.reset_peak_memory_stats()
         t = beng.time_steps(a.tg, a.ctx, a.reps, a.stat)
-        r = {"B": B, "attn": beng.attn, "step_ms": t * 1e3, "agg_tok_s": B / t, "seq_tok_s": 1 / t,
+        tuned = {f"{k[0]}x{k[1]}_b{k[2]}_t{k[3]}": v for k, v in getattr(beng, "launch", {}).items()}
+        r = {"B": B, "attn": beng.attn, "tuned": tuned, "step_ms": t * 1e3, "agg_tok_s": B / t, "seq_tok_s": 1 / t,
              "state_gb": beng.state_bytes() / 1e9, "peak_gb": torch.cuda.max_memory_allocated() / 1e9}
         res["runs"].append(r)
         print(f"B={B:2d}: {r['step_ms']:.2f} ms/step, {r['agg_tok_s']:.1f} tok/s aggregate, "

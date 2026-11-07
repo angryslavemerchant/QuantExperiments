@@ -86,3 +86,17 @@ def test_q8_matches_batch1(R, C):
             Y = torch.full((B, R), float("nan"), dtype=torch.float16, device="cuda")
             tile.run(X[:B].contiguous(), Y)
             assert _close(Y, ref[:B]) < 2e-3, (B, "tile")
+
+
+def test_tune_runs():
+    """The tuner returns one grid config per distinct shape, and those configs compute correctly."""
+    rls = [proto_runs.RunsLinear(*_lin(R, C, 10, G=4, M=1, seed=R), 1) for R, C in ((256, 2048), (512, 1024), (256, 2048))]
+    grid = [(4, 1, 1), (8, 2, 4)]
+    best = br.tune_runs(rls, 5, grid=grid, n=2, reps=1)
+    assert set(best) == {br.runs_key(rls[0]), br.runs_key(rls[1])}
+    assert all(v in grid for v in best.values())
+    X = torch.randn(5, 2048, device="cuda").half()
+    w, b, m = best[br.runs_key(rls[0])]
+    lb = br.RunsBatch(rls[0], warps=w, bps=b, max_split=m, layout="tile")
+    Y = lb.run(X, torch.empty(5, 256, dtype=torch.float16, device="cuda"))
+    assert _close(Y, _ref(rls[0], X)) < 2e-3

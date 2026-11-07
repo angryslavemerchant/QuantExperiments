@@ -472,6 +472,7 @@ gemv_q8_bw(const uint4* __restrict__ q, const __half* __restrict__ scales, const
 _mods: dict = {}
 SMEM_LIMIT = 48 * 1024
 BMAX = 32
+TILE_PAD = 8        # tiles per book padded to a multiple of this (RunsBatch warps must divide it)
 
 
 def _nb8(B: int) -> int:
@@ -582,7 +583,9 @@ class RunsBatch:
         self.smem = self.books or (tb <= SMEM_LIMIT if table == "auto" else table == "smem")
         self.table_bytes = K * 8 if self.books else tb
         self.threads, self.W, self.acc16 = warps * 32, warps, acc16
-        # 16-row tiles grouped by book, each book's tiles padded to whole groups of W
+        # 16-row tiles grouped by book, each book's tiles padded to whole groups of TILE_PAD (a
+        # multiple of W: the tile layout is then the same for every W dividing it)
+        assert TILE_PAD % warps == 0, f"warps must divide {TILE_PAD}"
         book = (rl.book_off.long() // K).cpu()
         tiles, gstart = [], [0]
         for b in range(G):
@@ -591,7 +594,7 @@ class RunsBatch:
                 gstart.append(gstart[-1])
                 continue
             n_t = -(-rows.numel() // 16)
-            n_t = -(-n_t // warps) * warps
+            n_t = -(-n_t // TILE_PAD) * TILE_PAD
             pad = n_t * 16 - rows.numel()
             tiles.append(torch.cat([rows, torch.full((pad,), -1, dtype=rows.dtype)]))
             gstart.append(gstart[-1] + n_t // warps)
@@ -616,11 +619,10 @@ class RunsBatch:
         self.cnt = torch.zeros(self.tiles.numel() // 16, dtype=torch.int32, device=dev)
         assert layout in ("lane", "tile")
         self.layout = layout
-        if layout == "tile":         # one repacked copy per (matrix, warps), shared by every launcher
-            cache = rl.__dict__.setdefault("_tile_cache", {})
-            if warps not in cache:
-                cache[warps] = tile_words(rl, self.tiles.view(-1, 16))
-            self.wt, self.tile_off = cache[warps]
+        if layout == "tile":         # one repacked copy per matrix, shared by every launcher
+            if getattr(rl, "_tile_words", None) is None:
+                rl._tile_words = tile_words(rl, self.tiles.view(-1, 16))
+            self.wt, self.tile_off = rl._tile_words
         self.ws = _Workspace.get(self.S * bmax * self.R if self.S > 1 else 1, dev)
 
     def run(self, X: torch.Tensor, Y: torch.Tensor, B: int | None = None):
@@ -711,3 +713,54 @@ class Q8Batch:
             fn((grid,), (256,), (cp.uint64(self.qt.data_ptr()), cp.uint64(self.st.data_ptr()), cp.uint64(X.data_ptr()),
                                  cp.uint64(Y.data_ptr()), cp.int32(self.R), cp.int32(self.C // 64), cp.int32(B)))
         return Y
+
+
+def runs_key(rl) -> tuple:
+    """Launch-relevant shape of a RunsLinear: (R, C, bits, table rows)."""
+    return (rl.R, rl.nch * 4, rl.bits, rl.table.shape[0])
+
+
+TUNE_GRID = [(w, b, m) for w in (4, 8) for b in (1, 2, 4) for m in (1, 2, 4, 8)]
+
+
+@torch.no_grad()
+def tune_runs(rls: list, B: int, grid=TUNE_GRID, layout: str = "tile", acc16: bool = False, n: int = 10,
+              reps: int = 3, log=None) -> dict:
+    """Fastest (warps, bps, max_split) per distinct runs_key among `rls` at batch B (CUDA-graph
+    timed, min of reps; configs with the same effective split / grid are timed once)."""
+    reps_by_key = {}
+    for rl in rls:
+        reps_by_key.setdefault(runs_key(rl), rl)
+    best = {}
+    for key, rl in reps_by_key.items():
+        X = torch.randn(B, key[1], device=rl.words.device).half()
+        Y = torch.empty(B, key[0], dtype=torch.float16, device=rl.words.device)
+        seen, res = set(), []
+        for w, b, m in grid:
+            lb = RunsBatch(rl, bmax=B, warps=w, bps=b, max_split=m, layout=layout, acc16=acc16)
+            eff = (w, lb.grid, lb.S)
+            if eff in seen:
+                continue
+            seen.add(eff)
+            lb.run(X, Y, B)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _ in range(n):
+                    lb.run(X, Y, B)
+            ts = []
+            for _ in range(reps):
+                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                e0.record()
+                g.replay()
+                e1.record()
+                torch.cuda.synchronize()
+                ts.append(e0.elapsed_time(e1) / n)
+            res.append((min(ts), (w, b, m)))
+            del g
+        res.sort()
+        best[key] = res[0][1]
+        if log:
+            log(f"tune B={B} R={key[0]} C={key[1]} bits={key[2]} table={key[3]}: {res[0][1]} {res[0][0] * 1e3:.1f} us "
+                f"(of {len(res)}; worst {res[-1][0] * 1e3:.1f} us)")
+    return best
