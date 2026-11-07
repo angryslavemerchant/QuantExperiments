@@ -33,7 +33,54 @@ from .kernels import decode_e2e as de
 from .qwen35_runtime import Qwen35Engine
 
 
-class Qwen35BatchEngine:
+class BatchEngineBase:
+    """Engine-agnostic parts of the batch engines: subclasses set B, cfg, eng (the batch-1
+    engine), tok / pos [B], logits, graph, implement step(), reset(), _states() (per-sequence state
+    tensors, batch dim 1) and _load_one(b, tokens, use_prefill) / has_prefill()."""
+
+    def capture(self):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                self.step()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        self.reset()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.step()
+        self.reset()
+        return self.graph
+
+    def state_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self._states())
+
+    @torch.no_grad()
+    def time_steps(self, n: int = 64, ctx: int = 0, reps: int = 3, stat: str = "median") -> float:
+        """Seconds per batched step (graph replay), averaged over n steps starting at position
+        ctx for every sequence (the states are not meaningful: speed only; attention cost grows
+        with ctx). stat: "median" or "min" of reps."""
+        if ctx + n > self.cfg.max_len:
+            raise ValueError("ctx + n exceeds max_len")
+        if self.graph is None:
+            self.capture()
+        ts = []
+        for _ in range(reps):
+            self.reset()
+            self.pos.fill_(ctx)
+            torch.cuda.synchronize()
+            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            a.record()
+            for _ in range(n):
+                self.graph.replay()
+            b.record()
+            torch.cuda.synchronize()
+            ts.append(a.elapsed_time(b) / 1e3 / n)
+        return min(ts) if stat == "min" else sorted(ts)[len(ts) // 2]
+
+
+class Qwen35BatchEngine(BatchEngineBase):
     """step(): reads tok [B] at pos [B], writes logits [B, vocab] (fp16) and tok (greedy next).
     layout: "tile" (default) gives the batched GEMMs a tile-major copy of every block matrix's
     words (made once per matrix and shared by all batch engines: a second copy of the block
@@ -244,50 +291,24 @@ class Qwen35BatchEngine:
         self.tok[b] = eng.tok[0]
         self.logits[b].copy_(eng.logits)
 
-    def capture(self):
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):
-                self.step()
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-        self.reset()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.step()
-        self.reset()
-        return self.graph
+    def _states(self):
+        return (self.conv, self.S, self.kc, self.vc)
 
-    def state_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (self.conv, self.S, self.kc, self.vc))
+    def has_prefill(self) -> bool:
+        return getattr(self.eng, "prefill_lins", None) is not None
 
-    @torch.no_grad()
-    def time_steps(self, n: int = 64, ctx: int = 0, reps: int = 3, stat: str = "median") -> float:
-        """Seconds per batched step (graph replay), averaged over n steps starting at position
-        ctx for every sequence (the states are not meaningful: speed only; attention cost grows
-        with ctx). stat: "median" or "min" of reps."""
-        if ctx + n > self.cfg.max_len:
-            raise ValueError("ctx + n exceeds max_len")
-        if self.graph is None:
-            self.capture()
-        ts = []
-        for _ in range(reps):
-            self.reset()
-            self.pos.fill_(ctx)
-            torch.cuda.synchronize()
-            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            a.record()
-            for _ in range(n):
-                self.graph.replay()
-            b.record()
-            torch.cuda.synchronize()
-            ts.append(a.elapsed_time(b) / 1e3 / n)
-        return min(ts) if stat == "min" else sorted(ts)[len(ts) // 2]
+    def _load_one(self, b: int, tokens, use_prefill: bool):
+        from . import qwen35_runtime as q35
+        if use_prefill:
+            self.eng.reset()
+            q35.prefill(self.eng, tokens)
+        else:
+            q35.feed(self.eng, tokens)
+        self.load_slot(b)
 
 
 @torch.no_grad()
-def feed_batch(beng: Qwen35BatchEngine, prompts: list[list[int]], keep_logits: bool = False, graph: bool = False):
+def feed_batch(beng: BatchEngineBase, prompts: list[list[int]], keep_logits: bool = False, graph: bool = False):
     """Equal-length prompts fed from position 0 through the batched step (one step per prompt
     position). Afterwards beng.tok = each sequence's greedy next token. keep_logits: fp32
     [B, vocab] after each step."""
@@ -313,29 +334,22 @@ def feed_batch(beng: Qwen35BatchEngine, prompts: list[list[int]], keep_logits: b
 
 
 @torch.no_grad()
-def load_prompts(beng: Qwen35BatchEngine, prompts: list[list[int]], use_prefill: bool | None = None):
+def load_prompts(beng: BatchEngineBase, prompts: list[list[int]], use_prefill: bool | None = None):
     """Run each prompt alone through the batch-1 engine (batched prefill when attached, else step
     by step) and copy its state into its slot. Prompt lengths may differ (ragged positions)."""
-    from . import qwen35_runtime as q35
     if len(prompts) != beng.B:
         raise ValueError(f"need {beng.B} prompts")
-    eng = beng.eng
     if use_prefill is None:
-        use_prefill = getattr(eng, "prefill_lins", None) is not None
+        use_prefill = beng.has_prefill()
     beng.reset()
     for b, p in enumerate(prompts):
         if len(p) > beng.cfg.max_len:
             raise ValueError("prompt longer than max_len")
-        if use_prefill:
-            eng.reset()
-            q35.prefill(eng, p)
-        else:
-            q35.feed(eng, p)
-        beng.load_slot(b)
+        beng._load_one(b, p, use_prefill)
 
 
 @torch.no_grad()
-def generate_batch(beng: Qwen35BatchEngine, prompts: list[list[int]], n: int, graph: bool = True,
+def generate_batch(beng: BatchEngineBase, prompts: list[list[int]], n: int, graph: bool = True,
                    use_prefill: bool | None = None, feed: str = "auto") -> list[list[int]]:
     """Greedy continuation of each prompt by n tokens. feed: "slots" (load_prompts), "batch"
     (feed_batch: equal lengths) or "auto" (batch when the lengths are equal and the batch-1
@@ -346,7 +360,7 @@ def generate_batch(beng: Qwen35BatchEngine, prompts: list[list[int]], n: int, gr
         raise ValueError("prompt + n exceeds max_len")
     if feed == "auto":
         equal = len({len(p) for p in prompts}) == 1
-        feed = "batch" if equal and getattr(beng.eng, "prefill_lins", None) is None else "slots"
+        feed = "batch" if equal and not beng.has_prefill() else "slots"
     if feed == "batch":
         feed_batch(beng, prompts, graph=graph)
     else:

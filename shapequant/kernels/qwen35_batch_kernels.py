@@ -156,14 +156,29 @@ extern "C" __global__ void __launch_bounds__(256) attn_b(const float* qr, const 
     }
 }
 
-// GQA-sharing flash decoding: grid (NKV * nsplit, B), 128 threads (4 warps). Block (kvh, split) reads
+"""
+
+# shared with kernels.qwen2_batch_kernels (needs NH, NKV, HD, QT, GATED, warp_sum)
+GQA_SRC = r"""
+// GQA-sharing flash decoding: grid (NKV * nsplit, B), 128 threads (4 warps). Compiled with QT = the
+// query type (float: Qwen3.5's normed + roped q; __half: Qwen2's roped q) and GATED (Qwen3.5: output
+// times sigmoid(gate), gate = qg[b][h * 2 * HD + HD + d]; Qwen2: no gate, qg unused). Block (kvh, split) reads
 // its kv head's K / V rows for one slice of the positions once, for all REP = NH / NKV query heads
 // of the group (attn_b reads them once per query head). Warp w takes positions p0 + w, p0 + w + 4, ...;
 // online softmax per head, merged over the warps in shared memory. nsplit == 1: final output (times
-// sigmoid(gate)); else partials (m, l, o) to pm / pl [B, NKV, nsplit, REP], po [.., HD], merged by
+// the gate); else partials (m, l, o) to pm / pl [B, NKV, nsplit, REP], po [.., HD], merged by
 // attn_comb_b.
 #define REP (NH / NKV)
-extern "C" __global__ void __launch_bounds__(128) attn_gqa_b(const float* qr, const __half* qg, const __half* kc,
+__device__ __forceinline__ float tof(float x) { return x; }
+__device__ __forceinline__ float tof(__half x) { return __half2float(x); }
+__device__ __forceinline__ float gate_of(const __half* qg, int h, int d) {
+#if GATED
+    return 1.f / (1.f + __expf(-__half2float(qg[h * 2 * HD + HD + d])));
+#else
+    return 1.f;
+#endif
+}
+extern "C" __global__ void __launch_bounds__(128) attn_gqa_b(const QT* qr, const __half* qg, const __half* kc,
         const __half* vc, const long long* pos_p, int maxlen, int nsplit, float* pm, float* pl, float* po,
         __half* out) {
     constexpr int PL = HD / 32;
@@ -182,7 +197,7 @@ extern "C" __global__ void __launch_bounds__(128) attn_gqa_b(const float* qr, co
     for (int r = 0; r < REP; ++r) {
         m[r] = -1e30f; l[r] = 0.f;
         #pragma unroll
-        for (int j = 0; j < PL; ++j) { q[r][j] = qr[(kvh * REP + r) * HD + lane * PL + j] * rsqrtf((float)HD); acc[r][j] = 0.f; }
+        for (int j = 0; j < PL; ++j) { q[r][j] = tof(qr[(kvh * REP + r) * HD + lane * PL + j]) * rsqrtf((float)HD); acc[r][j] = 0.f; }
     }
     for (int p = p0 + w; p < p1; p += 4) {
         float kf[PL], vf[PL];
@@ -222,7 +237,7 @@ extern "C" __global__ void __launch_bounds__(128) attn_gqa_b(const float* qr, co
         for (int k = 0; k < 4; ++k) { const float c = __expf(wm[k][r] - M); L += wl[k][r] * c; O += wo[k][r][d] * c; }
         const int h = kvh * REP + r;
         if (nsplit == 1) {
-            out[h * HD + d] = __float2half(O / L * sigm(__half2float(qg[h * 2 * HD + HD + d])));
+            out[h * HD + d] = __float2half(O / L * gate_of(qg, h, d));
         } else {
             const size_t pi = ((bb * NKV + kvh) * nsplit + sp) * REP + r;
             if (d == 0) { pm[pi] = M; pl[pi] = L; }
@@ -246,7 +261,7 @@ extern "C" __global__ void attn_comb_b(const __half* qg, int nsplit, const float
         L += pl[pi] * c;
         O += po[pi * HD + d] * c;
     }
-    out[bb * NH * HD + h * HD + d] = __float2half(O / L * sigm(__half2float(qg[bb * NH * 2 * HD + h * 2 * HD + HD + d])));
+    out[bb * NH * HD + h * HD + d] = __float2half(O / L * gate_of(qg + bb * NH * 2 * HD, h, d));
 }
 """
 
@@ -260,5 +275,6 @@ def module(c):
     if key not in _mods:
         defs = (f"#define HK {c.hk}\n#define HV {c.hv}\n#define DK {c.dk}\n#define DV {c.dv}\n#define KC {c.conv_k}\n"
                 f"#define NH {c.n_heads}\n#define NKV {c.n_kv}\n#define HD {c.head_dim}\n#define ROT {c.rot}\n")
-        _mods[key] = cp.RawModule(code=defs + qk._SRC + _BSRC, options=("-std=c++17",))
+        defs += "#define QT float\n#define GATED 1\n"
+        _mods[key] = cp.RawModule(code=defs + qk._SRC + _BSRC + GQA_SRC, options=("-std=c++17",))
     return _mods[key]
