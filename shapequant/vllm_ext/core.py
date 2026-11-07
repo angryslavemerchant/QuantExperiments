@@ -111,7 +111,7 @@ class _Scratch:
 
 class PackedShards:
     def __init__(self, rls: list, *, bmax: int = BMAX, layout: str = "tile", warps: int = 8, bps: int = 2, xs: bool = False,
-                 max_split: int = 8, large: str = "dequant", chunk_bytes: int = 24 << 20):
+                 max_split: int = 8, large: str = "dequant", chunk_bytes: int = 24 << 20, dequant_from: int = 384):
         # large-M path: "dequant" (whole matrix to scratch + GEMM), "chunked" (L2-sized row chunks,
         # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
         assert large in ("dequant", "chunked", "fused"), large
@@ -133,6 +133,7 @@ class PackedShards:
         self.offs = [sum(self.Rs[:i]) for i in range(len(rls))]
         self.bmax = bmax
         self.cross = bmax        # M <= cross: batched kernel, else the large-M path (tune() moves it)
+        self.dequant_from = dequant_from   # large == "fused": M >= this uses dequant + GEMM instead
         self.launchers = [br.RunsBatch(rl, bmax=bmax, warps=warps, bps=bps, max_split=max_split, layout=layout, xs=xs)
                           for rl in rls]
         # the batched kernel writes Y [B, R_piece] contiguous: one buffer per piece, then a copy
@@ -213,9 +214,11 @@ class PackedShards:
     def _large(self, x16: torch.Tensor) -> torch.Tensor:
         if self.large == "chunked":
             return self._large_chunked(x16)
-        if self.large == "fused":
+        if self.large == "fused" and x16.shape[0] < self.dequant_from:
             from ..kernels import runs_gemm
             return runs_gemm.gemm(x16, self.rls)
+        # long prefill chunks: dequant + cuBLAS (the decode cost is amortized over many rows; the
+        # fused GEMM's mma loop is ~2x slower than cuBLAS there: PRO 6000 s35c, M >= 512)
         from ..kernels import cuda_dequant
         scratch = _Scratch.get(max(self.Rs) * self.C, x16.device)
         if len(self.rls) == 1:

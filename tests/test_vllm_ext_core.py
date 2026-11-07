@@ -128,3 +128,15 @@ def test_tuned_dispatch_synthetic():
         ref = _ref(x.half(), [a, b])
         err = (ps.forward(x).float() - ref).norm() / ref.norm()
         assert err < 1e-2, (M, err)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_hands_long_batches_to_dequant():
+    pytest.importorskip("cupy")
+    from test_runs_gemm import _rl, _ref
+    a = _rl(200, 1280, 10, 4, 41)
+    ps = core.PackedShards([a], large="fused", dequant_from=100)
+    for M in (40, 99, 100, 300):
+        x = torch.randn(M, 1280 * 4, device="cuda", dtype=torch.bfloat16)
+        ref = _ref(x.half(), [a])
+        assert (ps.forward(x).float() - ref).norm() / ref.norm() < 1e-2
