@@ -69,6 +69,7 @@ def main() -> int:
     ap.add_argument("--names", required=True)
     ap.add_argument("--Ms", default="1,8,32,48,64,96,128,192,256,512,1024")
     ap.add_argument("--slow", action="store_true", help="also dequant + GEMM")
+    ap.add_argument("--bm-sweep", action="store_true", help="also the fused kernel at other token tiles")
     ap.add_argument("--out")
     a = ap.parse_args()
     from shapequant.kernels import batched_runs as br, cuda_dequant, runs_gemm
@@ -96,6 +97,8 @@ def main() -> int:
                  "batched_us": timeit(chunks(lb, 32)),
                  **{f"xs_w{w}_us": timeit(chunks(l, 128)) for w, l in lbx.items()},
                  "fused_us": timeit(lambda: runs_gemm.gemm(x, [rl], out=y)) if runs_gemm.supported(rl) else None,
+                 **({f"fused_bm{bm}_us": timeit(lambda bm=bm: runs_gemm.gemm(x, [rl], out=y, bm=bm))
+                     for bm in (32, 64, 128) if bm != runs_gemm.auto_bm(M) and bm * 4 >= M} if a.bm_sweep and M > 16 else {}),
                  "bf16_us": timeit(lambda: torch.matmul(xb, Wd.t()))}
             if a.slow:
                 scratch = torch.empty(R * C, dtype=torch.float16, device="cuda")
