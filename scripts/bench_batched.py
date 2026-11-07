@@ -1,4 +1,5 @@
-"""Batched decode throughput of the Qwen3.5 / 3.8 runtime (shapequant.qwen35_batch), in the
+"""Batched decode throughput of the Qwen3.5 / 3.8 runtime (shapequant.qwen35_batch; Qwen2-style
+models: shapequant.runtime_batch), in the
 llama-batched-bench setting: npl sequences each holding a context of `ctx` tokens, decoding
 `tg` more tokens together; reports aggregate tok/s (B * tg / time) and per-sequence tok/s for
 each batch size, as JSON.
@@ -7,7 +8,7 @@ Synthetic engine (default): the model's shapes from its HF config (transformers 
 weights downloaded), random codes at the shipped format (d = 4 runs, G books per matrix, M = 1,
 K from --bits or a per-matrix allocation file, 8-bit head, 4-bit embedding), built directly on
 the GPU (speed does not depend on the values). Or --packed: a real packed file
-(qwen35_runtime.engine_from_packed).
+(qwen35_runtime / runtime .engine_from_packed by the file's model type).
 
     python scripts/bench_batched.py --model Qwen/Qwen3.8-27B --alloc configs/alloc/qwen38_27b_s14_25.json \\
         --ctx 512 --tg 64 --batch 1 2 4 8 16 32 --out artifacts/bench/batched_27b.json
@@ -81,6 +82,50 @@ def synthetic_engine(model: str, max_len: int, bits: int = 10, G: int = 4, alloc
     return q35.Qwen35Engine(cfg, Ls, emb, vec(H), head, dev, fused=True)
 
 
+def _hf_config(model: str):
+    from transformers import AutoConfig
+    hc = AutoConfig.from_pretrained(model)
+    return getattr(hc, "text_config", hc)
+
+
+def is_qwen35(model_type: str) -> bool:
+    return model_type.startswith("qwen3_5")
+
+
+def synthetic_qwen2_engine(model: str, max_len: int, bits: int = 10, G: int = 4, alloc: dict | None = None,
+                           layers: int | None = None, seed: int = 0, dev="cuda"):
+    """Random-code Qwen2-architecture DecodeEngine (M = 1, G books, 8-bit head, 4-bit embedding)."""
+    from shapequant.runtime import cfg_from_hf
+    hc = _hf_config(model)
+    if layers:
+        hc.num_hidden_layers = layers
+    cfg = cfg_from_hf(hc, max_len)
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, I, NH, NKV, HD = cfg.hidden, cfg.inter, cfg.n_heads, cfg.n_kv, cfg.head_dim
+
+    def lin(name, R, C):
+        b = alloc[name].bit_length() - 1 if alloc and name in alloc else bits
+        th, bps = (0, 1) if R <= 4096 else (512, 1)
+        return de.RunsLin.random(R, C, b, torch.arange(C)[None], g, dev=dev, G=G, threads=th, blocks_per_sm=bps)
+
+    def vec(n, s=0.1, base=0.0):
+        return (torch.randn(n, device=dev, generator=g) * s + base).half()
+
+    Ls = []
+    for i in range(cfg.layers):
+        a, m = f"model.layers.{i}.self_attn.", f"model.layers.{i}.mlp."
+        Ls.append(dict(ln1=vec(H, 0.1, 1.0), ln2=vec(H, 0.1, 1.0), q=lin(a + "q_proj", NH * HD, H),
+                       k=lin(a + "k_proj", NKV * HD, H), v=lin(a + "v_proj", NKV * HD, H), o=lin(a + "o_proj", H, NH * HD),
+                       gate=lin(m + "gate_proj", I, H), up=lin(m + "up_proj", I, H), down=lin(m + "down_proj", H, I),
+                       bq=vec(NH * HD), bk=vec(NKV * HD), bv=vec(NKV * HD)))
+    V = cfg.vocab
+    head = de.Q8Lin(torch.randint(-127, 127, (V, H), dtype=torch.int8, device=dev, generator=g),
+                    torch.full((V, H // 32), 1e-3, dtype=torch.float16, device=dev), V, H)
+    emb = de.Q4Embed(torch.randint(0, 255, (V, H // 2), dtype=torch.uint8, device=dev, generator=g),
+                     torch.full((V, H // 32), 1e-2, dtype=torch.float16, device=dev))
+    return de.DecodeEngine(cfg, emb, Ls, vec(H, 0.1, 1.0), head, dev)
+
+
 @torch.no_grad()
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -94,11 +139,13 @@ def main() -> int:
     ap.add_argument("--ctx", type=int, default=512, help="context per sequence before the timed steps (npp)")
     ap.add_argument("--tg", type=int, default=64, help="timed decode steps (ntg)")
     ap.add_argument("--reps", type=int, default=3)
-    ap.add_argument("--head-loop-max", type=int, default=1, help="B up to this: batch-1 head kernel per sequence")
+    ap.add_argument("--head-loop-max", type=int, default=1,
+                    help="Qwen3.5: B up to this: batch-1 head kernel per sequence")
     ap.add_argument("--layout", default="tile", choices=["tile", "lane"],
                     help="block weights for the batched GEMMs: tile-major copy (faster, 2x block-weight memory) or in place")
     ap.add_argument("--acc16", action="store_true", help="fp16-accumulate mma (2x tensor rate on GeForce parts)")
-    ap.add_argument("--b1-batched", action="store_true", help="B = 1 on the batched kernels too (default: batch-1 kernels)")
+    ap.add_argument("--b1-batched", action="store_true",
+                    help="Qwen3.5: B = 1 on the batched kernels too (default: batch-1 kernels; Qwen2 always batched)")
     ap.add_argument("--stat", default="median", choices=["median", "min"], help="statistic over reps (min: shared GPUs)")
     ap.add_argument("--tune", action="store_true", help="per matrix shape and B: pick the fastest launch config first")
     ap.add_argument("--warps", type=int, default=8)
@@ -111,15 +158,24 @@ def main() -> int:
     max_len = a.ctx + a.tg + 1
     t0 = time.time()
     if a.packed:
-        eng, info = q35.engine_from_packed(a.packed, max_len=max_len, fused=True)
-        src = {"packed": a.packed, "summary": info["summary"]}
+        from shapequant.packed import PackedFile
+        pf = PackedFile(a.packed)
+        mt = (pf.aux or {}).get("config", {}).get("model_type") or _hf_config(pf.summary["base_model"]).model_type
+        if is_qwen35(mt):
+            eng, info = q35.engine_from_packed(a.packed, max_len=max_len, fused=True)
+        else:
+            from shapequant import runtime
+            eng, info = runtime.engine_from_packed(a.packed, max_len=max_len)
+        src = {"packed": a.packed, "model_type": mt, "summary": info["summary"]}
     else:
         alloc = None
         if a.alloc:
             alloc = json.loads(Path(a.alloc).read_text())
             alloc = alloc.get("choices", alloc)
-        eng = synthetic_engine(a.model, max_len, a.bits, a.G, alloc, a.layers)
-        src = {"model": a.model, "bits": a.bits, "G": a.G, "alloc": a.alloc, "layers": a.layers}
+        mt = _hf_config(a.model).model_type
+        build = synthetic_engine if is_qwen35(mt) else synthetic_qwen2_engine
+        eng = build(a.model, max_len, a.bits, a.G, alloc, a.layers)
+        src = {"model": a.model, "model_type": mt, "bits": a.bits, "G": a.G, "alloc": a.alloc, "layers": a.layers}
     torch.cuda.synchronize()
     res = {"gpu": torch.cuda.get_device_name(), "source": src, "ctx": a.ctx, "tg": a.tg,
            "weight_bytes": eng.weight_bytes(), "build_s": round(time.time() - t0, 1),
@@ -128,13 +184,17 @@ def main() -> int:
            "runs": []}
     print(f"engine built in {res['build_s']} s, weights {res['weight_bytes'] / 1e9:.2f} GB", flush=True)
     for B in a.batch:
-        beng = qb.Qwen35BatchEngine(eng, B, layout=a.layout, head_loop_max=a.head_loop_max, warps=a.warps,
-                                    bps=a.bps, max_split=a.max_split, acc16=a.acc16, batch1_kernels=not a.b1_batched,
-                                    tune=a.tune, tune_log=(lambda m: print("  " + m, flush=True)) if a.tune else None)
+        kw = dict(layout=a.layout, warps=a.warps, bps=a.bps, max_split=a.max_split, acc16=a.acc16, tune=a.tune,
+                  tune_log=(lambda m: print("  " + m, flush=True)) if a.tune else None)
+        if is_qwen35(mt):
+            beng = qb.Qwen35BatchEngine(eng, B, head_loop_max=a.head_loop_max, batch1_kernels=not a.b1_batched, **kw)
+        else:
+            from shapequant.runtime_batch import Qwen2BatchEngine
+            beng = Qwen2BatchEngine(eng, B, **kw)
         torch.cuda.reset_peak_memory_stats()
         t = beng.time_steps(a.tg, a.ctx, a.reps, a.stat)
         tuned = {f"{k[0]}x{k[1]}_b{k[2]}_t{k[3]}": v for k, v in getattr(beng, "launch", {}).items()}
-        r = {"B": B, "attn": beng.attn, "tuned": tuned, "step_ms": t * 1e3, "agg_tok_s": B / t, "seq_tok_s": 1 / t,
+        r = {"B": B, "attn": getattr(beng, "attn", "gqa"), "tuned": tuned, "step_ms": t * 1e3, "agg_tok_s": B / t, "seq_tok_s": 1 / t,
              "state_gb": beng.state_bytes() / 1e9, "peak_gb": torch.cuda.max_memory_allocated() / 1e9}
         res["runs"].append(r)
         print(f"B={B:2d}: {r['step_ms']:.2f} ms/step, {r['agg_tok_s']:.1f} tok/s aggregate, "
