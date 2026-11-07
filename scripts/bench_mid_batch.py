@@ -18,9 +18,27 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def timeit(fn, n=20, reps=3) -> float:
+_FLUSH = None
+_FLUSH_US = None
+
+
+def flush():
+    """Evict L2 (a 512 MB write): in a model every matrix is read from DRAM once per step."""
+    global _FLUSH
+    if _FLUSH is None:
+        _FLUSH = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
+    _FLUSH.zero_()
+
+
+def timeit(fn, n=20, reps=3, cold=True) -> float:
     """GPU time per call (us), CUDA-graph replay of n calls (as vLLM's captured decode steps; no
-    host launch overhead), min of reps."""
+    host launch overhead), min of reps. cold: L2 flushed before each call (the flush's own time,
+    measured the same way, is subtracted)."""
+    if cold:
+        global _FLUSH_US
+        if _FLUSH_US is None:
+            _FLUSH_US = timeit(flush, n, reps, cold=False)
+        return timeit(lambda: (flush(), fn()), n, reps, cold=False) - _FLUSH_US
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):

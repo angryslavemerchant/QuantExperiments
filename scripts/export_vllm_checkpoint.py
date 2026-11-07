@@ -83,6 +83,7 @@ def export(packed: str, out: Path, base: str | None = None) -> dict:
     dst = out / PACKED_NAME
     if dst.exists():
         dst.unlink()
+    packed = os.path.realpath(packed)       # the HF cache entry is a (relative) symlink to its blob
     try:
         os.link(packed, dst)
     except OSError:

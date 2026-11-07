@@ -3,7 +3,8 @@
 # bf16 (stock vLLM) and throughput of both, per model.
 #   bash scripts/vllm_box.sh <out_dir> name=REPO:FILE@BASE [name=REPO:FILE@BASE ...]
 # REPO:FILE: a self-contained packed file on the Hub; BASE: its base model repo (for the bf16 ref).
-# Results: <out_dir>/<name>/{ours,ref}.json, compare.json, logs.
+# Results: <out_dir>/<name>/{ours_<mode>,ref}.json, compare_<mode>.json, logs. Env: MODES="dequant fused chunked"
+# (large-M paths to run, default dequant), SKIP_REF=1 (no bf16 export / run).
 set -uo pipefail
 OUT=$1; shift
 PY=${PYTHON:-$(command -v python3 || command -v python)}
@@ -42,30 +43,41 @@ for spec in "$@"; do
   log "== $name: exporting ($src, base $base)"
   $PY scripts/export_vllm_checkpoint.py --packed-hf "$src" --base "$base" --out "$CK/$name.sq" > "$D/export_ours.log" 2>&1 \
     || { log "plugin export failed"; tail -20 "$D/export_ours.log"; continue; }
-  $PY scripts/export_eval_checkpoint.py --base "$base" --packed-hf "$src" --out "$CK/$name.ref" \
-      --record "$D/export_ref.json" > "$D/export_ref.log" 2>&1 \
-    || { log "bf16 export failed"; tail -20 "$D/export_ref.log"; continue; }
+  if [ -z "${SKIP_REF:-}" ]; then
+    $PY scripts/export_eval_checkpoint.py --base "$base" --packed-hf "$src" --out "$CK/$name.ref" \
+        --record "$D/export_ref.json" > "$D/export_ref.log" 2>&1 \
+      || { log "bf16 export failed"; tail -20 "$D/export_ref.log"; continue; }
+  fi
   log "per-matrix kernel bench (large-M options)"
   PK=$($PY -c "from huggingface_hub import hf_hub_download as d; r, f = '$src'.split(':', 1); print(d(r, f))")
-  "$VENV/bin/python" scripts/bench_mid_batch.py --packed "$PK" --out "$D/mid_batch.json" \
+  "$VENV/bin/python" scripts/bench_mid_batch.py --packed "$PK" --out "$D/mid_batch.json" --Ms 1,32,64,128,256,512 --chunks-mb 16,48 \
       --names model.layers.0.mlp.gate_proj,model.layers.0.mlp.down_proj,model.layers.0.linear_attn.in_proj_qkv,model.layers.3.self_attn.o_proj \
       > "$D/mid_batch.log" 2>&1 || log "mid-batch bench failed"
   grep -E " M= " "$D/mid_batch.log" | tail -44
-  log "running ours (plugin)"
-  if ! "$VENV/bin/python" scripts/vllm_smoke.py run --model "$CK/$name.sq" --name "$name-shapequant" --out "$D/ours.json" > "$D/ours.log" 2>&1; then
-    log "ours failed (compiled); tail:"; tail -30 "$D/ours.log"
-    log "retrying ours with --eager"
-    "$VENV/bin/python" scripts/vllm_smoke.py run --model "$CK/$name.sq" --name "$name-shapequant-eager" --eager \
-        --out "$D/ours.json" > "$D/ours_eager.log" 2>&1 || { log "ours eager failed"; tail -30 "$D/ours_eager.log"; }
+  for mode in ${MODES:-dequant}; do
+    log "running ours (plugin, large-M path: $mode)"
+    O="$D/ours_$mode"
+    if ! SHAPEQUANT_LARGE=$mode "$VENV/bin/python" scripts/vllm_smoke.py run --model "$CK/$name.sq" \
+        --name "$name-shapequant-$mode" --out "$O.json" > "$O.log" 2>&1; then
+      log "ours ($mode) failed (compiled); tail:"; tail -30 "$O.log"
+      log "retrying with --eager"
+      SHAPEQUANT_LARGE=$mode "$VENV/bin/python" scripts/vllm_smoke.py run --model "$CK/$name.sq" --eager \
+          --name "$name-shapequant-$mode-eager" --out "$O.json" > "${O}_eager.log" 2>&1 \
+        || { log "eager failed too"; tail -30 "${O}_eager.log"; }
+    fi
+    grep -E "^\[" "$O.log" "${O}_eager.log" 2>/dev/null | tail -14
+  done
+  if [ -z "${SKIP_REF:-}" ]; then
+    log "running ref (bf16)"
+    "$VENV/bin/python" scripts/vllm_smoke.py run --model "$CK/$name.ref" --name "$name-bf16" --out "$D/ref.json" > "$D/ref.log" 2>&1 \
+      || { log "ref failed"; tail -30 "$D/ref.log"; }
+    grep -E "^\[" "$D/ref.log" | tail -14
   fi
-  grep -E "^\[" "$D/ours.log" "$D/ours_eager.log" 2>/dev/null | tail -14
-  log "running ref (bf16)"
-  "$VENV/bin/python" scripts/vllm_smoke.py run --model "$CK/$name.ref" --name "$name-bf16" --out "$D/ref.json" > "$D/ref.log" 2>&1 \
-    || { log "ref failed"; tail -30 "$D/ref.log"; }
-  grep -E "^\[" "$D/ref.log" | tail -14
-  if [ -e "$D/ours.json" ] && [ -e "$D/ref.json" ]; then
-    "$VENV/bin/python" scripts/vllm_smoke.py compare "$D/ours.json" "$D/ref.json" --out "$D/compare.json"
-  fi
+  for mode in ${MODES:-dequant}; do
+    if [ -e "$D/ours_$mode.json" ] && [ -e "$D/ref.json" ]; then
+      "$VENV/bin/python" scripts/vllm_smoke.py compare "$D/ours_$mode.json" "$D/ref.json" --out "$D/compare_$mode.json"
+    fi
+  done
   rm -rf "$CK/$name.sq" "$CK/$name.ref"
 done
 log "all done"
