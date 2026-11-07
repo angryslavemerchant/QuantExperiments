@@ -80,10 +80,20 @@ _SRC_RUNS = r"""
 // zero-padded), so every warp load is 128 contiguous bytes and a unit's words are one contiguous block.
 #define TWORDS (2 * 32 * (NFULL * 8 * NWB + (JT > 0 ? 8 * NWT : 0)))
 
+#ifndef XS
+#define XS 0
+#endif
+// XS: the block stages each column unit's X slice in shared memory once (all warps step through
+// the same units): xs[n][q], n < NB8*8 batch rows, q = 8m + 2t + e the unit's 64 chunks (code j of
+// slot t: m = j >> 1, e = j & 1), XOR-swizzled by the row so a warp's 8-byte reads (rows g, slots
+// t) hit distinct bank pairs. Rows >= B are zero.
+__device__ __forceinline__ int xs_swz(int n) { return (n & 1) | ((n & 2) << 2); }
+
 // the NT tags held in a (row g) and b (row g + 8), NWD words each (+1 zero word)
 template <int NT, int NWD>
 __device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, const uint2* tab0, const uint2* tab1,
-                                      const uint2* __restrict__ X, int g, int B, float (*acc)[4])
+                                      const uint2* __restrict__ X, int g, int B, float (*acc)[4],
+                                      const uint2* xs, int t)
 {
     const u32 MASK = (1u << BITS) - 1u;
     #pragma unroll
@@ -92,6 +102,15 @@ __device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, con
         const u32 va = ((sh + BITS <= 32) ? (a[wi] >> sh) : __funnelshift_r(a[wi], a[wi + 1], sh)) & MASK;
         const u32 vb = ((sh + BITS <= 32) ? (b[wi] >> sh) : __funnelshift_r(b[wi], b[wi + 1], sh)) & MASK;
         const uint2 ta = tab0[va], tb = tab1[vb];
+#if XS
+        const int q = (j >> 1) * 8 + 2 * t + (j & 1);
+        #pragma unroll
+        for (int nb = 0; nb < NB8; ++nb) {
+            const int n = nb * 8 + g;
+            const uint2 xv = xs[n * 64 + (q ^ xs_swz(n))];
+            mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
+        }
+#else
         const int c = cbase + (j >> 1) * 64 + (j & 1);
         #pragma unroll
         for (int nb = 0; nb < NB8; ++nb) {
@@ -99,19 +118,34 @@ __device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, con
             const uint2 xv = n < B ? __ldg(X + (size_t)n * NCH + c) : make_uint2(0u, 0u);
             mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
         }
+#endif
+    }
+}
+
+// XS: stage unit u's X slice (NB8*8 rows x 64 chunks) into xs
+__device__ __forceinline__ void load_xs(const uint2* __restrict__ X, uint2* xs, int u, int B)
+{
+    int bb, ug, nm;
+    if (u < NFULL * 8) { bb = u >> 3; ug = u & 7; nm = 8; } else { bb = NFULL; ug = u - NFULL * 8; nm = JT; }
+    const int base = 512 * bb + 8 * ug;
+    for (int idx = threadIdx.x; idx < NB8 * 8 * 64; idx += THREADS) {
+        const int n = idx >> 6, q = idx & 63, m = q >> 3;
+        const uint2 v = (n < B && m < nm) ? __ldg(X + (size_t)n * NCH + base + 64 * m + (q & 7)) : make_uint2(0u, 0u);
+        xs[n * 64 + (q ^ xs_swz(n))] = v;
     }
 }
 
 // TILE: one unit from the tile layout (base = this unit's block + lane)
 template <int NT, int NWD>
 __device__ __forceinline__ void unit_t(const u32* __restrict__ base, int cbase, const uint2* tab0, const uint2* tab1,
-                                       const uint2* __restrict__ X, int g, int B, float (*acc)[4])
+                                       const uint2* __restrict__ X, int g, int B, float (*acc)[4],
+                                       const uint2* xs, int t)
 {
     u32 a[NWD + 1], b[NWD + 1];
     #pragma unroll
     for (int i = 0; i < NWD; ++i) { a[i] = __ldg(base + i * 32); b[i] = __ldg(base + (NWD + i) * 32); }
     a[NWD] = 0u; b[NWD] = 0u;
-    codes<NT, NWD>(a, b, cbase, tab0, tab1, X, g, B, acc);
+    codes<NT, NWD>(a, b, cbase, tab0, tab1, X, g, B, acc, xs, t);
 }
 
 // One column unit for this thread: the NT tags of run lane L for rows g (w0) and g + 8 (w1).
@@ -119,7 +153,7 @@ __device__ __forceinline__ void unit_t(const u32* __restrict__ base, int cbase, 
 template <int NT, int NWD, bool TAIL>
 __device__ __forceinline__ void unit(const u32* __restrict__ w0, const u32* __restrict__ w1, int L, int cbase,
                                      const uint2* tab0, const uint2* tab1, const uint2* __restrict__ X, int g,
-                                     int B, float (*acc)[4])
+                                     int B, float (*acc)[4], const uint2* xs, int t)
 {
     u32 a[NWD + 1], b[NWD + 1];
     if constexpr (TAIL) {
@@ -141,7 +175,7 @@ __device__ __forceinline__ void unit(const u32* __restrict__ w0, const u32* __re
         }
     }
     a[NWD] = 0u; b[NWD] = 0u;
-    codes<NT, NWD>(a, b, cbase, tab0, tab1, X, g, B, acc);
+    codes<NT, NWD>(a, b, cbase, tab0, tab1, X, g, B, acc, xs, t);
 }
 
 // grid: persistent blocks of W = THREADS / 32 warps. Item it = (group, slice): the group's W tiles
@@ -187,10 +221,20 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
     const uint2* tab = table;
 #endif
     const float ys = yscale[0];
+#if XS
+    uint2* xs = stab + (SMEM ? table_n : 0);
+#else
+    const uint2* xs = nullptr;
+#endif
     for (; it < nitems; it += istride) {
         const int grp = it / S, sl = it - grp * S;
         const int tile = grp * W + warp;
+#if XS
+        const bool active = tiles[tile * 16] >= 0;   // padding warps still take part in the X staging
+#else
         if (tiles[tile * 16] < 0) continue;     // all-padding tile (book padding): no work, no output
+        const bool active = true;
+#endif
         const int r0 = tiles[tile * 16 + g], r1 = tiles[tile * 16 + g + 8];
 #if TILE
         // tiles are single-book: book_off holds each tile's table offset
@@ -209,14 +253,20 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
         const int u0 = sl * NUNITS / S, u1 = (sl + 1) * NUNITS / S;
         #pragma unroll 1
         for (int u = u0; u < u1; ++u) {
+#if XS
+            __syncthreads();                     // previous unit's slice fully read
+            load_xs(X, xs, u, B);
+            __syncthreads();
+#endif
+            if (!active) continue;
             if (u < NFULL * 8) {
                 const int bb = u >> 3, L = 4 * (u & 7) + t;
 #if TILE
-                unit_t<16, NWB>(wtl + u * 2 * NWB * 32, 2 * (bb * 256 + L), tab0, tab1, X, g, B, acc);
+                unit_t<16, NWB>(wtl + u * 2 * NWB * 32, 2 * (bb * 256 + L), tab0, tab1, X, g, B, acc, xs, t);
 #else
                 const int off = bb * 32 * NWB;
                 unit<16, NWB, false>(wb0 ? wb0 + off : nullptr, wb1 ? wb1 + off : nullptr, L, 2 * (bb * 256 + L),
-                                     tab0, tab1, X, g, B, acc);
+                                     tab0, tab1, X, g, B, acc, xs, t);
 #endif
             }
 #if JT > 0
@@ -224,15 +274,16 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
                 const int L = 4 * (u - NFULL * 8) + t;
 #if TILE
                 unit_t<JT * 2, NWT>(wtl + (NFULL * 8 * 2 * NWB + (u - NFULL * 8) * 2 * NWT) * 32, 2 * (NFULL * 256 + L),
-                                    tab0, tab1, X, g, B, acc);
+                                    tab0, tab1, X, g, B, acc, xs, t);
 #else
                 const int off = NFULL * 32 * NWB;
                 unit<JT * 2, NWT, true>(wb0 ? wb0 + off : nullptr, wb1 ? wb1 + off : nullptr, L,
-                                        2 * (NFULL * 256 + L), tab0, tab1, X, g, B, acc);
+                                        2 * (NFULL * 256 + L), tab0, tab1, X, g, B, acc, xs, t);
 #endif
             }
 #endif
         }
+        if (!active) continue;
         if (S > 1) {
             #pragma unroll
             for (int nb = 0; nb < NB8; ++nb) {
@@ -476,20 +527,23 @@ BMAX = 32
 TILE_PAD = 8        # tiles per book padded to a multiple of this (RunsBatch warps must divide it)
 
 
+BMAX_XS = 128      # X staged in shared memory (xs=True): larger batches fit
+
+
 def _nb8(B: int) -> int:
-    assert 1 <= B <= BMAX, f"batch {B} outside 1..{BMAX}"
+    assert 1 <= B <= BMAX_XS, f"batch {B} outside 1..{BMAX_XS}"
     return (B + 7) // 8
 
 
-def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False, tile=False):
+def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False, tile=False, xs=False):
     import cupy as cp
     from .proto_runs import geometry
     nfull, jt = geometry(nch)
-    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile)
+    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile, xs)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define NB8 {nb8}\n"
                f"#define SMEM {int(smem)}\n#define BOOKS {int(books)}\n#define THREADS {threads}\n"
-               f"#define ACC16 {int(acc16)}\n#define TILE {int(tile)}\n") + _COMMON + _SRC_RUNS
+               f"#define ACC16 {int(acc16)}\n#define TILE {int(tile)}\n#define XS {int(xs)}\n") + _COMMON + _SRC_RUNS
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs_b")
     return _mods[key]
 
@@ -572,10 +626,11 @@ class RunsBatch:
     RunsLinear) whose warp loads are contiguous: ~1.5-2x faster at small B on an RTX 2060."""
 
     def __init__(self, rl, bmax: int = BMAX, warps: int = 8, bps: int = 2, max_split: int = 8,
-                 table: str = "auto", acc16: bool = False, layout: str = "lane"):
+                 table: str = "auto", acc16: bool = False, layout: str = "lane", xs: bool = False):
         from . import proto_runs as pr
         assert not rl.has_mask, "batched runs kernel: one column order (M = 1) only"
-        self.rl, self.R, self.C, self.bmax = rl, rl.R, rl.nch * 4, bmax
+        assert bmax <= (BMAX_XS if xs else BMAX), f"bmax {bmax} over {BMAX_XS if xs else BMAX} (xs={xs})"
+        self.rl, self.R, self.C, self.bmax, self.xs = rl, rl.R, rl.nch * 4, bmax, xs
         dev = rl.words.device
         K = 1 << rl.bits
         G = rl.table.shape[0] // K
@@ -634,8 +689,11 @@ class RunsBatch:
         B = X.shape[0] if B is None else B
         assert B <= self.bmax and X.is_contiguous() and X.dtype == torch.float16
         tile = self.layout == "tile"
-        fn = _runs_fn(rl.bits, rl.nch, _nb8(B), self.smem, self.books, self.threads, self.acc16, tile)
-        shm = self.table_bytes if self.smem else 0
+        nb8 = _nb8(B)
+        fn = _runs_fn(rl.bits, rl.nch, nb8, self.smem, self.books, self.threads, self.acc16, tile, self.xs)
+        shm = (self.table_bytes if self.smem else 0) + (nb8 * 8 * 64 * 8 if self.xs else 0)
+        if shm > 48 * 1024:
+            fn.max_dynamic_shared_size_bytes = shm
         K = 1 << rl.bits
         words, boff = (self.wt, self.tile_off) if tile else (rl.words, rl.book_off)
         args = (cp.uint64(words.data_ptr()), cp.uint64(rl.table.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),

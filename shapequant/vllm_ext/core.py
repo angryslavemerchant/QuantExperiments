@@ -82,7 +82,7 @@ class _Scratch:
 
 
 class PackedShards:
-    def __init__(self, rls: list, *, bmax: int = BMAX, layout: str = "tile", warps: int = 8, bps: int = 2,
+    def __init__(self, rls: list, *, bmax: int = BMAX, layout: str = "tile", warps: int = 8, bps: int = 2, xs: bool = False,
                  max_split: int = 8, large: str = "dequant", chunk_bytes: int = 24 << 20):
         # large-M path: "dequant" (whole matrix to scratch + GEMM), "chunked" (L2-sized row chunks,
         # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
@@ -104,7 +104,8 @@ class PackedShards:
         self.R = sum(self.Rs)
         self.offs = [sum(self.Rs[:i]) for i in range(len(rls))]
         self.bmax = bmax
-        self.launchers = [br.RunsBatch(rl, bmax=bmax, warps=warps, bps=bps, max_split=max_split, layout=layout)
+        # xs: X staged in shared memory, bmax up to 128 (kernels.batched_runs)
+        self.launchers = [br.RunsBatch(rl, bmax=bmax, warps=warps, bps=bps, max_split=max_split, layout=layout, xs=xs)
                           for rl in rls]
         # the batched kernel writes Y [B, R_piece] contiguous: one buffer per piece, then a copy
         # into the stacked output (skipped for a single piece)

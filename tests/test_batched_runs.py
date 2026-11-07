@@ -100,3 +100,20 @@ def test_tune_runs():
     lb = br.RunsBatch(rls[0], warps=w, bps=b, max_split=m, layout="tile")
     Y = lb.run(X, torch.empty(5, 256, dtype=torch.float16, device="cuda"))
     assert _close(Y, _ref(rls[0], X)) < 2e-3
+
+
+# xs: X staged in shared memory (swizzled), batches up to 128
+@pytest.mark.parametrize("R,C", [(300, 2048), (128, 256), (1040, 5120)])
+@pytest.mark.parametrize("bits,G", [(8, 4), (10, 1), (12, 4)])
+@pytest.mark.parametrize("layout", ["lane", "tile"])
+def test_runs_xs_matches_batch1(R, C, bits, G, layout):
+    lin, tags = _lin(R, C, bits, G=G, M=1)
+    rl = proto_runs.RunsLinear(lin, tags, 1)
+    X = (torch.randn(128, C, device="cuda") * 2).half()
+    ref = _ref(rl, X)
+    for split in (1, 4):
+        lb = br.RunsBatch(rl, bmax=128, layout=layout, xs=True, max_split=split)
+        for B in (1, 7, 32, 33, 64, 100, 128):
+            Y = torch.full((B, R), float("nan"), dtype=torch.float16, device="cuda")
+            lb.run(X[:B].contiguous(), Y)
+            assert _close(Y, ref[:B]) < 2e-3, (layout, split, B)

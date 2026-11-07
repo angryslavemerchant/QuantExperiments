@@ -1,6 +1,7 @@
-"""Per-matrix time of the three ways to multiply M activation rows by a packed matrix, for the
-vLLM plugin's large-M branch: chunked batched run kernel (32 rows per launch), GPU dequant + fp16
-cuBLAS GEMM, fused dequant-GEMM (kernels.runs_gemm); plus the bf16 dense GEMM a stock engine does.
+"""Per-matrix time (L2-cold, CUDA-graph replay) of the ways to multiply M activation rows by a packed
+matrix: batched run kernel (32 rows per launch), the same with X staged in shared memory (xs; up
+to 128 rows per launch, 4 or 8 warps per block), fused dequant-GEMM (kernels.runs_gemm), optionally
+GPU dequant + fp16 GEMM; plus the bf16 dense GEMM a stock engine does.
 
   python scripts/bench_mid_batch.py --packed FILE --names model.layers.0.mlp.gate_proj,model.layers.0.mlp.down_proj
 """
@@ -67,7 +68,7 @@ def main() -> int:
     ap.add_argument("--packed", required=True)
     ap.add_argument("--names", required=True)
     ap.add_argument("--Ms", default="1,8,32,48,64,96,128,192,256,512,1024")
-    ap.add_argument("--chunks-mb", default="2,8,16,32,64", help="L2-chunked dequant chunk sizes")
+    ap.add_argument("--slow", action="store_true", help="also dequant + GEMM")
     ap.add_argument("--out")
     a = ap.parse_args()
     from shapequant.kernels import batched_runs as br, cuda_dequant, runs_gemm
@@ -79,47 +80,29 @@ def main() -> int:
         rl = runs_linear(pf, name).rl
         R, C = rl.R, rl.nch * 4
         lb = br.RunsBatch(rl, bmax=32, layout="tile")
-        scratch = torch.empty(R * C, dtype=torch.float16, device="cuda")
+        lbx = {w: br.RunsBatch(rl, bmax=128, layout="tile", xs=True, warps=w) for w in (4, 8)}
         Wd = cuda_dequant.dequant(rl).clone().view(R, C).to(torch.bfloat16)
         for M in map(int, a.Ms.split(",")):
             x = torch.randn(M, C, device="cuda").half()
             xb = x.to(torch.bfloat16)
             y = torch.empty(M, R, dtype=torch.float16, device="cuda")
-            yc = [torch.empty(min(32, M - s), R, dtype=torch.float16, device="cuda") for s in range(0, M, 32)]
-            xc = [x[s:s + 32].contiguous() for s in range(0, M, 32)]
 
-            def chunked():
-                for xi, yi in zip(xc, yc):
-                    lb.run(xi, yi, xi.shape[0])
-
-            def deq():
-                w = cuda_dequant.dequant(rl, scratch).view(R, C)
-                torch.matmul(x, w.t(), out=y)
-
-            def fused():
-                runs_gemm.gemm(x, [rl], out=y)
-
-            def fused1():
-                runs_gemm.gemm(x, [rl], out=y, split=1)
-
-            from shapequant.vllm_ext.core import PackedShards
-            chunked_l2 = {}
-            for mb in map(int, a.chunks_mb.split(",")):
-                ps = PackedShards([rl], large="chunked", chunk_bytes=mb << 20)
-                chunked_l2[mb] = timeit(lambda: ps._large_chunked(x))
-
-            def bf16():
-                torch.matmul(xb, Wd.t())
+            def chunks(launcher, n):
+                xc = [x[s:s + n].contiguous() for s in range(0, M, n)]
+                yc = [torch.empty(xi.shape[0], R, dtype=torch.float16, device="cuda") for xi in xc]
+                return lambda: [launcher.run(xi, yi, xi.shape[0]) for xi, yi in zip(xc, yc)]
 
             r = {"name": name, "R": R, "C": C, "bits": rl.bits, "M": M,
-                 "chunked_us": timeit(chunked), "dequant_gemm_us": timeit(deq),
-                 "fused_us": timeit(fused) if runs_gemm.supported(rl) else None,
-                 "fused_nosplit_us": timeit(fused1) if runs_gemm.supported(rl) else None,
-                 "chunked_l2_us": chunked_l2, "bf16_us": timeit(bf16)}
+                 "batched_us": timeit(chunks(lb, 32)),
+                 **{f"xs_w{w}_us": timeit(chunks(l, 128)) for w, l in lbx.items()},
+                 "fused_us": timeit(lambda: runs_gemm.gemm(x, [rl], out=y)) if runs_gemm.supported(rl) else None,
+                 "bf16_us": timeit(lambda: torch.matmul(xb, Wd.t()))}
+            if a.slow:
+                scratch = torch.empty(R * C, dtype=torch.float16, device="cuda")
+                r["dequant_gemm_us"] = timeit(lambda: torch.matmul(x, cuda_dequant.dequant(rl, scratch).view(R, C).t(), out=y))
             rows.append(r)
-            print(f"{name.split('layers.')[-1]:28s} R={R:6d} C={C:6d} b={rl.bits:2d} M={M:5d}  chunked {r['chunked_us']:8.1f}  "
-                  f"deq+gemm {r['dequant_gemm_us']:8.1f}  fused {r['fused_us'] or float('nan'):8.1f}  "
-                  f"l2chunk {' '.join(f'{k}MB:{v:.1f}' for k, v in chunked_l2.items())}  bf16 {r['bf16_us']:8.1f} us",
+            print(f"{name.split('layers.')[-1]:26s} R={R:6d} C={C:6d} b={rl.bits:2d} M={M:4d}  " +
+                  "  ".join(f"{k[:-3]} {v:7.1f}" for k, v in r.items() if k.endswith("_us") and v is not None) + " us",
                   flush=True)
     if a.out:
         Path(a.out).write_text(json.dumps({"gpu": torch.cuda.get_device_name(0), "rows": rows}, indent=1))

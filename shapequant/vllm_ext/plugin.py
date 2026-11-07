@@ -46,17 +46,21 @@ def _resolve(file: str) -> str:
 @register_quantization_config("shapequant")
 class ShapeQuantConfig(QuantizationConfig):
     def __init__(self, packed_file: str, bmax: int = core.BMAX, layout: str = "tile", large: str = "dequant",
-                 chunk_mb: int = 24):
+                 chunk_mb: int = 24, xs: bool = False, warps: int = 8):
         super().__init__()
         self.packed_file, self.bmax, self.layout = packed_file, bmax, layout
-        # SHAPEQUANT_LARGE / SHAPEQUANT_CHUNK_MB override the checkpoint's choice (benchmarking)
+        # SHAPEQUANT_LARGE / SHAPEQUANT_CHUNK_MB / SHAPEQUANT_BMAX / SHAPEQUANT_XS / SHAPEQUANT_WARPS
+        # override the checkpoint's choice (benchmarking)
+        self.bmax = int(os.environ.get("SHAPEQUANT_BMAX", bmax))
+        self.xs = os.environ.get("SHAPEQUANT_XS", "1" if xs else "0") == "1"
+        self.warps = int(os.environ.get("SHAPEQUANT_WARPS", warps))
         self.large = os.environ.get("SHAPEQUANT_LARGE", large)
         self.chunk_mb = int(os.environ.get("SHAPEQUANT_CHUNK_MB", chunk_mb))
         self._pf = None
 
     def __repr__(self) -> str:
         return (f"ShapeQuantConfig(packed_file={self.packed_file!r}, bmax={self.bmax}, large={self.large!r}, "
-                f"chunk_mb={self.chunk_mb})")
+                f"chunk_mb={self.chunk_mb}, xs={self.xs}, warps={self.warps})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -78,7 +82,8 @@ class ShapeQuantConfig(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "ShapeQuantConfig":
         return cls(packed_file=config["packed_file"], bmax=int(config.get("bmax", core.BMAX)),
                    layout=config.get("layout", "tile"), large=config.get("large", "dequant"),
-                   chunk_mb=int(config.get("chunk_mb", 24)))
+                   chunk_mb=int(config.get("chunk_mb", 24)), xs=bool(config.get("xs", False)),
+                   warps=int(config.get("warps", 8)))
 
     @property
     def pf(self):
@@ -108,7 +113,8 @@ class ShapeQuantLinearMethod(LinearMethodBase):
         dev = torch.device("cuda", torch.cuda.current_device())
         ps = core.PackedShards.from_packed(self.cfg.pf, self.pieces, dev=dev, bmax=self.cfg.bmax,
                                            layout=self.cfg.layout, large=self.cfg.large,
-                                           chunk_bytes=self.cfg.chunk_mb << 20)
+                                           chunk_bytes=self.cfg.chunk_mb << 20, xs=self.cfg.xs,
+                                           warps=self.cfg.warps)
         if ps.C != input_size or ps.R != output_size:
             raise ValueError(f"{self.prefix}: packed pieces are [{ps.R}, {ps.C}], vLLM layer is "
                              f"[{output_size}, {input_size}] (partitions {output_partition_sizes})")
