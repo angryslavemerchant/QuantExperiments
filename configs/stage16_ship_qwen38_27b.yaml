@@ -1,0 +1,48 @@
+# Stage 16: the shipped Qwen3.8-27B 2.5 bpw model. s14_25's allocation and compression (pre-ft KL
+# 0.13847, reproduced by stage 15a), then the stage 15a fine-tune (lr 3x lower than stage 14, fresh
+# fineweb data seen once, keep-best on held-out fineweb; 15a's held-out KL fell 15% on fineweb and
+# 10% on wikitext-train by step 256 vs ~2% for the stage 14 fine-tune), exported self-contained
+# (8-bit head + 4-bit embedding) outside artifacts/ and uploaded to a private HF repo.
+# Run: python scripts/run_experiment.py --config configs/stage16_ship_qwen38_27b.yaml
+stage: 16
+output_dir: artifacts/qwen38_27b/stage16
+model: Qwen/Qwen3.8-27B
+reference_dtype: bfloat16
+seed: 0
+
+eval:
+  logit_chunk: 128
+  wikitext:
+    dataset: Salesforce/wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    context: 2048
+    num_windows: 49        # 49 x 2,048 = ~100k tokens
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+  deploy:
+    - {name: h8e4, head: 8, embed: 4}
+
+calibration:
+  dataset: HuggingFaceFW/fineweb-edu
+  subset: sample-10BT
+  split: train
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+
+allocation:
+  d: 4
+  Ks: [256, 1024, 4096]
+  fisher_sequences: 32     # 32 x 2,048 calibration tokens, as 64 x 1,024
+  fisher_seq_len: 1024
+  proxy_iters: 10
+  proxy_fit_chunks: 250000
+
+kmeans:
+  iters: 25
+  refit_iters: 10
+  max_fit_chunks: 1000000
+  assign_batch: 32768
+
+runs:
+  - {name: s16_25, method: stack, d: 4, alloc_file: configs/alloc/qwen38_27b_s14_25.json, G: 4, M: 1, rounds: 2, select_frac: 1.0, ldlq: true, ldlq_damp: 0.1, gsm8k: false, export: true, export_dir: /workspace/packed_out, upload: {repo: Qwen3.8-27B-shapequant-2.5bpw, private: true}, finetune: {steps: 512, seq_len: 1024, lr_books: 3.0e-5, lr_gain: 3.0e-4, log_every: 32, sequences: 256, heldout: {fineweb: 12, wikitext_train: 12}, heldout_every: 128, keep_best: fineweb}}

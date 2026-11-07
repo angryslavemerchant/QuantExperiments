@@ -474,6 +474,7 @@ def main() -> int:
             if run.get("export"):
                 # export_dir: outside artifacts/ for files too big to recover (uploaded instead)
                 packed_path = Path(run.get("export_dir", out_dir / "packed")) / f"{name}_ft.safetensors"
+                packed_path.parent.mkdir(parents=True, exist_ok=True)
                 summary = export_packed(fits, packed_path, cfg, f"{name}_ft", log, model)
             del teacher, fits
             torch.cuda.empty_cache()
