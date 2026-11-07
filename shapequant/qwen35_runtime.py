@@ -374,11 +374,21 @@ def attach_prefill(eng: Qwen35Engine) -> None:
 
 
 @torch.no_grad()
-def prefill(eng: Qwen35Engine, tokens, logits: str = "last") -> torch.Tensor:
+def prefill(eng: Qwen35Engine, tokens, logits: str = "last", impl: str | None = None,
+            gemm: str | None = None) -> torch.Tensor:
     """Run tokens through the engine at its current position in one pass (conv / recurrent /
-    KV states continue from eng's). DeltaNet layers use HF's chunked gated delta rule
-    (torch_chunk_gated_delta_rule), attention SDPA. logits: "last" -> fp32 [vocab], "all" ->
-    fp32 [T, vocab]. Leaves eng.pos += T, eng.tok = argmax of the last row, eng.logits = last row."""
+    KV states continue from eng's). logits: "last" -> fp32 [vocab], "all" -> fp32 [T, vocab].
+    Leaves eng.pos += T, eng.tok = argmax of the last row, eng.logits = last row.
+    impl: "fast" (default, prefill.IMPL) = shapequant.qwen35_prefill (fused kernels, grouped GEMMs,
+    chunked DeltaNet scan kernel; gemm "dequant" | "fused" as in prefill.prefill); "ref" = the
+    torch path below: HF's chunked gated delta rule (torch_chunk_gated_delta_rule), fp32 SDPA."""
+    from . import prefill as pre
+    impl = impl or pre.IMPL
+    if impl == "fast":
+        from . import qwen35_prefill
+        return qwen35_prefill.prefill(eng, tokens, logits, gemm or pre.GEMM)
+    if impl != "ref":
+        raise ValueError(f"impl {impl!r}: 'fast' | 'ref'")
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
     from .prefill import _head
     c = eng.cfg
