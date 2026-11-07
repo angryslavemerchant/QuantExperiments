@@ -40,13 +40,15 @@ def _single(eng, prompt, n):
 
 
 @pytest.mark.parametrize("hv", [4, 2])
-@pytest.mark.parametrize("B,layout", [(1, "tile"), (3, "tile"), (8, "tile"), (5, "lane")])
-def test_batch_matches_single(engines, hv, B, layout):
+@pytest.mark.parametrize("B,layout,attn", [(1, "tile", "auto"), (3, "tile", "auto"), (8, "tile", "auto"),
+                                           (5, "lane", "heads"), (2, "tile", "gqa1"), (4, "tile", "gqa3")])
+def test_batch_matches_single(engines, hv, B, layout, attn):
     eng = engines[hv]
     T, n = 9, 8
     prompts = _prompts(B, T, seed=B + hv)
     ref = [_single(eng, p, n) for p in prompts]
-    beng = qb.Qwen35BatchEngine(eng, B, layout=layout)
+    ns = int(attn[3:]) if attn.startswith("gqa") else None    # gqa1: single pass, gqa3: 3 slices + combine
+    beng = qb.Qwen35BatchEngine(eng, B, layout=layout, attn=attn[:3] if ns else attn, nsplit=ns)
     lg = qb.feed_batch(beng, prompts, keep_logits=True)
     toks = [[int(t)] for t in beng.tok.tolist()]
     for _ in range(n - 1):

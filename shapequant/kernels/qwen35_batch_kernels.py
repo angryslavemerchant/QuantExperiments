@@ -155,6 +155,99 @@ extern "C" __global__ void __launch_bounds__(256) attn_b(const float* qr, const 
         out[h * HD + d] = __float2half(O / L * sigm(__half2float(qg[h * 2 * HD + HD + d])));
     }
 }
+
+// GQA-sharing flash decoding: grid (NKV * nsplit, B), 128 threads (4 warps). Block (kvh, split) reads
+// its kv head's K / V rows for one slice of the positions once, for all REP = NH / NKV query heads
+// of the group (attn_b reads them once per query head). Warp w takes positions p0 + w, p0 + w + 4, ...;
+// online softmax per head, merged over the warps in shared memory. nsplit == 1: final output (times
+// sigmoid(gate)); else partials (m, l, o) to pm / pl [B, NKV, nsplit, REP], po [.., HD], merged by
+// attn_comb_b.
+#define REP (NH / NKV)
+extern "C" __global__ void __launch_bounds__(128) attn_gqa_b(const float* qr, const __half* qg, const __half* kc,
+        const __half* vc, const long long* pos_p, int maxlen, int nsplit, float* pm, float* pl, float* po,
+        __half* out) {
+    constexpr int PL = HD / 32;
+    __shared__ float wm[4][REP], wl[4][REP];
+    __shared__ float wo[4][REP][HD];
+    const int kvh = blockIdx.x / nsplit, sp = blockIdx.x - kvh * nsplit;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const size_t bb = blockIdx.y;
+    qr += bb * NH * HD; qg += bb * NH * 2 * HD; out += bb * NH * HD;
+    const __half* K = kc + (bb * NKV + kvh) * maxlen * HD;
+    const __half* V = vc + (bb * NKV + kvh) * maxlen * HD;
+    const int n = (int)pos_p[bb] + 1, chunk = (n + nsplit - 1) / nsplit;
+    const int p0 = sp * chunk, p1 = min(n, p0 + chunk);
+    float q[REP][PL], acc[REP][PL], m[REP], l[REP];
+    #pragma unroll
+    for (int r = 0; r < REP; ++r) {
+        m[r] = -1e30f; l[r] = 0.f;
+        #pragma unroll
+        for (int j = 0; j < PL; ++j) { q[r][j] = qr[(kvh * REP + r) * HD + lane * PL + j] * rsqrtf((float)HD); acc[r][j] = 0.f; }
+    }
+    for (int p = p0 + w; p < p1; p += 4) {
+        float kf[PL], vf[PL];
+        #pragma unroll
+        for (int j = 0; j < PL; j += 2) {
+            const float2 a = __half22float2(*(const __half2*)(K + (size_t)p * HD + lane * PL + j));
+            const float2 b = __half22float2(*(const __half2*)(V + (size_t)p * HD + lane * PL + j));
+            kf[j] = a.x; kf[j + 1] = a.y; vf[j] = b.x; vf[j + 1] = b.y;
+        }
+        #pragma unroll
+        for (int r = 0; r < REP; ++r) {
+            float d = 0.f;
+            #pragma unroll
+            for (int j = 0; j < PL; ++j) d += q[r][j] * kf[j];
+            d = warp_sum(d);
+            const float mn = fmaxf(m[r], d), c = __expf(m[r] - mn), e = __expf(d - mn);
+            l[r] = l[r] * c + e;
+            #pragma unroll
+            for (int j = 0; j < PL; ++j) acc[r][j] = acc[r][j] * c + e * vf[j];
+            m[r] = mn;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < REP; ++r) {
+        if (lane == 0) { wm[w][r] = m[r]; wl[w][r] = l[r]; }
+        #pragma unroll
+        for (int j = 0; j < PL; ++j) wo[w][r][lane * PL + j] = acc[r][j];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < REP * HD; i += 128) {
+        const int r = i / HD, d = i - r * HD;
+        float M = -1e30f;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) M = fmaxf(M, wm[k][r]);
+        float L = 0.f, O = 0.f;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { const float c = __expf(wm[k][r] - M); L += wl[k][r] * c; O += wo[k][r][d] * c; }
+        const int h = kvh * REP + r;
+        if (nsplit == 1) {
+            out[h * HD + d] = __float2half(O / L * sigm(__half2float(qg[h * 2 * HD + HD + d])));
+        } else {
+            const size_t pi = ((bb * NKV + kvh) * nsplit + sp) * REP + r;
+            if (d == 0) { pm[pi] = M; pl[pi] = L; }
+            po[pi * HD + d] = O;
+        }
+    }
+}
+
+// grid (NH, B), HD threads: merge attn_gqa_b's nsplit partials of head h
+extern "C" __global__ void attn_comb_b(const __half* qg, int nsplit, const float* pm, const float* pl,
+                                       const float* po, __half* out) {
+    const int h = blockIdx.x, d = threadIdx.x, kvh = h / REP, r = h - kvh * REP;
+    const size_t bb = blockIdx.y;
+    const size_t base = (bb * NKV + kvh) * nsplit;
+    float M = -1e30f;
+    for (int s = 0; s < nsplit; ++s) M = fmaxf(M, pm[(base + s) * REP + r]);
+    float L = 0.f, O = 0.f;
+    for (int s = 0; s < nsplit; ++s) {
+        const size_t pi = (base + s) * REP + r;
+        const float c = __expf(pm[pi] - M);
+        L += pl[pi] * c;
+        O += po[pi * HD + d] * c;
+    }
+    out[bb * NH * HD + h * HD + d] = __float2half(O / L * sigm(__half2float(qg[bb * NH * 2 * HD + h * 2 * HD + HD + d])));
+}
 """
 
 _mods: dict = {}

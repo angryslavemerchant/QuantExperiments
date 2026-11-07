@@ -15,7 +15,8 @@ batch-1 step with a batch dimension everywhere:
     in_proj_a / in_proj_b projections as one fp32 GEMM for the batch;
   - greedy argmax per sequence; the whole step CUDA-graph capturable (capture() per engine, i.e.
     per B).
-B = 1 runs the batch-1 kernels throughout (bit-identical to Qwen35Engine). For B > 1 the
+B = 1 runs the batch-1 kernels throughout (bit-identical to Qwen35Engine; batch1_kernels=False
+uses the batched ones). For B > 1 the
 linears accumulate in fp32 (the batch-1 run kernel partially in fp16), so logits match the
 batch-1 engine to fp16 rounding, not bitwise.
 
@@ -38,10 +39,13 @@ class Qwen35BatchEngine:
     words (made once per matrix and shared by all batch engines: a second copy of the block
     weights, the batch-1 engine keeps its own), "lane" reads the batch-1 words in place (no extra
     memory, slower). head_loop_max: batch sizes up to this run the batch-1 q8 head kernel once per
-    sequence (else a tile-major copy of the head). warps / bps / max_split / acc16: RunsBatch."""
+    sequence (else a tile-major copy of the head). warps / bps / max_split / acc16: RunsBatch.
+    attn: "gqa" / "heads" / "auto" (gqa for B > 1); nsplit: gqa position slices (None: ~2 blocks
+    per SM)."""
 
     def __init__(self, eng: Qwen35Engine, B: int, *, layout: str = "tile", head_loop_max: int = 1, warps: int = 8,
-                 bps: int = 2, max_split: int = 8, acc16: bool = False):
+                 bps: int = 2, max_split: int = 8, acc16: bool = False, attn: str = "auto",
+                 nsplit: int | None = None, batch1_kernels: bool = True):
         from .kernels import batched_runs as br
         from .kernels import qwen35_kernels as qk
         c = eng.cfg
@@ -51,6 +55,11 @@ class Qwen35BatchEngine:
             raise ValueError(f"B = {B} outside 1..{br.BMAX}")
         self.eng, self.cfg, self.B, self.layers = eng, c, B, eng.layers
         self.embed, self.lm_head, self.final_norm = eng.embed, eng.lm_head, eng.final_norm
+        self.batched = B > 1 or not batch1_kernels      # batched kernels (else B = 1 on the batch-1 ones)
+        if not self.batched:
+            head_loop_max = max(head_loop_max, 1)
+        elif B == 1:
+            head_loop_max = 0
         self.head_loop_max = head_loop_max
         self.qhead = None       # tile-major copy of the q8 head (kernels.batched_runs.Q8Batch), shared per head
         if B > head_loop_max and isinstance(eng.lm_head, de.Q8Lin) and eng.lm_head.C % 64 == 0:
@@ -82,8 +91,21 @@ class Qwen35BatchEngine:
         # per linear-attention layer: [in_proj_a; in_proj_b]^T (fp32 [hidden, 2 hv]) for one GEMM
         self.wabT = {i: torch.cat([L["wa"], L["wb"]]).T.contiguous() for i, L in enumerate(eng.layers)
                      if c.layer_types[i] == "linear_attention"}
+        # attention: "gqa" (one block per kv head and position slice for all its query heads, then a
+        # combine pass; default for B > 1) or "heads" (block per query head: the batch-1 kernel's scheme)
+        rep = c.n_heads // c.n_kv
+        gqa_ok = 4 * rep * c.head_dim * 4 <= 40 * 1024
+        self.attn = ("gqa" if self.batched and gqa_ok else "heads") if attn == "auto" else attn
+        if self.attn == "gqa":
+            if not gqa_ok:
+                raise ValueError("attn='gqa': too many query heads per kv head for its shared memory")
+            sms = torch.cuda.get_device_properties(dev).multi_processor_count
+            self.nsplit = nsplit or max(1, min(-(-2 * sms // (c.n_kv * B)), c.max_len // 64))
+            npart = B * c.n_kv * self.nsplit * rep
+            self.pm, self.pl = torch.zeros(npart, **f32), torch.zeros(npart, **f32)
+            self.po = torch.zeros(npart * c.head_dim, **f32)
         self.blin = None
-        if B > 1:
+        if self.batched:
             self.blin = [{k: br.RunsBatch(v.rl, bmax=B, warps=warps, bps=bps, max_split=max_split, layout=layout,
                                           acc16=acc16)
                           for k, v in L.items() if isinstance(v, de.RunsLin)} for L in eng.layers]
@@ -146,7 +168,7 @@ class Qwen35BatchEngine:
                 self._k("conv_step_b", ((self.conv_dim + 255) // 256, B), 256,
                         (P(qkv), P(self.conv[jl]), P(L["convw"]), cp.int32(self.conv_dim), P(self.u)))
                 o = self.o16[:B * c.hv * c.dv]
-                if B == 1:      # the batch-1 kernel (a / b projections in-kernel): bit-identical
+                if not self.batched:    # the batch-1 kernel (a / b projections in-kernel): bit-identical
                     self._k("delta_step", (c.hv,), c.dv,
                             (P(self.u), P(z), P(self.x16), P(L["wa"]), P(L["wb"]), P(L["A"]), P(L["dt_bias"]),
                              P(L["gnorm"]), P(self.S[jl]), cp.int32(c.hidden), cp.float32(c.eps), P(o)))
@@ -166,8 +188,17 @@ class Qwen35BatchEngine:
                 self._k("attn_prep_b", (c.n_heads + c.n_kv, B), c.head_dim,
                         (P(qg), P(k), P(v), P(L["qn"]), P(L["kn"]), P(self.inv_freq), P(self.pos),
                          cp.float32(c.eps), P(self.qr), P(self.kc[ja]), P(self.vc[ja]), cp.int32(c.max_len)))
-                self._k("attn_b", (c.n_heads, B), 256, (P(self.qr), P(qg), P(self.kc[ja]), P(self.vc[ja]),
-                                                       P(self.pos), cp.int32(c.max_len), P(o)))
+                if self.attn == "gqa":
+                    ns = self.nsplit
+                    self._k("attn_gqa_b", (c.n_kv * ns, B), 128,
+                            (P(self.qr), P(qg), P(self.kc[ja]), P(self.vc[ja]), P(self.pos), cp.int32(c.max_len),
+                             cp.int32(ns), P(self.pm), P(self.pl), P(self.po), P(o)))
+                    if ns > 1:
+                        self._k("attn_comb_b", (c.n_heads, B), c.head_dim,
+                                (P(qg), cp.int32(ns), P(self.pm), P(self.pl), P(self.po), P(o)))
+                else:
+                    self._k("attn_b", (c.n_heads, B), 256, (P(self.qr), P(qg), P(self.kc[ja]), P(self.vc[ja]),
+                                                           P(self.pos), cp.int32(c.max_len), P(o)))
                 add = self._lin(i, "o", o.view(B, -1), "c")
                 ja += 1
             self._addnorm(add, L["ln2"])
@@ -224,10 +255,10 @@ class Qwen35BatchEngine:
         return sum(t.numel() * t.element_size() for t in (self.conv, self.S, self.kc, self.vc))
 
     @torch.no_grad()
-    def time_steps(self, n: int = 64, ctx: int = 0, reps: int = 3) -> float:
+    def time_steps(self, n: int = 64, ctx: int = 0, reps: int = 3, stat: str = "median") -> float:
         """Seconds per batched step (graph replay), averaged over n steps starting at position
         ctx for every sequence (the states are not meaningful: speed only; attention cost grows
-        with ctx). Median of reps."""
+        with ctx). stat: "median" or "min" of reps."""
         if ctx + n > self.cfg.max_len:
             raise ValueError("ctx + n exceeds max_len")
         if self.graph is None:
@@ -244,7 +275,7 @@ class Qwen35BatchEngine:
             b.record()
             torch.cuda.synchronize()
             ts.append(a.elapsed_time(b) / 1e3 / n)
-        return sorted(ts)[len(ts) // 2]
+        return min(ts) if stat == "min" else sorted(ts)[len(ts) // 2]
 
 
 @torch.no_grad()
