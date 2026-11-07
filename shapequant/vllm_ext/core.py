@@ -21,6 +21,7 @@ handle in, so torch.compile sees an opaque op with a known output shape).
 
 from __future__ import annotations
 
+import contextlib
 import re
 
 import torch
@@ -50,6 +51,20 @@ def packed_pieces(prefix: str, names) -> list[str] | None:
     if any(have):
         raise ValueError(f"{prefix}: only some of its pieces are packed ({pieces})")
     return None
+
+
+@contextlib.contextmanager
+def neutral_defaults():
+    """torch's stock defaults (CPU device, float32) for building the kernels' tensors: vLLM
+    constructs models under a CUDA default device and a bf16 default dtype, while the packed-file
+    loaders create their CPU / fp32 temporaries without naming a device or dtype."""
+    dt = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.device("cpu"):
+            yield
+    finally:
+        torch.set_default_dtype(dt)
 
 
 class _Scratch:
@@ -98,7 +113,8 @@ class PackedShards:
     @classmethod
     def from_packed(cls, pf, names: list[str], dev="cuda", **kw) -> "PackedShards":
         from ..runtime import runs_linear
-        return cls([runs_linear(pf, n, dev=dev).rl for n in names], **kw)
+        with neutral_defaults():
+            return cls([runs_linear(pf, n, dev=dev).rl for n in names], **kw)
 
     def nbytes(self) -> int:
         n = 0

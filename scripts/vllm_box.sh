@@ -48,12 +48,14 @@ for spec in "$@"; do
         --record "$D/export_ref.json" > "$D/export_ref.log" 2>&1 \
       || { log "bf16 export failed"; tail -20 "$D/export_ref.log"; continue; }
   fi
-  log "per-matrix kernel bench (large-M options)"
-  PK=$($PY -c "from huggingface_hub import hf_hub_download as d; r, f = '$src'.split(':', 1); print(d(r, f))")
-  "$VENV/bin/python" scripts/bench_mid_batch.py --packed "$PK" --out "$D/mid_batch.json" --Ms 1,32,64,128,256,512 --chunks-mb 16,48 \
-      --names model.layers.0.mlp.gate_proj,model.layers.0.mlp.down_proj,model.layers.0.linear_attn.in_proj_qkv,model.layers.3.self_attn.o_proj \
-      > "$D/mid_batch.log" 2>&1 || log "mid-batch bench failed"
-  grep -E " M= " "$D/mid_batch.log" | tail -44
+  if [ -z "${SKIP_BENCH:-}" ]; then
+    log "per-matrix kernel bench (large-M options)"
+    PK=$($PY -c "from huggingface_hub import hf_hub_download as d; r, f = '$src'.split(':', 1); print(d(r, f))")
+    "$VENV/bin/python" scripts/bench_mid_batch.py --packed "$PK" --out "$D/mid_batch.json" --Ms 1,32,64,128,256,512 --chunks-mb 16,48 \
+        --names model.layers.0.mlp.gate_proj,model.layers.0.mlp.down_proj,model.layers.0.linear_attn.in_proj_qkv,model.layers.3.self_attn.o_proj \
+        > "$D/mid_batch.log" 2>&1 || log "mid-batch bench failed"
+    grep -E " M= " "$D/mid_batch.log" | tail -44
+  fi
   for mode in ${MODES:-dequant}; do
     log "running ours (plugin, large-M path: $mode)"
     O="$D/ours_$mode"

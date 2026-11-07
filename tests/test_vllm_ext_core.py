@@ -54,3 +54,59 @@ def test_forward_matches_dense(pieces, M, large):
     y2 = core.linear_op(x.view(M, 1, ps.C), h)
     assert y2.shape == (M, 1, ps.R)
     assert torch.equal(y2.view(M, ps.R), y)
+
+
+@needs_gpu
+def test_builds_under_vllm_defaults():
+    """vLLM builds models under a CUDA default device and a bf16 default dtype."""
+    pytest.importorskip("cupy")
+    from shapequant.packed import PackedFile
+    pf = PackedFile(PACKED)
+    names = ["model.layers.0.linear_attn.in_proj_qkv", "model.layers.0.linear_attn.in_proj_z"]
+    dt = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            ps = core.PackedShards.from_packed(pf, names, dev=torch.device("cuda", 0), large="fused")
+    finally:
+        torch.set_default_dtype(dt)
+    assert torch.get_default_dtype() == dt
+    ref = core.PackedShards.from_packed(pf, names)
+    x = torch.randn(40, ps.C, device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(ps.forward(x[:5]), ref.forward(x[:5]))
+    W = ref.dense().float()
+    err = (ps.forward(x).float() - x.half().float() @ W.t()).norm() / (x.half().float() @ W.t()).norm()
+    assert err < 1e-2
+
+
+@needs_gpu
+@pytest.mark.parametrize("large", ["dequant", "fused"])
+def test_custom_op_compiles_and_graph_captures(large):
+    """What vLLM does with the op: dynamo traces it (fullgraph, fake impl gives the shape) and the
+    compiled steps are replayed from CUDA graphs, for small- and large-M batches."""
+    pytest.importorskip("cupy")
+    from shapequant.packed import PackedFile
+    pf = PackedFile(PACKED)
+    ps = core.PackedShards.from_packed(pf, ["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj"], large=large)
+    h = core.register(ps)
+
+    def f(x):
+        return torch.ops.shapequant.linear(x, h).relu()
+
+    fc = torch.compile(f, backend="aot_eager", fullgraph=True, dynamic=True)
+    for M in (1, 8, 40):
+        x = torch.randn(M, ps.C, device="cuda", dtype=torch.bfloat16)
+        want = f(x)
+        assert torch.equal(fc(x), want)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            fc(x)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y = fc(x)
+        x.copy_(torch.randn_like(x))
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(y, f(x))
