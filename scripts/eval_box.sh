@@ -7,7 +7,7 @@
 # in a separate vLLM env. Results: <out_dir>/<name>/summary.json (+ samples, logs).
 set -uo pipefail
 OUT=$1; BASE=$2; shift 2
-PY=${PYTHON:-python}
+PY=${PYTHON:-$(command -v python3 || command -v python)}
 VENV=/workspace/vllm_env
 CK=/workspace/eval_ckpt
 mkdir -p "$OUT" "$CK"
@@ -20,8 +20,8 @@ PREFETCH=$!
 log "building vLLM env"
 (
   $PY -m pip install -q uv &&
-  uv venv "$VENV" --python 3.12 -q &&
-  uv pip install --python "$VENV/bin/python" -q --torch-backend=auto vllm "lm_eval[ifeval,math]==0.4.12" math-verify &&
+  $PY -m uv venv "$VENV" --python "$PY" -q &&
+  $PY -m uv pip install --python "$VENV/bin/python" -q --torch-backend=auto vllm "lm_eval[ifeval,math]==0.4.12" math-verify &&
   "$VENV/bin/python" -c "import vllm, lm_eval, torch; print('vllm', vllm.__version__, 'torch', torch.__version__)"
 ) > "$OUT/vllm_env.log" 2>&1
 RC=$?
