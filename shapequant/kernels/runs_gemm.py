@@ -58,8 +58,9 @@ typedef unsigned int u32;
 #define NWR (NWV > NWS ? NWV : NWS)
 
 struct Ctx {
-    const u32* words; const int* book_off; const __half* x; const int* rmap;
+    const u32* words; const int* book_off; const __half* x;
     int T, R, W, nfull, jt, ldx;
+    const int* rmap;
 };
 
 // k-tile kt -> super-tile s, pair p, lane group g, j (pair index within the super-tile)
