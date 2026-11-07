@@ -79,9 +79,10 @@ def test_gdn_prep_conv():
     assert float(q[:, T:].abs().sum() + g[:, T:].abs().sum() + beta[:, T:].abs().sum()) == 0.0
 
 
+@pytest.mark.parametrize("C", [1000, 1002])          # vectorized / scalar kernels
 @pytest.mark.parametrize("wdt", [torch.float16, torch.float32])
-def test_addnorm_silu(wdt):
-    T, C = 33, 1000
+def test_addnorm_silu(wdt, C):
+    T = 33
     g_ = torch.Generator(device="cuda").manual_seed(1)
     h = torch.randn(T, C, device="cuda", generator=g_)
     add = torch.randn(T, C + 24, device="cuda", generator=g_).half()[:, :C]

@@ -204,26 +204,74 @@ class Group:
             off += n
         return scratch[:self.n].view(self.R, self.C)
 
-    def matmul(self, x: torch.Tensor, scratch: torch.Tensor | None, gemm: str = "dequant") -> torch.Tensor:
-        """x fp16 [T, C] -> fp16 [T, R]."""
-        if gemm == "fused" and self.fused_ok():
-            from .kernels import runs_gemm
-            return runs_gemm.gemm(x, self.runs)
-        return F.linear(x, self.dense(scratch))
 
-
-def group_scratch(eng, groups) -> torch.Tensor:
-    """The engine's fp16 scratch for grouped dequant, sized for its largest group (allocated once)."""
+def group_scratch(eng, groups, nbuf: int = 1) -> torch.Tensor:
+    """The engine's fp16 scratch for grouped dequant: nbuf buffers of its largest group (allocated
+    once, grown on demand). Returns [nbuf, n]."""
     n = max(g.n for L in groups for g in L.values() if isinstance(g, Group))
+    n = (n + 63) // 64 * 64
     s = getattr(eng, "prefill_group_scratch", None)
-    if s is None or s.numel() < n:
+    if s is None or s.numel() < n * nbuf:
         eng.prefill_group_scratch = None
-        s = eng.prefill_group_scratch = torch.empty(n, dtype=torch.float16, device=eng.logits.device)
-    return s
+        s = eng.prefill_group_scratch = torch.empty(n * nbuf, dtype=torch.float16, device=eng.logits.device)
+    return s[:n * nbuf].view(nbuf, n)
 
 
 def needs_scratch(groups, gemm: str) -> bool:
     return gemm != "fused" or not all(g.fused_ok() for L in groups for g in L.values() if isinstance(g, Group))
+
+
+class Gemms:
+    """The fast prefill's GEMMs, called with the groups in a fixed order (seq) per prefill.
+    gemm "dequant": each group decodes into the shared scratch right before its cuBLAS GEMM;
+    "overlap": the next group decodes on a side stream into a second buffer while the current
+    GEMM (and whatever runs between GEMMs) proceeds - same values, the dequant mostly hidden;
+    "fused": kernels.runs_gemm straight from the codes (groups it cannot run fall back to dequant)."""
+
+    def __init__(self, eng, groups, seq: list, gemm: str = "dequant"):
+        self.seq, self.gemm, self.i = seq, gemm, 0
+        self.overlap = gemm == "overlap"
+        self.bufs = (group_scratch(eng, groups, 2 if self.overlap else 1) if needs_scratch(groups, gemm) else None)
+        if self.overlap:
+            self.side = getattr(eng, "_prefill_side_stream", None)
+            if self.side is None:
+                self.side = eng._prefill_side_stream = torch.cuda.Stream(device=eng.logits.device)
+            self.pending, self.free = {}, [None, None]
+
+    def _issue(self, j: int):
+        main = torch.cuda.current_stream()
+        b = j % 2
+        if self.free[b] is not None:
+            self.side.wait_event(self.free[b])        # the GEMM that last read this buffer is done
+        else:
+            self.side.wait_stream(main)               # earlier work (a previous prefill) may still read it
+        with torch.cuda.stream(self.side):
+            w = self.seq[j].dense(self.bufs[b])
+            ev = torch.cuda.Event()
+            ev.record(self.side)
+        self.pending[j] = (w, ev)
+
+    def __call__(self, g: Group, x: torch.Tensor) -> torch.Tensor:
+        j = self.i
+        assert self.seq[j] is g, "groups must be multiplied in the declared order"
+        self.i += 1
+        if self.gemm == "fused" and g.fused_ok():
+            from .kernels import runs_gemm
+            return runs_gemm.gemm(x, g.runs)
+        if not self.overlap:
+            return F.linear(x, g.dense(self.bufs[0]))
+        if j == 0:
+            self._issue(0)
+        if j + 1 < len(self.seq):
+            self._issue(j + 1)
+        w, ev = self.pending.pop(j)
+        main = torch.cuda.current_stream()
+        main.wait_event(ev)
+        y = F.linear(x, w)
+        fe = torch.cuda.Event()
+        fe.record(main)
+        self.free[j % 2] = fe
+        return y
 
 
 def _groups(eng):
@@ -259,7 +307,7 @@ def _prefill_fast(eng, tokens, logits: str = "all", gemm: str = "dequant") -> to
         raise ValueError(f"context {p0 + T} > max_len {cfg.max_len}")
     NH, NKV, HD = cfg.n_heads, cfg.n_kv, cfg.head_dim
     groups = _groups(eng)
-    scratch = group_scratch(eng, groups) if needs_scratch(groups, gemm) else None
+    mm = Gemms(eng, groups, [G[k] for G in groups for k in ("qkv", "o", "gu", "down")], gemm)
     pos = torch.arange(p0, p0 + T, device=dev)
     cs, sn = _rope_tables(pos, cfg.rope_theta, HD)
     rid = ids % eng.embed.shape[0]
@@ -270,7 +318,7 @@ def _prefill_fast(eng, tokens, logits: str = "all", gemm: str = "dequant") -> to
     add = None
     for li, (L, G) in enumerate(zip(eng.layers, groups)):
         x = pk.addnorm(h, add, L["ln1"], cfg.eps)
-        qkv = G["qkv"].matmul(x, scratch, gemm)
+        qkv = mm(G["qkv"], x)
         q = pk.rope_qkv(qkv, L.get("bq"), L.get("bk"), L.get("bv"), cs, sn, NH, NKV, HD, p0, eng.kc[li], eng.vc[li])
         kk = eng.kc[li, :, :p0 + T].repeat_interleave(NH // NKV, dim=0)
         vv = eng.vc[li, :, :p0 + T].repeat_interleave(NH // NKV, dim=0)
@@ -278,10 +326,10 @@ def _prefill_fast(eng, tokens, logits: str = "all", gemm: str = "dequant") -> to
                                            attn_mask=None if mask is None else mask[None, None],
                                            is_causal=mask is None, scale=HD ** -0.5)
         a = a[0].transpose(0, 1).reshape(T, NH * HD)
-        add = G["o"].matmul(a, scratch, gemm)
+        add = mm(G["o"], a)
         x = pk.addnorm(h, add, L["ln2"], cfg.eps)
-        act = pk.silu_mul(G["gu"].matmul(x, scratch, gemm), 0)
-        add = G["down"].matmul(act, scratch, gemm)
+        act = pk.silu_mul(mm(G["gu"], x), 0)
+        add = mm(G["down"], act)
     if logits == "all":
         x = pk.addnorm(h, add, eng.final_norm, cfg.eps)
     else:

@@ -30,7 +30,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-PATHS = {"ref": {"impl": "ref"}, "fast": {"impl": "fast", "gemm": "dequant"}, "fused": {"impl": "fast", "gemm": "fused"}}
+PATHS = {"ref": {"impl": "ref"}, "fast": {"impl": "fast", "gemm": "dequant"},
+         "overlap": {"impl": "fast", "gemm": "overlap"}, "fused": {"impl": "fast", "gemm": "fused"}}
 
 
 def model_type(model: str) -> str:

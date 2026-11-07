@@ -27,6 +27,7 @@ import torch
 
 _SRC = r"""
 #include <cuda_fp16.h>
+typedef unsigned int u32;
 
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
@@ -71,6 +72,58 @@ extern "C" __global__ void addnorm(float* __restrict__ h, const __half* __restri
         const float w = wf32 ? ((const float*)wv)[i] : __half2float(((const __half*)wv)[i]);
         o[i] = __float2half(hr[i] * r * w);
     }
+}
+
+// addnorm with 4-wide accesses (C, lda, ldo multiples of 4; 8-byte aligned fp16 rows)
+__device__ __forceinline__ float4 h4f(uint2 a) {
+    const float2 x = __half22float2(*(const __half2*)&a.x), y = __half22float2(*(const __half2*)&a.y);
+    return make_float4(x.x, x.y, y.x, y.y);
+}
+extern "C" __global__ void addnorm4(float* __restrict__ h, const __half* __restrict__ add, int lda,
+                                    const void* __restrict__ wv, int wf32, int C, float eps,
+                                    __half* __restrict__ out, int ldo) {
+    __shared__ float red[32];
+    const size_t t = blockIdx.x;
+    float4* hr = (float4*)(h + t * C);
+    const uint2* ar = add ? (const uint2*)(add + t * lda) : nullptr;
+    const int C4 = C >> 2;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < C4; i += blockDim.x) {
+        float4 v = hr[i];
+        if (ar) {
+            const float4 a = h4f(ar[i]);
+            v.x += a.x; v.y += a.y; v.z += a.z; v.w += a.w;
+            hr[i] = v;
+        }
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float r = rsqrtf(block_sum(ss, red) / C + eps);
+    uint2* o = (uint2*)(out + t * ldo);
+    for (int i = threadIdx.x; i < C4; i += blockDim.x) {
+        const float4 v = hr[i];
+        const float4 w = wf32 ? ((const float4*)wv)[i] : h4f(((const uint2*)wv)[i]);
+        __half2 a = __floats2half2_rn(v.x * r * w.x, v.y * r * w.y), b = __floats2half2_rn(v.z * r * w.z, v.w * r * w.w);
+        o[i] = make_uint2(*(u32*)&a, *(u32*)&b);
+    }
+}
+
+// silu_mul over 8 elements per thread (I % 8 == 0)
+extern "C" __global__ void silu_mul8(const __half* __restrict__ gu, int I, long long n8, int mode, __half* __restrict__ out) {
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n8) return;
+    const int I8 = I >> 3;
+    const long long t = idx / I8, i = idx - t * I8;
+    const uint4 gv = ((const uint4*)(gu + t * 2 * I))[i], uv = ((const uint4*)(gu + t * 2 * I + I))[i];
+    const __half* g = (const __half*)&gv;
+    const __half* u = (const __half*)&uv;
+    uint4 ov;
+    __half* o = (__half*)&ov;
+    #pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const float gf = __half2float(g[q]);
+        o[q] = mode == 0 ? __hmul(__float2half(silu(gf)), u[q]) : __float2half(silu(gf) * __half2float(u[q]));
+    }
+    ((uint4*)out)[idx] = ov;
 }
 
 // ---------------------------------------------------------------- silu_mul
@@ -182,19 +235,27 @@ extern "C" __global__ void conv(const __half* __restrict__ x, int ld, const floa
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= D) return;
     const int t0 = blockIdx.y * TS, t1 = min(T, t0 + TS);
+    // window held right-aligned in win[8 - K .. 7] (compile-time indices: registers, not local memory)
     float wr[8], win[8];
-    for (int m = 0; m < K; ++m) wr[m] = w[c * K + m];
-    // window = seq[t0 + 1 .. t0 + K - 1] (the K-1 inputs before x[t0])
-    for (int m = 0; m < K - 1; ++m) {
-        const int s = t0 + 1 + m;
-        win[m] = s < K ? state[c * K + s] : __half2float(x[(size_t)(s - K) * ld + c]);
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const int mm = m - (8 - K);                    // tap index, < 0: unused slot
+        wr[m] = mm >= 0 ? w[c * K + mm] : 0.f;
+        win[m] = 0.f;
+        // window = seq[t0 + 1 .. t0 + K - 1] (the K-1 inputs before x[t0]) in slots 8-K .. 6
+        if (mm >= 0 && m < 7) {
+            const int s = t0 + 1 + mm;
+            win[m] = s < K ? state[c * K + s] : __half2float(x[(size_t)(s - K) * ld + c]);
+        }
     }
     for (int t = t0; t < t1; ++t) {
-        win[K - 1] = __half2float(x[(size_t)t * ld + c]);
+        win[7] = __half2float(x[(size_t)t * ld + c]);
         float acc = 0.f;
-        for (int m = 0; m < K; ++m) acc += wr[m] * win[m];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) acc += wr[m] * win[m];
         u[(size_t)t * D + c] = silu(acc);
-        for (int m = 0; m < K - 1; ++m) win[m] = win[m + 1];
+        #pragma unroll
+        for (int m = 0; m < 7; ++m) win[m] = win[m + 1];
     }
 }
 
@@ -348,6 +409,87 @@ extern "C" __global__ void __launch_bounds__(256) gdn_scan(
     for (int i = tid; i < SDK * SBV; i += 256) Sg[(i / SBV) * SDV + v0 + i % SBV] = Ss[i];
 }
 
+// ---------------------------------------------------------------- gdn_chunk_prep / gdn_tri
+// Per chunk (h, n) of C = 64 rows; q, k [H, Tp, DK], v [H, Tp, DV], g, beta [H, Tp] (Tp = N * 64).
+// prep: gc = cumsum(g) within the chunk; vb = v * beta [H, N, C, DV], kbe = k * beta * e^gc;
+//       qg = q e^gc, kd = k e^{gc_last - gc} [H, N, C, DK]; dec = e^{gc_last} [H, N]. grid H*N, block 256.
+extern "C" __global__ void gdn_chunk_prep(const float* __restrict__ q, const float* __restrict__ k,
+                                          const float* __restrict__ v, const float* __restrict__ g,
+                                          const float* __restrict__ beta, int DK, int DV,
+                                          float* __restrict__ gc, float* __restrict__ vb, float* __restrict__ kbe,
+                                          float* __restrict__ qg,
+                                          float* __restrict__ kd, float* __restrict__ dec) {
+    __shared__ float sg[64], sb[64];
+    const size_t c0 = (size_t)blockIdx.x * 64;                  // first row (h * Tp + n * 64)
+    if (threadIdx.x < 32) {                                     // warp scan of the 64 gates
+        const int l = threadIdx.x;
+        float a = g[c0 + 2 * l], b = g[c0 + 2 * l + 1];
+        b += a;                                                 // pair sums, then an inclusive scan
+        float s = b;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const float t = __shfl_up_sync(0xffffffffu, s, o);
+            if (l >= o) s += t;
+        }
+        const float ex = s - b;                                 // exclusive prefix of the pairs
+        sg[2 * l] = ex + a;
+        sg[2 * l + 1] = s;
+        sb[2 * l] = beta[c0 + 2 * l];
+        sb[2 * l + 1] = beta[c0 + 2 * l + 1];
+    }
+    __syncthreads();
+    const float gl = sg[63];
+    if (threadIdx.x < 64) gc[c0 + threadIdx.x] = sg[threadIdx.x];
+    if (threadIdx.x == 0) dec[blockIdx.x] = expf(gl);
+    for (int idx = threadIdx.x; idx < 64 * DV; idx += blockDim.x) {
+        const int i = idx / DV;
+        const size_t o = (c0 + i) * DV + (idx - i * DV);
+        vb[o] = v[o] * sb[i];
+    }
+    for (int idx = threadIdx.x; idx < 64 * DK; idx += blockDim.x) {
+        const int i = idx / DK;
+        const size_t o = (c0 + i) * DK + (idx - i * DK);
+        const float e = expf(sg[i]), kk = k[o];
+        kbe[o] = kk * sb[i] * e;
+        qg[o] = q[o] * e;
+        kd[o] = kk * expf(gl - sg[i]);
+    }
+}
+
+// tri: from KK = k k^T and QK = q k^T [B, 64, 64] (B = H*N chunks), gc, beta:
+//   M = beta_i KK_ij e^{gc_i - gc_j} (j < i);  Tinv = (I + M)^-1 (written over KK);
+//   P = QK_ij e^{gc_i - gc_j} (j <= i, else 0) (written over QK). grid B, block 64.
+extern "C" __global__ void __launch_bounds__(64) gdn_tri(float* __restrict__ KK, float* __restrict__ QK,
+                                                         const float* __restrict__ gc, const float* __restrict__ beta) {
+    __shared__ float M[64][65], sg[64], sb[64];       // 17 KB: several blocks per SM
+    const int j = threadIdx.x;
+    const size_t b = blockIdx.x;
+    float* kk = KK + b * 4096;
+    float* qk = QK + b * 4096;
+    sg[j] = gc[b * 64 + j];
+    sb[j] = beta[b * 64 + j];
+    __syncthreads();
+    for (int i = 0; i < 64; ++i) {                    // thread j: column j (coalesced row reads)
+        const float e = j <= i ? expf(sg[i] - sg[j]) : 0.f;
+        M[i][j] = j < i ? kk[i * 64 + j] * e * sb[i] : 0.f;
+        qk[i * 64 + j] = qk[i * 64 + j] * e;
+    }
+    __syncthreads();
+    // forward substitution in place, row by row: X[i][jj] = -(M[i][jj] + sum_{k=jj+1}^{i-1} M[i][k] X[k][jj])
+    // for jj < i (X[k][k] = 1). Row i is read (M) before it is overwritten (X): two barriers per row.
+    for (int i = 1; i < 64; ++i) {
+        float s = 0.f;
+        if (j < i) {
+            s = M[i][j];
+            for (int k2 = j + 1; k2 < i; ++k2) s += M[i][k2] * M[k2][j];
+        }
+        __syncthreads();
+        if (j < i) M[i][j] = -s;
+        __syncthreads();
+    }
+    for (int i = 0; i < 64; ++i) kk[i * 64 + j] = j < i ? M[i][j] : (j == i ? 1.f : 0.f);
+}
+
 // ---------------------------------------------------------------- q8_rows
 // rows [s, e) of an 8-bit block-32 matrix (q int8 [R, C], sc fp16 [R, C/32]) -> fp16 [e - s, C]
 extern "C" __global__ void q8_rows(const signed char* __restrict__ q, const __half* __restrict__ sc, int C,
@@ -434,9 +576,15 @@ def addnorm(h: torch.Tensor, add: torch.Tensor | None, w: torch.Tensor, eps: flo
         out = torch.empty(T, C, dtype=torch.float16, device=h.device)
     if add is not None:
         assert add.dtype == torch.float16 and add.stride(1) == 1
-    threads = min(1024, max(32, 32 * math.ceil(min(C, 1024) / 32)))
-    _launch("addnorm", T, threads, (_p(h), _p(add), _i(0 if add is None else add.stride(0)), _p(w),
-                                     _i(int(w.dtype == torch.float32)), _i(C), _f(eps), _p(out), _i(out.stride(0))))
+    lda = 0 if add is None else add.stride(0)
+    vec = (C % 4 == 0 and lda % 4 == 0 and out.stride(0) % 4 == 0 and out.stride(1) == 1
+           and all(t is None or t.data_ptr() % 16 == 0 for t in (h, w)) and (add is None or add.data_ptr() % 8 == 0)
+           and out.data_ptr() % 8 == 0)
+    n = C // 4 if vec else C
+    threads = min(1024, max(32, 32 * math.ceil(min(n, 1024) / 32)))
+    _launch("addnorm4" if vec else "addnorm", T, threads,
+            (_p(h), _p(add), _i(lda), _p(w), _i(int(w.dtype == torch.float32)), _i(C), _f(eps), _p(out),
+             _i(out.stride(0))))
     return out
 
 
@@ -444,9 +592,13 @@ def silu_mul(gu: torch.Tensor, mode: int) -> torch.Tensor:
     """gu fp16 [T, 2I] -> fp16 [T, I]; mode 0 = Qwen2 rounding, 1 = Qwen3.5 rounding."""
     T, I2 = gu.shape
     I = I2 // 2
+    assert gu.is_contiguous()
     out = torch.empty(T, I, dtype=torch.float16, device=gu.device)
     n = T * I
-    _launch("silu_mul", (n + 255) // 256, 256, (_p(gu), _i(I), _ll(n), _i(mode), _p(out)))
+    if I % 8 == 0 and gu.data_ptr() % 16 == 0:
+        _launch("silu_mul8", (n // 8 + 255) // 256, 256, (_p(gu), _i(I), _ll(n // 8), _i(mode), _p(out)))
+    else:
+        _launch("silu_mul", (n + 255) // 256, 256, (_p(gu), _i(I), _ll(n), _i(mode), _p(out)))
     return out
 
 
@@ -536,32 +688,31 @@ def gdn_scan(w, qg, kd, u, dec, S, bv: int | None = None):
 
 def chunk_gated_delta_rule(q, k, v, g, beta, S, chunk: int = 64, bv: int | None = None):
     """Chunked gated delta rule, the math of HF's torch_chunk_gated_delta_rule (q already l2-normed
-    and scaled, k l2-normed) with the intra-chunk inverse as one triangular solve and the
-    inter-chunk recurrence in gdn_scan. q, k [H, Tp, DK], v [H, Tp, DV], g, beta [H, Tp] (fp32,
+    and scaled, k l2-normed): per chunk, gdn_chunk_prep (gate cumsum, scaled operands), k k^T and
+    q k^T as batched matmuls, gdn_tri (decay masks and the intra-chunk inverse (I + M)^-1 that HF
+    builds row by row), u / w = inverse @ (v beta | k beta e^g), then the inter-chunk recurrence in
+    gdn_scan and o = o_inter + P v_new. q, k [H, Tp, DK], v [H, Tp, DV], g, beta [H, Tp] (fp32,
     zero padded to whole chunks), S [H, DK, DV] fp32 initial state (updated in place to the final
     state). Returns o [H, Tp, DV] fp32."""
+    assert chunk == 64
     H, Tp, DK = q.shape
     DV = v.shape[-1]
     N = Tp // chunk
-    q, k, v = q.view(H, N, chunk, DK), k.view(H, N, chunk, DK), v.view(H, N, chunk, DV)
-    g, beta = g.view(H, N, chunk), beta.view(H, N, chunk)
-    gc = g.cumsum(-1)
-    ar = torch.arange(chunk, device=q.device)
-    lower = ar[:, None] >= ar[None, :]
-    D = torch.exp((gc[..., :, None] - gc[..., None, :]).masked_fill(~lower, float("-inf")))   # [H,N,C,C]
-    kb = k * beta[..., None]
-    M = (kb @ k.transpose(-1, -2)) * D
-    A = torch.tril(M, -1) + torch.eye(chunk, device=q.device, dtype=q.dtype)
-    eg = gc.exp()
-    rhs = torch.cat([v * beta[..., None], kb * eg[..., None]], -1)
-    sol = torch.linalg.solve_triangular(A, rhs, upper=False, unitriangular=True)
-    uu, w = sol[..., :DV].contiguous(), sol[..., DV:].contiguous()
-    gl = gc[..., -1:]
-    qg = (q * eg[..., None]).contiguous()
-    kd = (k * (gl - gc).exp()[..., None]).contiguous()
-    dec = gl[..., 0].exp().contiguous()
-    vn, oi = gdn_scan(w, qg, kd, uu, dec, S, bv)
-    o = oi + ((q @ k.transpose(-1, -2)) * D) @ vn
+    B = H * N
+    f = dict(dtype=torch.float32, device=q.device)
+    gc, dec = torch.empty(H, Tp, **f), torch.empty(H, N, **f)
+    vb, kbe = torch.empty(H, Tp, DV, **f), torch.empty(H, Tp, DK, **f)
+    qg, kd = torch.empty(H, Tp, DK, **f), torch.empty(H, Tp, DK, **f)
+    _launch("gdn_chunk_prep", B, 256, (_p(q), _p(k), _p(v), _p(g), _p(beta), _i(DK), _i(DV), _p(gc), _p(vb),
+                                       _p(kbe), _p(qg), _p(kd), _p(dec)))
+    qc, kc = q.view(B, chunk, DK), k.view(B, chunk, DK)
+    KK = torch.bmm(kc, kc.transpose(1, 2))
+    QK = torch.bmm(qc, kc.transpose(1, 2))
+    _launch("gdn_tri", B, 64, (_p(KK), _p(QK), _p(gc), _p(beta)))
+    uu = torch.bmm(KK, vb.view(B, chunk, DV)).view(H, N, chunk, DV)
+    w = torch.bmm(KK, kbe.view(B, chunk, DK)).view(H, N, chunk, DK)
+    vn, oi = gdn_scan(w, qg.view(H, N, chunk, DK), kd.view(H, N, chunk, DK), uu, dec, S, bv)
+    o = torch.baddbmm(oi.view(B, chunk, DV), QK, vn.view(B, chunk, DV))
     return o.view(H, Tp, DV)
 
 

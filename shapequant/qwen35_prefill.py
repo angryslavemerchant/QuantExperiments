@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from .kernels import decode_e2e as de
-from .prefill import Group, group_scratch, head_fast, needs_scratch
+from .prefill import Gemms, Group, head_fast
 
 
 def groups(eng):
@@ -51,7 +51,8 @@ def prefill(eng, tokens, logits: str = "last", gemm: str = "dequant") -> torch.T
     if p0 + T > c.max_len:
         raise ValueError(f"context {p0 + T} > max_len {c.max_len}")
     G_all = groups(eng)
-    scratch = group_scratch(eng, G_all) if needs_scratch(G_all, gemm) else None
+    seq = [G[k] for G in G_all for k in ("qkvz", "out", "qkv", "o", "gu", "down") if k in G]
+    mm = Gemms(eng, G_all, seq, gemm)
     rid = ids % eng.embed.shape[0]
     h = (eng.embed.rows(rid) if isinstance(eng.embed, de.Q4Embed) else eng.embed[rid]).float().contiguous()
     pos = torch.arange(p0, p0 + T, device=dev)
@@ -64,16 +65,16 @@ def prefill(eng, tokens, logits: str = "last", gemm: str = "dequant") -> torch.T
     for i, (L, G) in enumerate(zip(eng.layers, G_all)):
         x = pk.addnorm(h, add, L["ln1"], c.eps)
         if c.layer_types[i] == "linear_attention":
-            y = G["qkvz"].matmul(x, scratch, gemm)                    # [T, conv_dim + hv*dv] fp16
+            y = mm(G["qkvz"], x)                   # [T, conv_dim + hv*dv] fp16
             ab = x.float() @ G["wab"].T                               # [T, 2hv] fp32
             u = pk.conv(y, eng.conv[jl], L["convw"], eng.conv_dim)    # [T, conv_dim] fp32, state updated
             q, k, v, g, beta = pk.gdn_prep(u, ab, L["A"], L["dt_bias"], c.hk, c.hv, c.dk, c.dv)
             o = pk.chunk_gated_delta_rule(q, k, v, g, beta, eng.S[jl])
             o16 = pk.gated_norm(o, y[:, eng.conv_dim:], L["gnorm"], c.eps, T)
-            add = G["out"].matmul(o16, scratch, gemm)
+            add = mm(G["out"], o16)
             jl += 1
         else:
-            y = G["qkv"].matmul(x, scratch, gemm)                     # [T, NH*2HD + 2*NKV*HD]
+            y = mm(G["qkv"], x)                   # [T, NH*2HD + 2*NKV*HD]
             q = pk.attn_prep(y, L["qn"], L["kn"], cs, sn, NH, NKV, HD, c.rot, c.eps, p0, eng.kc[ja], eng.vc[ja])
             rep = NH // NKV
             kk = eng.kc[ja, :, :p0 + T].repeat_interleave(rep, 0)
@@ -81,11 +82,11 @@ def prefill(eng, tokens, logits: str = "last", gemm: str = "dequant") -> torch.T
             o = F.scaled_dot_product_attention(q[None], kk[None], vv[None],
                                                attn_mask=None if mask is None else mask[None, None],
                                                is_causal=mask is None, scale=HD ** -0.5)[0]   # [NH, T, HD]
-            add = G["o"].matmul(pk.gate_out(o.contiguous(), y, NH, HD), scratch, gemm)
+            add = mm(G["o"], pk.gate_out(o.contiguous(), y, NH, HD))
             ja += 1
         x = pk.addnorm(h, add, L["ln2"], c.eps)
-        act = pk.silu_mul(G["gu"].matmul(x, scratch, gemm), 1)
-        add = G["down"].matmul(act, scratch, gemm)
+        act = pk.silu_mul(mm(G["gu"], x), 1)
+        add = mm(G["down"], act)
     if logits == "all":
         x = pk.addnorm(h, add, eng.final_norm, c.eps)
     else:
