@@ -1,0 +1,28 @@
+task: math500_think
+dataset_path: HuggingFaceH4/MATH-500
+test_split: test
+output_type: generate_until
+num_fewshot: 0
+doc_to_text: "{{problem}}\nPlease reason step by step, and put your final answer within \\boxed{}."
+doc_to_target: "{{answer}}"
+process_results: !function think_tasks.math_results
+# Qwen's recommended thinking-mode sampling; one sample per problem
+generation_kwargs:
+  until: []
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 32768
+metric_list:
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+  - metric: exact
+    aggregation: mean
+    higher_is_better: true
+  - metric: no_answer
+    aggregation: mean
+    higher_is_better: false
+metadata:
+  version: 1.0
