@@ -110,3 +110,21 @@ def test_custom_op_compiles_and_graph_captures(large):
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(y, f(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_tuned_dispatch_synthetic():
+    """tune() picks a crossover among the measured Ms; forward agrees with the dense product on both
+    sides of it (xs batched kernel up to 64 rows, fused GEMM above)."""
+    pytest.importorskip("cupy")
+    from test_runs_gemm import _rl, _ref
+    a, b = _rl(300, 1280, 10, 4, 31), _rl(200, 1280, 12, 4, 32)
+    ps = core.PackedShards([a, b], xs=True, bmax=64, large="fused")
+    cross = ps.tune(Ms=(8, 32, 64))
+    assert cross in (0, 8, 32, 64) and ps.cross == cross
+    assert core.PackedShards([a, b], xs=True, bmax=64, large="fused").tune(Ms=(8, 32, 64)) == cross   # cached
+    for M in (1, 8, 31, 33, 64, 65, 130):
+        x = torch.randn(M, 1280 * 4, device="cuda", dtype=torch.bfloat16)
+        ref = _ref(x.half(), [a, b])
+        err = (ps.forward(x).float() - ref).norm() / ref.norm()
+        assert err < 1e-2, (M, err)

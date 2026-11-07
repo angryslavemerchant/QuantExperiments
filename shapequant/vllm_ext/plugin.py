@@ -46,7 +46,7 @@ def _resolve(file: str) -> str:
 @register_quantization_config("shapequant")
 class ShapeQuantConfig(QuantizationConfig):
     def __init__(self, packed_file: str, bmax: int = core.BMAX, layout: str = "tile", large: str = "dequant",
-                 chunk_mb: int = 24, xs: bool = False, warps: int = 8):
+                 chunk_mb: int = 24, xs: bool = False, warps: int = 8, tune: bool = False):
         super().__init__()
         self.packed_file, self.bmax, self.layout = packed_file, bmax, layout
         # SHAPEQUANT_LARGE / SHAPEQUANT_CHUNK_MB / SHAPEQUANT_BMAX / SHAPEQUANT_XS / SHAPEQUANT_WARPS
@@ -54,6 +54,8 @@ class ShapeQuantConfig(QuantizationConfig):
         self.bmax = int(os.environ.get("SHAPEQUANT_BMAX", bmax))
         self.xs = os.environ.get("SHAPEQUANT_XS", "1" if xs else "0") == "1"
         self.warps = int(os.environ.get("SHAPEQUANT_WARPS", warps))
+        # per-shape crossover between the batched kernel and the large-M path, measured at load
+        self.tune = os.environ.get("SHAPEQUANT_TUNE", "1" if tune else "0") == "1"
         self.large = os.environ.get("SHAPEQUANT_LARGE", large)
         self.chunk_mb = int(os.environ.get("SHAPEQUANT_CHUNK_MB", chunk_mb))
         self._pf = None
@@ -83,7 +85,7 @@ class ShapeQuantConfig(QuantizationConfig):
         return cls(packed_file=config["packed_file"], bmax=int(config.get("bmax", core.BMAX)),
                    layout=config.get("layout", "tile"), large=config.get("large", "dequant"),
                    chunk_mb=int(config.get("chunk_mb", 24)), xs=bool(config.get("xs", False)),
-                   warps=int(config.get("warps", 8)))
+                   warps=int(config.get("warps", 8)), tune=bool(config.get("tune", False)))
 
     @property
     def pf(self):
@@ -118,6 +120,9 @@ class ShapeQuantLinearMethod(LinearMethodBase):
         if ps.C != input_size or ps.R != output_size:
             raise ValueError(f"{self.prefix}: packed pieces are [{ps.R}, {ps.C}], vLLM layer is "
                              f"[{output_size}, {input_size}] (partitions {output_partition_sizes})")
+        if self.cfg.tune:
+            with core.neutral_defaults():
+                ps.tune()
         layer.sq_handle = core.register(ps)
         layer.sq_shards = ps            # keeps the kernels' tensors alive with the module
 

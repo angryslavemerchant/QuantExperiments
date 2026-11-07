@@ -67,6 +67,34 @@ def neutral_defaults():
         torch.set_default_dtype(dt)
 
 
+_TUNED: dict = {}
+
+
+def _time(fn, reps: int, n: int = 10) -> float:
+    """GPU ms per call: CUDA-graph replay of n calls (as vLLM's captured decode), median of reps."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        fn()                      # compiles kernels, grows shared buffers before capture
+        fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(n):
+            fn()
+    ts = []
+    for _ in range(reps):
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        g.replay()
+        b.record()
+        torch.cuda.synchronize()
+        ts.append(a.elapsed_time(b) / n)
+    del g
+    return sorted(ts)[len(ts) // 2]
+
+
 class _Scratch:
     """One fp16 buffer per device for dequantized weights (grown as needed; layers run one at a
     time on one stream, so a single buffer is shared)."""
@@ -104,12 +132,37 @@ class PackedShards:
         self.R = sum(self.Rs)
         self.offs = [sum(self.Rs[:i]) for i in range(len(rls))]
         self.bmax = bmax
-        # xs: X staged in shared memory, bmax up to 128 (kernels.batched_runs)
+        self.cross = bmax        # M <= cross: batched kernel, else the large-M path (tune() moves it)
         self.launchers = [br.RunsBatch(rl, bmax=bmax, warps=warps, bps=bps, max_split=max_split, layout=layout, xs=xs)
                           for rl in rls]
         # the batched kernel writes Y [B, R_piece] contiguous: one buffer per piece, then a copy
         # into the stacked output (skipped for a single piece)
         self.device = rls[0].words.device
+
+    def key(self) -> tuple:
+        return (tuple(self.Rs), self.C, tuple(rl.bits for rl in self.rls), self.large, self.bmax)
+
+    @torch.no_grad()
+    def tune(self, Ms=(8, 16, 24, 32, 48, 64, 96, 128), reps: int = 5) -> int:
+        """Measure the batched kernel against the large-M path at each M <= bmax and set cross =
+        the largest M before the large path first wins (the per-shape crossover differs: e.g.
+        down_proj's batched kernel wins to 64 rows, qkv's fused GEMM from 48). Cached per shape."""
+        k = self.key()
+        if k in _TUNED:
+            self.cross = _TUNED[k]
+            return self.cross
+        cross = 0
+        for M in Ms:
+            if M > self.bmax:
+                break
+            x = torch.randn(M, self.C, device=self.device, dtype=torch.float16)
+            t_small = _time(lambda: self._small(x, M), reps)
+            t_large = _time(lambda: self._large(x), reps)
+            if t_large < t_small:
+                break
+            cross = M
+        self.cross = _TUNED[k] = cross
+        return cross
 
     @classmethod
     def from_packed(cls, pf, names: list[str], dev="cuda", **kw) -> "PackedShards":
@@ -139,7 +192,7 @@ class PackedShards:
         x16 = x2.to(torch.float16).contiguous()
         if M == 0:
             y = x16.new_empty(0, self.R)
-        elif M <= self.bmax:
+        elif M <= self.cross:
             y = self._small(x16, M)
         else:
             y = self._large(x16)

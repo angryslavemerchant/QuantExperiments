@@ -41,7 +41,10 @@ def log(msg: str) -> None:
 def vllm_config(aux_config: dict) -> dict:
     cfg = dict(aux_config)
     cfg.update(architectures=["Qwen3_5ForCausalLM"], tie_word_embeddings=False, torch_dtype="bfloat16",
-               quantization_config={"quant_method": "shapequant", "packed_file": PACKED_NAME})
+               quantization_config={"quant_method": "shapequant", "packed_file": PACKED_NAME,
+                                    # PRO 6000 s36: shared-memory batched kernel to a per-shape crossover (<= 64 rows, tuned
+                                    # at load), fused GEMM above
+                                    "xs": True, "bmax": 64, "large": "fused", "tune": True})
     cfg.pop("dtype", None)
     cfg.pop("_name_or_path", None)
     return cfg
