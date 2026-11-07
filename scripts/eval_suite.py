@@ -5,8 +5,10 @@ prompt mode, and its result is written as soon as it finishes (a later failure o
 keeps the earlier tasks):
 
   base-style prompts (no chat template), greedy:
-    mmlu 5-shot, arc_challenge 0, hellaswag 0, winogrande 0, gsm8k 5-shot (all 1319),
-    mmlu_pro 5-shot CoT (limit per subject, --mmlu-pro-limit)
+    gsm8k 5-shot (all 1319), mmlu_pro 5-shot CoT (limit per subject, --mmlu-pro-limit)
+    with --with-loglik also mmlu 5-shot, arc_challenge, hellaswag, winogrande: off by default,
+    because lm-eval scores them through vLLM prompt logprobs, which bypass prefix caching and
+    ran at ~2 requests/s on a 27B (5-shot MMLU alone ~6 h; s34 runs, 2026-11-07)
   chat template, thinking on (Qwen's sampling: T 0.6, top-p 0.95, top-k 20; 32k tokens):
     ifeval, math500_think, gpqa_diamond_think (configs/lm_eval_tasks; GPQA is gated on the
     Hub and is skipped with a note when the token lacks access)
@@ -39,11 +41,13 @@ HEADLINE = {
 
 
 def plan(a) -> list[dict]:
-    base = [
+    loglik = [
         {"task": "mmlu", "fewshot": 5},
         {"task": "arc_challenge", "fewshot": 0},
         {"task": "hellaswag", "fewshot": 0},
         {"task": "winogrande", "fewshot": 0},
+    ] if a.with_loglik else []
+    base = loglik + [
         {"task": "gsm8k", "fewshot": 5, "log": True},
         {"task": "mmlu_pro", "fewshot": 5, "limit": a.mmlu_pro_limit, "log": True},
     ]
@@ -80,6 +84,7 @@ def main() -> int:
     ap.add_argument("--name", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--tasks", help="comma list (default: the whole suite)")
+    ap.add_argument("--with-loglik", action="store_true", help="also the multiple-choice loglikelihood tasks (slow on vLLM)")
     ap.add_argument("--mmlu-pro-limit", type=int, default=100, help="questions per MMLU-Pro subject")
     ap.add_argument("--max-model-len", type=int, default=36864)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
