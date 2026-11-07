@@ -34,10 +34,14 @@ from .qwen35_runtime import Qwen35Engine
 
 class Qwen35BatchEngine:
     """step(): reads tok [B] at pos [B], writes logits [B, vocab] (fp16) and tok (greedy next).
-    head_loop_max: batch sizes up to this run the batch-1 q8 head kernel once per sequence."""
+    layout: "tile" (default) gives the batched GEMMs a tile-major copy of every block matrix's
+    words (made once per matrix and shared by all batch engines: a second copy of the block
+    weights, the batch-1 engine keeps its own), "lane" reads the batch-1 words in place (no extra
+    memory, slower). head_loop_max: batch sizes up to this run the batch-1 q8 head kernel once per
+    sequence (else a tile-major copy of the head). warps / bps / max_split / acc16: RunsBatch."""
 
-    def __init__(self, eng: Qwen35Engine, B: int, *, head_loop_max: int = 1, warps: int = 8, bps: int = 2,
-                 max_split: int = 8):
+    def __init__(self, eng: Qwen35Engine, B: int, *, layout: str = "tile", head_loop_max: int = 1, warps: int = 8,
+                 bps: int = 2, max_split: int = 8, acc16: bool = False):
         from .kernels import batched_runs as br
         from .kernels import qwen35_kernels as qk
         c = eng.cfg
@@ -80,7 +84,8 @@ class Qwen35BatchEngine:
                      if c.layer_types[i] == "linear_attention"}
         self.blin = None
         if B > 1:
-            self.blin = [{k: br.RunsBatch(v.rl, bmax=B, warps=warps, bps=bps, max_split=max_split)
+            self.blin = [{k: br.RunsBatch(v.rl, bmax=B, warps=warps, bps=bps, max_split=max_split, layout=layout,
+                                          acc16=acc16)
                           for k, v in L.items() if isinstance(v, de.RunsLin)} for L in eng.layers]
         self.graph = None
 

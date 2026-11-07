@@ -30,22 +30,24 @@ def test_runs_matches_batch1(R, C, bits, G):
     rl = proto_runs.RunsLinear(lin, tags, 1)
     X = (torch.randn(32, C, device="cuda") * 2).half()
     ref = _ref(rl, X)
-    lb = br.RunsBatch(rl)
-    for B in (1, 2, 5, 8, 13, 16, 24, 32):
-        Y = torch.full((B, R), float("nan"), dtype=torch.float16, device="cuda")
-        lb.run(X[:B].contiguous(), Y)
-        assert _close(Y, ref[:B]) < 2e-3, B
+    for layout in ("lane", "tile"):
+        lb = br.RunsBatch(rl, layout=layout)
+        for B in (1, 2, 5, 8, 13, 16, 24, 32):
+            Y = torch.full((B, R), float("nan"), dtype=torch.float16, device="cuda")
+            lb.run(X[:B].contiguous(), Y)
+            assert _close(Y, ref[:B]) < 2e-3, (layout, B)
 
 
 @pytest.mark.parametrize("split", [1, 3, 8])
 @pytest.mark.parametrize("warps", [4, 8])
-def test_runs_split_and_replay(split, warps):
+@pytest.mark.parametrize("layout,acc16", [("lane", False), ("tile", False), ("tile", True)])
+def test_runs_split_and_replay(split, warps, layout, acc16):
     """Split-K partial sums (deterministic: identical on repeated launches, also inside a graph)."""
     lin, tags = _lin(1024, 3584, 10, G=4, M=1, seed=3)
     rl = proto_runs.RunsLinear(lin, tags, 1)
     X = torch.randn(12, 3584, device="cuda").half()
     ref = _ref(rl, X)
-    lb = br.RunsBatch(rl, bmax=12, warps=warps, max_split=split, bps=8)
+    lb = br.RunsBatch(rl, bmax=12, warps=warps, max_split=split, bps=8, layout=layout, acc16=acc16)
     assert lb.S == min(split, lb.S) and (split == 1) == (lb.S == 1)
     Y1 = torch.empty(12, 1024, dtype=torch.float16, device="cuda")
     lb.run(X, Y1)

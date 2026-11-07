@@ -95,6 +95,9 @@ def main() -> int:
     ap.add_argument("--tg", type=int, default=64, help="timed decode steps (ntg)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--head-loop-max", type=int, default=1, help="B up to this: batch-1 head kernel per sequence")
+    ap.add_argument("--layout", default="tile", choices=["tile", "lane"],
+                    help="block weights for the batched GEMMs: tile-major copy (faster, 2x block-weight memory) or in place")
+    ap.add_argument("--acc16", action="store_true", help="fp16-accumulate mma (2x tensor rate on GeForce parts)")
     ap.add_argument("--warps", type=int, default=8)
     ap.add_argument("--bps", type=int, default=2)
     ap.add_argument("--max-split", type=int, default=8)
@@ -117,12 +120,13 @@ def main() -> int:
     torch.cuda.synchronize()
     res = {"gpu": torch.cuda.get_device_name(), "source": src, "ctx": a.ctx, "tg": a.tg,
            "weight_bytes": eng.weight_bytes(), "build_s": round(time.time() - t0, 1),
-           "launch": {"warps": a.warps, "bps": a.bps, "max_split": a.max_split, "head_loop_max": a.head_loop_max},
+           "launch": {"layout": a.layout, "acc16": a.acc16, "warps": a.warps, "bps": a.bps, "max_split": a.max_split,
+                      "head_loop_max": a.head_loop_max},
            "runs": []}
     print(f"engine built in {res['build_s']} s, weights {res['weight_bytes'] / 1e9:.2f} GB", flush=True)
     for B in a.batch:
-        beng = qb.Qwen35BatchEngine(eng, B, head_loop_max=a.head_loop_max, warps=a.warps, bps=a.bps,
-                                    max_split=a.max_split)
+        beng = qb.Qwen35BatchEngine(eng, B, layout=a.layout, head_loop_max=a.head_loop_max, warps=a.warps,
+                                    bps=a.bps, max_split=a.max_split, acc16=a.acc16)
         torch.cuda.reset_peak_memory_stats()
         t = beng.time_steps(a.tg, a.ctx, a.reps)
         r = {"B": B, "step_ms": t * 1e3, "agg_tok_s": B / t, "seq_tok_s": 1 / t,

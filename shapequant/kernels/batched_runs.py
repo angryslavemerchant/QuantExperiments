@@ -8,7 +8,9 @@ Codebook runs (d = 4, the lane-major words of proto_runs.RunsLinear, read in pla
   mma's k index permuted so slot t's 4 k positions are one code's 4 columns) and loads the
   matching 4 x values of batch row g (8 bytes) per 8-row batch tile;
 - slot t walks the codes of run-kernel lanes L = 4s + t (s = 0..7) of a 512-chunk batch, so the
-  words come straight from proto_runs' layout (same tail realignment);
+  words can come straight from proto_runs' layout (same tail realignment), or from a tile-major
+  copy (layout="tile") where each warp load is 128 contiguous bytes (DRAM-friendlier: the
+  in-place layout scatters a warp's loads over 16 rows, 80-byte pieces each);
 - a block = W warps on W tiles, all stepping through the same column units (x reuse via L1);
   work items = (tile group, column slice): split-K over slices for parallelism on wide GPUs, the
   last slice to finish for a tile sums the fp32 partials in slice order (deterministic);
@@ -70,6 +72,47 @@ _SRC_RUNS = r"""
 #define WROW (NFULL * 32 * NWB + JT * 2 * BITS)
 #define NCH ((NFULL * 8 + JT) * 64)
 #define NUNITS (NFULL * 8 + (JT > 0 ? 8 : 0))
+#ifndef TILE
+#define TILE 0
+#endif
+// TILE layout (RunsBatch(layout="tile")): per 16-row tile, unit by unit, each thread's words for rows
+// g / g + 8 (h = 0 / 1) at [unit][h][word i][lane]: full units NWB words, tail units NWT (realigned,
+// zero-padded), so every warp load is 128 contiguous bytes and a unit's words are one contiguous block.
+#define TWORDS (2 * 32 * (NFULL * 8 * NWB + (JT > 0 ? 8 * NWT : 0)))
+
+// the NT tags held in a (row g) and b (row g + 8), NWD words each (+1 zero word)
+template <int NT, int NWD>
+__device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, const uint2* tab0, const uint2* tab1,
+                                      const uint2* __restrict__ X, int g, int B, float (*acc)[4])
+{
+    const u32 MASK = (1u << BITS) - 1u;
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        const int bit = j * BITS, wi = bit >> 5, sh = bit & 31;
+        const u32 va = ((sh + BITS <= 32) ? (a[wi] >> sh) : __funnelshift_r(a[wi], a[wi + 1], sh)) & MASK;
+        const u32 vb = ((sh + BITS <= 32) ? (b[wi] >> sh) : __funnelshift_r(b[wi], b[wi + 1], sh)) & MASK;
+        const uint2 ta = tab0[va], tb = tab1[vb];
+        const int c = cbase + (j >> 1) * 64 + (j & 1);
+        #pragma unroll
+        for (int nb = 0; nb < NB8; ++nb) {
+            const int n = nb * 8 + g;
+            const uint2 xv = n < B ? __ldg(X + (size_t)n * NCH + c) : make_uint2(0u, 0u);
+            mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
+        }
+    }
+}
+
+// TILE: one unit from the tile layout (base = this unit's block + lane)
+template <int NT, int NWD>
+__device__ __forceinline__ void unit_t(const u32* __restrict__ base, int cbase, const uint2* tab0, const uint2* tab1,
+                                       const uint2* __restrict__ X, int g, int B, float (*acc)[4])
+{
+    u32 a[NWD + 1], b[NWD + 1];
+    #pragma unroll
+    for (int i = 0; i < NWD; ++i) { a[i] = __ldg(base + i * 32); b[i] = __ldg(base + (NWD + i) * 32); }
+    a[NWD] = 0u; b[NWD] = 0u;
+    codes<NT, NWD>(a, b, cbase, tab0, tab1, X, g, B, acc);
+}
 
 // One column unit for this thread: the NT tags of run lane L for rows g (w0) and g + 8 (w1).
 // cbase = chunk of tag 0; tag j sits at chunk cbase + (j >> 1) * 64 + (j & 1).
@@ -78,7 +121,6 @@ __device__ __forceinline__ void unit(const u32* __restrict__ w0, const u32* __re
                                      const uint2* tab0, const uint2* tab1, const uint2* __restrict__ X, int g,
                                      int B, float (*acc)[4])
 {
-    const u32 MASK = (1u << BITS) - 1u;
     u32 a[NWD + 1], b[NWD + 1];
     if constexpr (TAIL) {
         const int start = L * NT * BITS, i0 = start >> 5, sh0 = start & 31;
@@ -99,20 +141,7 @@ __device__ __forceinline__ void unit(const u32* __restrict__ w0, const u32* __re
         }
     }
     a[NWD] = 0u; b[NWD] = 0u;
-    #pragma unroll
-    for (int j = 0; j < NT; ++j) {
-        const int bit = j * BITS, wi = bit >> 5, sh = bit & 31;
-        const u32 va = ((sh + BITS <= 32) ? (a[wi] >> sh) : __funnelshift_r(a[wi], a[wi + 1], sh)) & MASK;
-        const u32 vb = ((sh + BITS <= 32) ? (b[wi] >> sh) : __funnelshift_r(b[wi], b[wi + 1], sh)) & MASK;
-        const uint2 ta = tab0[va], tb = tab1[vb];
-        const int c = cbase + (j >> 1) * 64 + (j & 1);
-        #pragma unroll
-        for (int nb = 0; nb < NB8; ++nb) {
-            const int n = nb * 8 + g;
-            const uint2 xv = n < B ? __ldg(X + (size_t)n * NCH + c) : make_uint2(0u, 0u);
-            mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
-        }
-    }
+    codes<NT, NWD>(a, b, cbase, tab0, tab1, X, g, B, acc);
 }
 
 // grid: persistent blocks of W = THREADS / 32 warps. Item it = (group, slice): the group's W tiles
@@ -162,10 +191,17 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
         const int grp = it / S, sl = it - grp * S;
         const int tile = grp * W + warp;
         const int r0 = tiles[tile * 16 + g], r1 = tiles[tile * 16 + g + 8];
+#if TILE
+        // tiles are single-book: book_off holds each tile's table offset
+        const uint2* tab0 = tab + (BOOKS ? 0 : book_off[tile]);
+        const uint2* tab1 = tab0;
+        const u32* wtl = words + (size_t)tile * TWORDS + lane;
+#else
         const uint2* tab0 = tab + ((BOOKS || r0 < 0) ? 0 : book_off[r0]);
         const uint2* tab1 = tab + ((BOOKS || r1 < 0) ? 0 : book_off[r1]);
         const u32* wb0 = r0 >= 0 ? words + (size_t)r0 * WROW : nullptr;
         const u32* wb1 = r1 >= 0 ? words + (size_t)r1 * WROW : nullptr;
+#endif
         float acc[NB8][4];
         #pragma unroll
         for (int nb = 0; nb < NB8; ++nb) { acc[nb][0] = acc[nb][1] = acc[nb][2] = acc[nb][3] = 0.f; }
@@ -173,15 +209,26 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
         #pragma unroll 1
         for (int u = u0; u < u1; ++u) {
             if (u < NFULL * 8) {
-                const int bb = u >> 3, L = 4 * (u & 7) + t, off = bb * 32 * NWB;
+                const int bb = u >> 3, L = 4 * (u & 7) + t;
+#if TILE
+                unit_t<16, NWB>(wtl + u * 2 * NWB * 32, 2 * (bb * 256 + L), tab0, tab1, X, g, B, acc);
+#else
+                const int off = bb * 32 * NWB;
                 unit<16, NWB, false>(wb0 ? wb0 + off : nullptr, wb1 ? wb1 + off : nullptr, L, 2 * (bb * 256 + L),
                                      tab0, tab1, X, g, B, acc);
+#endif
             }
 #if JT > 0
             else {
-                const int L = 4 * (u - NFULL * 8) + t, off = NFULL * 32 * NWB;
+                const int L = 4 * (u - NFULL * 8) + t;
+#if TILE
+                unit_t<JT * 2, NWT>(wtl + (NFULL * 8 * 2 * NWB + (u - NFULL * 8) * 2 * NWT) * 32, 2 * (NFULL * 256 + L),
+                                    tab0, tab1, X, g, B, acc);
+#else
+                const int off = NFULL * 32 * NWB;
                 unit<JT * 2, NWT, true>(wb0 ? wb0 + off : nullptr, wb1 ? wb1 + off : nullptr, L,
                                         2 * (NFULL * 256 + L), tab0, tab1, X, g, B, acc);
+#endif
             }
 #endif
         }
@@ -432,15 +479,15 @@ def _nb8(B: int) -> int:
     return (B + 7) // 8
 
 
-def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False):
+def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False, tile=False):
     import cupy as cp
     from .proto_runs import geometry
     nfull, jt = geometry(nch)
-    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16)
+    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define NB8 {nb8}\n"
                f"#define SMEM {int(smem)}\n#define BOOKS {int(books)}\n#define THREADS {threads}\n"
-               f"#define ACC16 {int(acc16)}\n") + _COMMON + _SRC_RUNS
+               f"#define ACC16 {int(acc16)}\n#define TILE {int(tile)}\n") + _COMMON + _SRC_RUNS
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs_b")
     return _mods[key]
 
@@ -478,13 +525,52 @@ class _Workspace:
         return b
 
 
+def tile_words(rl, tiles: torch.Tensor):
+    """The TILE layout of a RunsLinear's lane-major words for 16-row tiles `tiles` [nt, 16] (row
+    ids, -1 = padding, every tile within one book): int32 [nt, TWORDS] and each tile's table
+    offset (int32 [nt])."""
+    from .proto_runs import geometry
+    nfull, jt = geometry(rl.nch)
+    bits = rl.bits
+    nwb, nwt = bits // 2, (jt * 2 * bits + 31) // 32
+    nt = tiles.shape[0]
+    rows = tiles.reshape(-1).long()
+    W = rl.words[rows.clamp_min(0)] * (rows >= 0)[:, None].to(rl.words.dtype)       # [nt * 16, WROW]
+    parts = []
+    if nfull:
+        f = W[:, :nfull * 32 * nwb].reshape(nt, 2, 8, nfull, 8, 4, nwb)           # tile, h, g, b, s, t, i
+        parts.append(f.permute(0, 3, 4, 1, 6, 2, 5).reshape(nt, -1))              # tile, b, s, h, i, g, t
+    if jt:
+        nt_tags = 2 * jt
+        st = W[:, nfull * 32 * nwb:].to(torch.int64) & 0xFFFFFFFF                   # tail bit stream
+        st = torch.cat([st, torch.zeros_like(st[:, :2])], 1)
+        L = torch.arange(32, device=W.device)
+        start = L[:, None] * nt_tags * bits + torch.arange(nwt, device=W.device)[None] * 32     # [32, nwt]
+        wi, sh = start >> 5, start & 31
+        lo = st[:, wi.reshape(-1)].view(-1, 32, nwt)
+        hi = st[:, (wi + 1).reshape(-1)].view(-1, 32, nwt)
+        v = ((lo >> sh) | (hi << (32 - sh))) & 0xFFFFFFFF
+        end = (L[:, None] + 1) * nt_tags * bits - start                             # bits left in this lane
+        keep = torch.where(end >= 32, torch.full_like(end, 0xFFFFFFFF), (1 << end.clamp(0, 31)) - 1)
+        v = v & keep
+        v = torch.where(v >= 2 ** 31, v - 2 ** 32, v).to(torch.int32)              # [nt * 16, 32, nwt]
+        tl = v.reshape(nt, 2, 8, 8, 4, nwt)                                         # tile, h, g, s, t, i
+        parts.append(tl.permute(0, 3, 1, 5, 2, 4).reshape(nt, -1))                # tile, s, h, i, g, t
+    wt = torch.cat(parts, 1).contiguous()
+    first = tiles[:, 0].long()
+    off = torch.where(first >= 0, rl.book_off[first.clamp_min(0)].long(), torch.zeros_like(first))
+    return wt, off.to(torch.int32).contiguous()
+
+
 class RunsBatch:
     """Batched launcher for one proto_runs.RunsLinear (d = 4, M = 1): run(X [B, C] fp16,
     Y [B, R] fp16) for any B <= bmax. warps: tiles per block; bps: blocks per SM;
-    max_split: column slices (split-K) at most."""
+    max_split: column slices (split-K) at most. layout: "lane" reads the RunsLinear's words in
+    place; "tile" reads a repacked copy (tile_words: same size plus tail padding, cached on the
+    RunsLinear) whose warp loads are contiguous: ~1.5-2x faster at small B on an RTX 2060."""
 
     def __init__(self, rl, bmax: int = BMAX, warps: int = 8, bps: int = 2, max_split: int = 8,
-                 table: str = "auto", acc16: bool = False):
+                 table: str = "auto", acc16: bool = False, layout: str = "lane"):
         from . import proto_runs as pr
         assert not rl.has_mask, "batched runs kernel: one column order (M = 1) only"
         self.rl, self.R, self.C, self.bmax = rl, rl.R, rl.nch * 4, bmax
@@ -528,6 +614,13 @@ class RunsBatch:
             self.blk = self.tiles
             self.grid = min(self.nitems, self.grid_cap)
         self.cnt = torch.zeros(self.tiles.numel() // 16, dtype=torch.int32, device=dev)
+        assert layout in ("lane", "tile")
+        self.layout = layout
+        if layout == "tile":         # one repacked copy per (matrix, warps), shared by every launcher
+            cache = rl.__dict__.setdefault("_tile_cache", {})
+            if warps not in cache:
+                cache[warps] = tile_words(rl, self.tiles.view(-1, 16))
+            self.wt, self.tile_off = cache[warps]
         self.ws = _Workspace.get(self.S * bmax * self.R if self.S > 1 else 1, dev)
 
     def run(self, X: torch.Tensor, Y: torch.Tensor, B: int | None = None):
@@ -537,11 +630,13 @@ class RunsBatch:
         assert B <= self.bmax and X.is_contiguous() and X.dtype == torch.float16
         if self.S > 1:      # the workspace may have grown (new launchers) since __init__
             self.ws = _Workspace.get(self.S * self.bmax * self.R, X.device)
-        fn = _runs_fn(rl.bits, rl.nch, _nb8(B), self.smem, self.books, self.threads, self.acc16)
+        tile = self.layout == "tile"
+        fn = _runs_fn(rl.bits, rl.nch, _nb8(B), self.smem, self.books, self.threads, self.acc16, tile)
         shm = self.table_bytes if self.smem else 0
         K = 1 << rl.bits
-        args = (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),
-                cp.uint64(rl.book_off.data_ptr()), cp.uint64(X.data_ptr()), cp.uint64(Y.data_ptr()),
+        words, boff = (self.wt, self.tile_off) if tile else (rl.words, rl.book_off)
+        args = (cp.uint64(words.data_ptr()), cp.uint64(rl.table.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),
+                cp.uint64(boff.data_ptr()), cp.uint64(X.data_ptr()), cp.uint64(Y.data_ptr()),
                 cp.uint64(self.tiles.data_ptr()), cp.int32(self.nitems), cp.int32(self.S), cp.int32(self.R),
                 cp.int32(B), cp.int32(K if self.books else rl.table.shape[0]), cp.uint64(rl.yscale.data_ptr()),
                 cp.uint64(self.blk.data_ptr()), cp.uint64(self.ws.data_ptr()), cp.uint64(self.cnt.data_ptr()))
