@@ -37,3 +37,33 @@ def test_finetune_data_disjoint(monkeypatch):
     # default: the calibration sequences themselves, no held-out sets
     ft, held = rx.finetune_data({"seq_len": 4}, cfg, None, calib, 0)
     assert ft is calib and held == {}
+
+
+def test_upload_packed_fake_hub(monkeypatch, tmp_path):
+    """upload_packed: private repo under the token's user, model card + file, receipt with sha256."""
+    import hashlib
+    import json
+    import huggingface_hub
+    calls = []
+
+    class FakeApi:
+        def whoami(self):
+            return {"name": "someone"}
+
+        def create_repo(self, repo, private, exist_ok):
+            calls.append(("create", repo, private))
+
+        def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
+            calls.append(("upload", path_in_repo, repo_id, path_or_fileobj if path_in_repo == "README.md" else None))
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    f = tmp_path / "m_ft.safetensors"
+    f.write_bytes(b"x" * 1000)
+    row = {"mean_kl": 0.12, "bits_per_weight_rounded": 2.51, "deploy_h8e4_kl": 0.121}
+    r = rx.upload_packed(f, {"repo": "q27-test"}, {"model": "Qwen/Qwen3.8-27B"}, row, {"bpw": 2.5, "bpw_all": 2.9},
+                         tmp_path, lambda *_: None)
+    assert calls[0] == ("create", "someone/q27-test", True)
+    assert [c[1] for c in calls[1:]] == ["README.md", "m_ft.safetensors"]
+    assert b"0.12" in calls[1][3] and b"base_model: Qwen/Qwen3.8-27B" in calls[1][3]
+    assert r["sha256"] == hashlib.sha256(b"x" * 1000).hexdigest()
+    assert json.loads((tmp_path / "upload_receipt.json").read_text())["repo"] == "someone/q27-test"

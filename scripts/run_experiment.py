@@ -186,6 +186,52 @@ def export_packed(fits: dict, path: Path, cfg: dict, row_name: str, log, model=N
     return summary
 
 
+def upload_packed(path: Path, ucfg: dict, cfg: dict, row: dict, summary: dict, out_dir: Path, log) -> dict:
+    """Upload a packed file (+ a model card) to a Hugging Face repo with the HF_TOKEN in the
+    environment (needs write access); private unless ucfg["private"] is false. Writes
+    out_dir/upload_receipt.json (repo, file, size, sha256), which is recovered with the artifacts."""
+    import hashlib
+    from huggingface_hub import HfApi
+    api = HfApi()
+    user = api.whoami()["name"]
+    repo = ucfg["repo"] if "/" in ucfg["repo"] else f"{user}/{ucfg['repo']}"
+    api.create_repo(repo, private=ucfg.get("private", True), exist_ok=True)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    keys = ("mean_kl", "p99_kl", "top1_agree", "perplexity", "deploy_h8e4_kl", "bits_per_weight_rounded")
+    stats = "\n".join(f"| {k} | {row[k]:.5g} |" for k in keys if isinstance(row.get(k), (int, float)))
+    card = f"""---
+base_model: {cfg['model']}
+tags: [quantized, shapequant, codebook]
+---
+# {cfg['model'].split('/')[-1]}: shapequant {row.get('bits_per_weight_rounded', 0):.2f} bpw (experimental)
+
+Codebook-quantized ("stack" recipe: Fisher-allocated K per matrix over {{256, 1024, 4096}}, d=4,
+G=4 books, LDLQ, then fine-tuned codebooks + row scales) block linears, plus an 8-bit lm_head and a
+4-bit embedding, in the shapequant packed format (`{path.name}`, self-contained: config and all
+other tensors included). Research artifact; needs the shapequant runtime (not llama.cpp / HF).
+
+Block linears: {summary['bpw']:.4f} bpw; whole file: {summary.get('bpw_all', float('nan')):.4f} bpw.
+Scored on ~100k wikitext-2 test tokens against the 16-bit model:
+
+| metric | value |
+|---|---|
+{stats}
+
+sha256 `{h.hexdigest()}`
+"""
+    api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md", repo_id=repo)
+    log(f"  uploading {path.name} ({path.stat().st_size / 1e9:.2f} GB) to {repo}")
+    api.upload_file(path_or_fileobj=str(path), path_in_repo=path.name, repo_id=repo)
+    receipt = {"repo": repo, "file": path.name, "bytes": path.stat().st_size, "sha256": h.hexdigest(),
+               "private": ucfg.get("private", True)}
+    (out_dir / "upload_receipt.json").write_text(json.dumps(receipt, indent=2))
+    log(f"  uploaded to https://huggingface.co/{repo}")
+    return receipt
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -424,12 +470,17 @@ def main() -> int:
                                 heldout=heldout)
             ft_stats["ft_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
             log(f"  fine-tune peak GPU memory {ft_stats['ft_peak_gb']:.1f} GB")
+            summary = packed_path = None
             if run.get("export"):
-                export_packed(fits, out_dir / "packed" / f"{name}_ft.safetensors", cfg, f"{name}_ft", log, model)
+                # export_dir: outside artifacts/ for files too big to recover (uploaded instead)
+                packed_path = Path(run.get("export_dir", out_dir / "packed")) / f"{name}_ft.safetensors"
+                summary = export_packed(fits, packed_path, cfg, f"{name}_ft", log, model)
             del teacher, fits
             torch.cuda.empty_cache()
             log(f"  fine-tune KL {ft_stats['ft_kl_first']:.4f} -> {ft_stats['ft_kl_last']:.4f}")
-            evaluate(f"{name}_ft", True, ft_stats)
+            ft_row = evaluate(f"{name}_ft", True, ft_stats)
+            if run.get("upload") and packed_path is not None:
+                upload_packed(packed_path, run["upload"], cfg, ft_row, summary, out_dir, log)
 
     if cfg.get("stage0_checks"):
         restore_originals(model, originals)
