@@ -81,3 +81,17 @@ def test_auto_split_fills_gpu():
     rl = _rl(200, 1280, 10, 1, 3)
     assert runs_gemm.auto_split(rl, 64, sms=188) > 1
     assert runs_gemm.auto_split(rl, 64, sms=188) <= 16
+
+
+@pytest.mark.parametrize("bm", [16, 32, 64, 128])
+@pytest.mark.parametrize("split", [1, 5])
+def test_token_tiles(bm, split):
+    """Every token-tile height gives the same product, for T below, at and above the tile."""
+    a, b = _rl(150, 1280, 10, 4, 21), _rl(70, 1280, 8, 1, 22)
+    for T in (1, bm - 1, bm, bm + 3, 3 * bm + 5):
+        x = torch.randn(T, 1280 * 4, device="cuda").half()
+        _check(runs_gemm.gemm(x, [a, b], split=split, bm=bm), _ref(x, [a, b]))
+
+
+def test_auto_bm():
+    assert [runs_gemm.auto_bm(t) for t in (1, 16, 17, 33, 64, 65, 500)] == [16, 16, 32, 64, 64, 128, 128]

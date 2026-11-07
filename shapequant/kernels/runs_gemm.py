@@ -31,7 +31,22 @@ _SRC = r"""
 #include <cuda_fp16.h>
 typedef unsigned int u32;
 
+// BM (tokens per block): 128 (warps 2 x 4, warp tile 64 x 32), 64 / 32 / 16 (warps 1 x 8, warp
+// tile BM x 16): small batches skip the mma work on padding rows
+#ifndef BM
 #define BM 128
+#endif
+#if BM == 128
+#define WN 4
+#else
+#define WN 8
+#endif
+#define WMN (8 / WN)                 // warps along tokens
+#define TM (BM / WMN)                // warp tile: tokens
+#define TN (128 / WN)                // warp tile: weight rows
+#define MI (TM / 16)
+#define NJ (TN / 8)
+#define XU ((BM * 4 + 255) / 256)    // X tile uint4 loads per thread
 #define BN 128
 #define BK 32
 #define LDS (BK + 8)                 // tile row stride in halves (80 bytes): conflict-free ldmatrix
@@ -132,9 +147,9 @@ __device__ __forceinline__ void load_x(const Ctx& c, int kt, int m0, uint4* xa) 
     const KT k = kt_info(c, kt);
     const int col = k.p * 256 + 32 * k.g;
     #pragma unroll
-    for (int u = 0; u < 2; ++u) {
+    for (int u = 0; u < XU; ++u) {
         const int idx = threadIdx.x + NT * u, row = idx >> 2, part = idx & 3, t = m0 + row;
-        xa[u] = t < c.T ? __ldg((const uint4*)(c.x + (size_t)t * c.ldx + col + part * 8)) : make_uint4(0, 0, 0, 0);
+        xa[u] = (row < BM && t < c.T) ? __ldg((const uint4*)(c.x + (size_t)t * c.ldx + col + part * 8)) : make_uint4(0, 0, 0, 0);
     }
 }
 
@@ -145,9 +160,9 @@ __device__ __forceinline__ void store_tile(const Ctx& c, int kt, const uint4* xa
     __half* As = st;
     __half* Bs = st + BM * LDS;
     #pragma unroll
-    for (int u = 0; u < 2; ++u) {
+    for (int u = 0; u < XU; ++u) {
         const int idx = tid + NT * u, row = idx >> 2, part = idx & 3;
-        *(uint4*)(As + row * LDS + part * 8) = xa[u];
+        if (row < BM) *(uint4*)(As + row * LDS + part * 8) = xa[u];
     }
     const KT k = kt_info(c, kt);
     const ST t = st_info(c, k.s);
@@ -207,15 +222,15 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
     const int nsup = nfull * 8 + (jt > 0 ? 8 : 0);
     const int s_lo = (int)(((long long)nsup * blockIdx.z) / S), s_hi = (int)(((long long)nsup * (blockIdx.z + 1)) / S);
     const int k_lo = st_start(c, s_lo), nk = st_start(c, s_hi);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wm = warp >> 2, wn = warp & 3;
-    float acc[4][4][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wm = warp / WN, wn = warp % WN;
+    float acc[MI][NJ][4];
     #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < MI; ++i)
         #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < NJ; ++j)
             #pragma unroll
             for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
-    uint4 xa[2];
+    uint4 xa[XU];
     u32 wr[NWR];
     // prologue: words of super-tile 0, tile 0, then the prefetch of super-tile 1's words
     if (s_lo < s_hi) {
@@ -227,27 +242,27 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
         if (s_lo + 1 < s_hi) load_words(c, s_lo + 1, n0, wr);
     }
     __syncthreads();
-    const int a_off = (wm * 64 + (lane & 15)) * LDS + 8 * (lane >> 4);
-    const int b_off = BM * LDS + (wn * 32 + (lane & 7) + 8 * (lane >> 4)) * LDS + 8 * ((lane >> 3) & 1);
+    const int a_off = (wm * TM + (lane & 15)) * LDS + 8 * (lane >> 4);
+    const int b_off = BM * LDS + (wn * TN + (lane & 7) + 8 * (lane >> 4)) * LDS + 8 * ((lane >> 3) & 1);
     for (int kt = k_lo; kt < nk; ++kt) {
         const __half* cur = st + (kt & 1) * STAGE;
         const bool more = kt + 1 < nk;
         if (more) load_x(c, kt + 1, m0, xa);
         #pragma unroll
         for (int ks = 0; ks < BK; ks += 16) {
-            u32 a[4][4], b[4][2];
+            u32 a[MI][4], b[NJ][2];
             #pragma unroll
-            for (int i = 0; i < 4; ++i) ldsm4(a[i], cur + a_off + i * 16 * LDS + ks);
+            for (int i = 0; i < MI; ++i) ldsm4(a[i], cur + a_off + i * 16 * LDS + ks);
             #pragma unroll
-            for (int j = 0; j < 2; ++j) {             // two n16 groups -> four n8 tiles
+            for (int j = 0; j < NJ / 2; ++j) {        // n16 groups -> pairs of n8 tiles
                 u32 r[4];
                 ldsm4(r, cur + b_off + j * 16 * LDS + ks);
                 b[2 * j][0] = r[0]; b[2 * j][1] = r[1]; b[2 * j + 1][0] = r[2]; b[2 * j + 1][1] = r[3];
             }
             #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < MI; ++i)
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) mma16816(acc[i][j], a[i], b[j]);
+                for (int j = 0; j < NJ; ++j) mma16816(acc[i][j], a[i], b[j]);
         }
         if (more) {
             const int sn = kt_info(c, kt + 1).s;
@@ -264,15 +279,15 @@ extern "C" __global__ void __launch_bounds__(NT) runs_gemm(
     // epilogue: c0, c1 at (row g, cols 2q, 2q+1), c2, c3 at row g + 8; times the row scale
     const int gq = lane >> 2, q2 = (lane & 3) * 2;
     #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int n = n0 + wn * 32 + j * 8 + q2;
+    for (int j = 0; j < NJ; ++j) {
+        const int n = n0 + wn * TN + j * 8 + q2;
         if (n >= R) continue;
         const float s0 = __half2float(row_scale[n]), s1 = n + 1 < R ? __half2float(row_scale[n + 1]) : 0.f;
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < MI; ++i) {
             #pragma unroll
             for (int hh = 0; hh < 2; ++hh) {
-                const int t = m0 + wm * 64 + i * 16 + gq + 8 * hh;
+                const int t = m0 + wm * TM + i * 16 + gq + 8 * hh;
                 if (t >= T) continue;
                 if (S > 1) {                          // fp32 partial of this slice; split_reduce sums them
                     float* pp = part + ((size_t)blockIdx.z * T + t) * R + n;
@@ -306,9 +321,9 @@ extern "C" __global__ void split_reduce(const float* __restrict__ part, __half* 
 _fns: dict = {}
 
 
-def _smem(bits: int) -> int:
+def _smem(bits: int, bm: int = 128) -> int:
     """Tiles (two stages of A and B) + staged words, bytes (8-byte aligned)."""
-    return 2 * (128 + 128) * 40 * 2 + ((128 * (2 * bits + 1) + 1) // 2) * 8
+    return 2 * (bm + 128) * 40 * 2 + ((128 * (2 * bits + 1) + 1) // 2) * 8
 
 
 def _smem_optin() -> int:
@@ -317,11 +332,11 @@ def _smem_optin() -> int:
     return int(cp.cuda.runtime.deviceGetAttribute(cp.cuda.runtime.cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))
 
 
-def _mod(bits: int, tsmem: bool):
+def _mod(bits: int, tsmem: bool, bm: int = 128):
     import cupy as cp
-    key = (bits, tsmem)
+    key = (bits, tsmem, bm)
     if key not in _fns:
-        src = f"#define BITS {bits}\n#define TSMEM {int(tsmem)}\n" + _SRC
+        src = f"#define BITS {bits}\n#define TSMEM {int(tsmem)}\n#define BM {bm}\n" + _SRC
         _fns[key] = cp.RawModule(code=src, options=("-std=c++17",))
     return _fns[key]
 
@@ -341,14 +356,22 @@ def _part(n: int, dev) -> torch.Tensor:
     return b
 
 
-def auto_split(rl, T: int, sms: int | None = None, max_split: int = 16) -> int:
+BMS = (16, 32, 64, 128)
+
+
+def auto_bm(T: int) -> int:
+    """Smallest token tile covering T (up to 128; larger T: several 128-token tiles)."""
+    return next((b for b in BMS if T <= b), 128)
+
+
+def auto_split(rl, T: int, sms: int | None = None, max_split: int = 16, bm: int = 128) -> int:
     """Split-K slices so the grid covers about two waves of the SMs (small T, few row tiles)."""
     from .proto_runs import geometry
     if sms is None:
         sms = torch.cuda.get_device_properties(rl.words.device).multi_processor_count
     nfull, jt = geometry(rl.nch)
     nsup = nfull * 8 + (8 if jt else 0)
-    blocks = ((rl.R + 127) // 128) * ((T + 127) // 128)
+    blocks = ((rl.R + 127) // 128) * ((T + bm - 1) // bm)
     return max(1, min(max_split, nsup // 2, -(-2 * sms // blocks)))
 
 
@@ -357,10 +380,10 @@ def supported(rl) -> bool:
             and getattr(rl, "table_raw", None) is not None)
 
 
-def plan(rl, table: str = "auto"):
+def plan(rl, table: str = "auto", bm: int = 128):
     """(tsmem, shared memory bytes): the codebook goes to shared memory when it fits ("auto")."""
     tb = rl.table_raw.numel() * 2
-    base = _smem(rl.bits)
+    base = _smem(rl.bits, bm)
     fits = base + tb <= _smem_optin()
     if table == "smem" and not fits:
         raise ValueError("codebook does not fit in shared memory")
@@ -370,10 +393,11 @@ def plan(rl, table: str = "auto"):
 
 
 def gemm(x: torch.Tensor, rls: list, out: torch.Tensor | None = None, table: str = "auto",
-         split: int | str = "auto") -> torch.Tensor:
+         split: int | str = "auto", bm: int | str = "auto") -> torch.Tensor:
     """x fp16 [T, C] (row stride a multiple of 8) -> fp16 [T, sum R] = x @ [W_1; W_2; ...]^T for
     RunsLinears without column orders; out: optional [T, >= sum R] buffer. split: split-K slices
-    per matrix ("auto": auto_split), summed in slice order by split_reduce (fp32 partials)."""
+    per matrix ("auto": auto_split), summed in slice order by split_reduce (fp32 partials).
+    bm: tokens per block (16 / 32 / 64 / 128; "auto": auto_bm)."""
     import cupy as cp
     from .prefill_kernels import stream
     from .proto_runs import geometry
@@ -387,14 +411,16 @@ def gemm(x: torch.Tensor, rls: list, out: torch.Tensor | None = None, table: str
         assert supported(rl) and rl.nch * 4 == C
         assert rl.words.data_ptr() % 16 == 0 and rl.words.shape[1] % 4 == 0
         nfull, jt = geometry(rl.nch)
-        tsmem, shm = plan(rl, table)
-        mod = _mod(rl.bits, tsmem)
+        BMv = auto_bm(T) if bm == "auto" else int(bm)
+        assert BMv in BMS, BMv
+        tsmem, shm = plan(rl, table, BMv)
+        mod = _mod(rl.bits, tsmem, BMv)
         fn = mod.get_function("runs_gemm")
         if shm > 48 * 1024:
             fn.max_dynamic_shared_size_bytes = shm
-        S = auto_split(rl, T) if split == "auto" else int(split)
+        S = auto_split(rl, T, bm=BMv) if split == "auto" else int(split)
         part = _part(S * T * rl.R, x.device) if S > 1 else y
-        grid = ((rl.R + 127) // 128, (T + 127) // 128, S)
+        grid = ((rl.R + 127) // 128, (T + BMv - 1) // BMv, S)
         fn(grid, (256,),
            (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table_raw.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),
             cp.uint64(rl.book_off.data_ptr()), cp.uint64(x.data_ptr()), cp.uint64(y.data_ptr() + off * 2),
