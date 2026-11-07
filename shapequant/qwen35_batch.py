@@ -9,7 +9,8 @@ Per sequence the engine holds its own DeltaNet recurrent state S [Hv, dk, dv] (f
 KV cache and position (pos [B]: sequences may sit at different positions). One step = the fused
 batch-1 step with a batch dimension everywhere:
   - block linears: kernels.batched_runs.RunsBatch (each weight code decoded once for all B,
-    tensor-core mma over the batch); the lm_head: batched q8 kernel;
+    tensor-core mma over the batch); the lm_head: batched q8 kernel on a tile-major copy of the
+    head (kernels.batched_runs.Q8Batch, made once per head: costs a second copy of the head);
   - DeltaNet / attention / norms: kernels.qwen35_batch_kernels (grid.y = sequence); the tiny
     in_proj_a / in_proj_b projections as one fp32 GEMM for the batch;
   - greedy argmax per sequence; the whole step CUDA-graph capturable (capture() per engine, i.e.
@@ -47,6 +48,11 @@ class Qwen35BatchEngine:
         self.eng, self.cfg, self.B, self.layers = eng, c, B, eng.layers
         self.embed, self.lm_head, self.final_norm = eng.embed, eng.lm_head, eng.final_norm
         self.head_loop_max = head_loop_max
+        self.qhead = None       # tile-major copy of the q8 head (kernels.batched_runs.Q8Batch), shared per head
+        if B > head_loop_max and isinstance(eng.lm_head, de.Q8Lin) and eng.lm_head.C % 64 == 0:
+            if getattr(eng.lm_head, "_q8batch", None) is None:
+                eng.lm_head._q8batch = br.Q8Batch.from_lin(eng.lm_head)
+            self.qhead = eng.lm_head._q8batch
         dev = eng.h.device
         f32 = dict(dtype=torch.float32, device=dev)
         f16 = dict(dtype=torch.float16, device=dev)
@@ -111,7 +117,9 @@ class Qwen35BatchEngine:
     def _head(self):
         from .kernels import batched_runs as br
         lm = self.lm_head
-        if self.B <= self.head_loop_max or not isinstance(lm, de.Q8Lin):
+        if self.qhead is not None:
+            self.qhead.run(self.x16, self.logits, self.B)
+        elif self.B <= self.head_loop_max or not isinstance(lm, de.Q8Lin):
             for b in range(self.B):
                 lm.run(self.x16[b], self.logits[b])
         else:

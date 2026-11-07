@@ -34,8 +34,24 @@ typedef unsigned int u32;
 
 // c[0..3] += A(16x16: rows g, g+8 at k slots) * B(16x8): a_lo* = k {2t, 2t+1}, a_hi* = k {2t+8, 2t+9}
 // (row g: *0, row g+8: *1); xv.x / xv.y = the B fragment's k {2t, 2t+1} / {2t+8, 2t+9} for column g
+// ACC16: each k8 half summed in fp16 by the tensor core (8 products, the batch-1 kernel's bound
+// under TABLE_MAX), then added in fp32: twice the mma rate on GeForce parts (fp32 accumulate is
+// half rate there), a few more ALU ops.
+#ifndef ACC16
+#define ACC16 0
+#endif
+__device__ __forceinline__ void mma_k8_h(float* c, u32 a0, u32 a1, u32 b) {
+    u32 d0, d1;
+    asm("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%5,%5};\n"
+        : "=r"(d0), "=r"(d1) : "r"(a0), "r"(a1), "r"(b), "r"(0u));
+    const float2 f0 = __half22float2(*(const __half2*)&d0), f1 = __half22float2(*(const __half2*)&d1);
+    c[0] += f0.x; c[1] += f0.y; c[2] += f1.x; c[3] += f1.y;
+}
 __device__ __forceinline__ void mma_code(float* c, u32 a_lo0, u32 a_lo1, u32 a_hi0, u32 a_hi1, u32 b0, u32 b1) {
-#if __CUDA_ARCH__ >= 800
+#if ACC16
+    mma_k8_h(c, a_lo0, a_lo1, b0);
+    mma_k8_h(c, a_hi0, a_hi1, b1);
+#elif __CUDA_ARCH__ >= 800
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a_lo0), "r"(a_lo1), "r"(a_hi0), "r"(a_hi1), "r"(b0), "r"(b1));
@@ -275,6 +291,72 @@ gemv_q8_b(const uint2* __restrict__ q, const __half* __restrict__ scales, const 
     }
 }
 
+// Tile-major variant (Q8Batch's repacked copy): per 16-row tile and 64-column superblock, 1 KB laid
+// out in thread order, qt[((tile * NSB + sb) * 2 + h) * 32 + lane] (uint4; h = 0: row g, 1: row g + 8),
+// so every warp load is 512 contiguous bytes; scales st[(tile * NB + kb) * 16 + row in tile].
+// Otherwise as gemv_q8_bw (scale folded into the fp16 weights).
+extern "C" __global__ void __launch_bounds__(256)
+gemv_q8_bt(const uint4* __restrict__ qt, const __half* __restrict__ st, const uint4* __restrict__ X,
+           __half* __restrict__ Y, int R, int NSB, int B)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const int ntiles = (R + 15) >> 4, NB = NSB * 2;
+    for (int tile = blockIdx.x * 8 + warp; tile < ntiles; tile += gridDim.x * 8) {
+        const int r0 = tile * 16 + g, r1 = r0 + 8;
+        const uint4* qtile = qt + (size_t)tile * NSB * 64 + lane;
+        const __half* stile = st + (size_t)tile * NB * 16 + g + (t >> 1) * 16;
+        float acc[NB8][4];
+        #pragma unroll
+        for (int nb = 0; nb < NB8; ++nb) { acc[nb][0] = acc[nb][1] = acc[nb][2] = acc[nb][3] = 0.f; }
+        #pragma unroll 1
+        for (int k0 = 0; k0 < NSB; k0 += KU) {
+            uint4 qa[KU], qb[KU];
+            __half sa[KU], sb[KU];
+            #pragma unroll
+            for (int u = 0; u < KU; ++u) {
+                const int kb = min(k0 + u, NSB - 1);
+                qa[u] = __ldg(qtile + kb * 64);
+                qb[u] = __ldg(qtile + kb * 64 + 32);
+                sa[u] = k0 + u < NSB ? stile[kb * 32] : __float2half(0.f);
+                sb[u] = k0 + u < NSB ? stile[kb * 32 + 8] : __float2half(0.f);
+            }
+            #pragma unroll
+            for (int u = 0; u < KU; ++u) {
+                const int kb = min(k0 + u, NSB - 1);
+                u32 a[8], b[8];
+                const __half2 s2a = __half2half2(sa[u]), s2b = __half2half2(sb[u]);
+                i8x4_h2(qa[u].x, a[0], a[1]); i8x4_h2(qa[u].y, a[2], a[3]);
+                i8x4_h2(qa[u].z, a[4], a[5]); i8x4_h2(qa[u].w, a[6], a[7]);
+                i8x4_h2(qb[u].x, b[0], b[1]); i8x4_h2(qb[u].y, b[2], b[3]);
+                i8x4_h2(qb[u].z, b[4], b[5]); i8x4_h2(qb[u].w, b[6], b[7]);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    __half2 ha = __hmul2(*(__half2*)&a[i], s2a), hb = __hmul2(*(__half2*)&b[i], s2b);
+                    a[i] = *(u32*)&ha; b[i] = *(u32*)&hb;
+                }
+                #pragma unroll
+                for (int nb = 0; nb < NB8; ++nb) {
+                    const int n = nb * 8 + g;
+                    uint4 x0 = make_uint4(0u, 0u, 0u, 0u), x1 = x0;
+                    if (n < B) { x0 = __ldg(X + ((size_t)n * NSB + kb) * 8 + 2 * t); x1 = __ldg(X + ((size_t)n * NSB + kb) * 8 + 2 * t + 1); }
+                    mma_code(acc[nb], a[0], b[0], a[1], b[1], x0.x, x0.y);
+                    mma_code(acc[nb], a[2], b[2], a[3], b[3], x0.z, x0.w);
+                    mma_code(acc[nb], a[4], b[4], a[5], b[5], x1.x, x1.y);
+                    mma_code(acc[nb], a[6], b[6], a[7], b[7], x1.z, x1.w);
+                }
+            }
+        }
+        #pragma unroll
+        for (int nb = 0; nb < NB8; ++nb) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int n = nb * 8 + 2 * t + (e & 1), row = e < 2 ? r0 : r1;
+                if (n < B && row < R) Y[(size_t)n * R + row] = __float2half(acc[nb][e]);
+            }
+        }
+    }
+}
+
 // Wide variant: thread (g, t) takes columns 16t..16t+15 of each 64-column superblock (one 16-byte
 // load per row: 64 contiguous bytes per row per warp load); its 32-column block's scale is folded
 // into the fp16 weights (fp16(q * s): one rounding per weight), so the mmas accumulate directly.
@@ -350,24 +432,30 @@ def _nb8(B: int) -> int:
     return (B + 7) // 8
 
 
-def _runs_fn(bits, nch, nb8, smem, books, threads):
+def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False):
     import cupy as cp
     from .proto_runs import geometry
     nfull, jt = geometry(nch)
-    key = ("runs", bits, nfull, jt, nb8, smem, books, threads)
+    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define NB8 {nb8}\n"
-               f"#define SMEM {int(smem)}\n#define BOOKS {int(books)}\n#define THREADS {threads}\n") + _COMMON + _SRC_RUNS
+               f"#define SMEM {int(smem)}\n#define BOOKS {int(books)}\n#define THREADS {threads}\n"
+               f"#define ACC16 {int(acc16)}\n") + _COMMON + _SRC_RUNS
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs_b")
     return _mods[key]
 
 
-def _q8_fn(nb8, ku=4, wide=True):
+_Q8_KERNELS = {"narrow": "gemv_q8_b", "wide": "gemv_q8_bw", "tile": "gemv_q8_bt"}
+
+
+def _q8_fn(nb8, ku=4, kind="wide", acc16=False):
+    """acc16 only for the scale-folded kinds (narrow sums raw int8 products: fp16 could overflow)."""
     import cupy as cp
-    key = ("q8", nb8, ku, wide)
+    assert not (acc16 and kind == "narrow")
+    key = ("q8", nb8, ku, kind, acc16)
     if key not in _mods:
-        src = f"#define NB8 {nb8}\n#define KU {ku}\n" + _COMMON + _SRC_Q8
-        _mods[key] = cp.RawModule(code=src, options=("-std=c++17",)).get_function("gemv_q8_bw" if wide else "gemv_q8_b")
+        src = f"#define NB8 {nb8}\n#define KU {ku}\n#define ACC16 {int(acc16)}\n" + _COMMON + _SRC_Q8
+        _mods[key] = cp.RawModule(code=src, options=("-std=c++17",)).get_function(_Q8_KERNELS[kind])
     return _mods[key]
 
 
@@ -396,7 +484,7 @@ class RunsBatch:
     max_split: column slices (split-K) at most."""
 
     def __init__(self, rl, bmax: int = BMAX, warps: int = 8, bps: int = 2, max_split: int = 8,
-                 table: str = "auto"):
+                 table: str = "auto", acc16: bool = False):
         from . import proto_runs as pr
         assert not rl.has_mask, "batched runs kernel: one column order (M = 1) only"
         self.rl, self.R, self.C, self.bmax = rl, rl.R, rl.nch * 4, bmax
@@ -407,7 +495,7 @@ class RunsBatch:
         self.books = table == "books" or (table == "auto" and tb > SMEM_LIMIT and K * 8 <= SMEM_LIMIT and G > 1)
         self.smem = self.books or (tb <= SMEM_LIMIT if table == "auto" else table == "smem")
         self.table_bytes = K * 8 if self.books else tb
-        self.threads, self.W = warps * 32, warps
+        self.threads, self.W, self.acc16 = warps * 32, warps, acc16
         # 16-row tiles grouped by book, each book's tiles padded to whole groups of W
         book = (rl.book_off.long() // K).cpu()
         tiles, gstart = [], [0]
@@ -449,7 +537,7 @@ class RunsBatch:
         assert B <= self.bmax and X.is_contiguous() and X.dtype == torch.float16
         if self.S > 1:      # the workspace may have grown (new launchers) since __init__
             self.ws = _Workspace.get(self.S * self.bmax * self.R, X.device)
-        fn = _runs_fn(rl.bits, rl.nch, _nb8(B), self.smem, self.books, self.threads)
+        fn = _runs_fn(rl.bits, rl.nch, _nb8(B), self.smem, self.books, self.threads, self.acc16)
         shm = self.table_bytes if self.smem else 0
         K = 1 << rl.bits
         args = (cp.uint64(rl.words.data_ptr()), cp.uint64(rl.table.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),
@@ -476,14 +564,55 @@ def gemv_runs_batched(rl, X: torch.Tensor, Y: torch.Tensor | None = None, **kw) 
 
 def gemv_q8_batched(q: torch.Tensor, scales: torch.Tensor, X: torch.Tensor, Y: torch.Tensor, R: int, C: int,
                     B: int | None = None, bps: int = 4, ku: int = 4, wide: bool | None = None) -> torch.Tensor:
-    """Y[B, R] = X[B, C] . dequant(q, scales)^T for the Q8_0-like head (proto_formats.q8_pack)."""
+    """Y[B, R] = X[B, C] . dequant(q, scales)^T for the Q8_0-like head (proto_formats.q8_pack), from
+    its natural layout. wide (default when C % 64 == 0): scales folded into fp16 weights, 16-byte
+    loads; else exact int8 products times the scale per 32-block. Engines use Q8Batch (repacked)."""
     import cupy as cp
     B = X.shape[0] if B is None else B
     assert C % 32 == 0 and X.is_contiguous() and X.dtype == torch.float16
     wide = C % 64 == 0 if wide is None else wide
-    fn = _q8_fn(_nb8(B), ku, wide)
+    fn = _q8_fn(_nb8(B), ku, "wide" if wide else "narrow")
     grid = min(_sms(q.device) * bps, (R + 127) // 128)
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
         fn((grid,), (256,), (cp.uint64(q.data_ptr()), cp.uint64(scales.data_ptr()), cp.uint64(X.data_ptr()),
                              cp.uint64(Y.data_ptr()), cp.int32(R), cp.int32(C // (64 if wide else 32)), cp.int32(B)))
     return Y
+
+
+class Q8Batch:
+    """Batched launcher for the Q8_0-like head (decode_e2e.Q8Lin): a tile-major copy of its int8
+    weights and scales (16-row tiles, each 64-column superblock's 1 KB in thread order: every warp
+    load is 512 contiguous bytes), run(X [B, C], Y [B, R]). Costs a second copy of the head (the
+    batch-1 kernel keeps reading the original). Needs C % 64 == 0."""
+
+    def __init__(self, q: torch.Tensor, scales: torch.Tensor, R: int, C: int, bps: int = 4, ku: int = 4,
+                 acc16: bool = False):
+        assert C % 64 == 0, "Q8Batch needs C % 64 == 0"
+        self.R, self.C, self.bps, self.ku, self.acc16 = R, C, bps, ku, acc16
+        T, NSB = (R + 15) // 16, C // 64
+        qp = torch.zeros(T * 16, C, dtype=torch.int8, device=q.device)
+        qp[:R] = q
+        # [tile, h, g, sb, t, 16 bytes] -> [tile, sb, h, g, t, 16]
+        self.qt = qp.view(T, 2, 8, NSB, 4, 16).permute(0, 3, 1, 2, 4, 5).contiguous()
+        sp = torch.zeros(T * 16, C // 32, dtype=torch.float16, device=q.device)
+        sp[:R] = scales
+        self.st = sp.view(T, 16, C // 32).transpose(1, 2).contiguous()          # [tile, block, row]
+        del qp, sp
+
+    @classmethod
+    def from_lin(cls, lin, **kw):
+        return cls(lin.q, lin.sc, lin.R, lin.C, **kw)
+
+    def nbytes(self) -> int:
+        return self.qt.numel() + self.st.numel() * 2
+
+    def run(self, X: torch.Tensor, Y: torch.Tensor, B: int | None = None) -> torch.Tensor:
+        import cupy as cp
+        B = X.shape[0] if B is None else B
+        assert X.is_contiguous() and X.dtype == torch.float16
+        fn = _q8_fn(_nb8(B), self.ku, "tile", self.acc16)
+        grid = min(_sms(X.device) * self.bps, (self.R + 127) // 128)
+        with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+            fn((grid,), (256,), (cp.uint64(self.qt.data_ptr()), cp.uint64(self.st.data_ptr()), cp.uint64(X.data_ptr()),
+                                 cp.uint64(Y.data_ptr()), cp.int32(self.R), cp.int32(self.C // 64), cp.int32(B)))
+        return Y

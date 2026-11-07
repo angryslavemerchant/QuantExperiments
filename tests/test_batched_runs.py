@@ -74,8 +74,13 @@ def test_q8_matches_batch1(R, C):
     X = (torch.randn(32, C, device="cuda") * 2).half()
     ref = torch.stack([pf.gemv_q8(q, sc, X[b], torch.empty(R, dtype=torch.float16, device="cuda"), R, C).float()
                        for b in range(32)])
+    tile = br.Q8Batch(q, sc, R, C) if C % 64 == 0 else None
     for B in (1, 3, 8, 9, 17, 32):
         for wide in ((False, True) if C % 64 == 0 else (False,)):
             Y = torch.empty(B, R, dtype=torch.float16, device="cuda")
             br.gemv_q8_batched(q, sc, X[:B].contiguous(), Y, R, C, wide=wide)
             assert _close(Y, ref[:B]) < 2e-3, (B, wide)
+        if tile is not None:
+            Y = torch.full((B, R), float("nan"), dtype=torch.float16, device="cuda")
+            tile.run(X[:B].contiguous(), Y)
+            assert _close(Y, ref[:B]) < 2e-3, (B, "tile")
