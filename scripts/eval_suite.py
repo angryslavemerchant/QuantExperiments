@@ -83,6 +83,8 @@ def main() -> int:
     ap.add_argument("--mmlu-pro-limit", type=int, default=100, help="questions per MMLU-Pro subject")
     ap.add_argument("--max-model-len", type=int, default=36864)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
+    ap.add_argument("--max-num-seqs", type=int, default=256,
+                    help="concurrent sequences (vLLM default 1024 exceeds the DeltaNet state slots of a 27B on 96 GB)")
     ap.add_argument("--limit", type=int, help="override every task's limit (smoke tests)")
     ap.add_argument("--max-gen", type=int, help="cap max_gen_toks everywhere (smoke tests)")
     a = ap.parse_args()
@@ -107,7 +109,8 @@ def main() -> int:
 
     t0 = time.time()
     kw = dict(pretrained=a.ckpt, dtype="bfloat16", max_model_len=a.max_model_len, gpu_memory_utilization=a.gpu_mem,
-              batch_size="auto", seed=0, max_gen_toks=2048, enable_prefix_caching=True)
+              batch_size="auto", seed=0, max_gen_toks=2048, enable_prefix_caching=True,
+              max_num_seqs=a.max_num_seqs)  # hybrid models: one DeltaNet state slot per running sequence
     try:   # text only: no vision memory profiling (multimodal base repos)
         lm = VLLM(**kw, limit_mm_per_prompt={"image": 0, "video": 0})
     except Exception as e:
