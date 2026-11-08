@@ -200,6 +200,15 @@ def test_export_config_embed_head_flag():
     cfg = ex.vllm_config({"vocab_size": 10, "dtype": "bfloat16"})
     assert cfg["quantization_config"]["embed_head"] == "packed" and "dtype" not in cfg
     assert ex.vllm_config({}, "bf16")["quantization_config"]["embed_head"] == "bf16"
+    names = ex.to_multimodal_names({"model.layers.3.mlp.down_proj.weight": 0, "model.norm.weight": 0,
+                                    "model.embed_tokens.weight": 0, "lm_head.weight": 0})
+    assert sorted(names) == ["lm_head.weight", "model.language_model.embed_tokens.weight",
+                             "model.language_model.layers.3.mlp.down_proj.weight", "model.language_model.norm.weight"]
+    # the multimodal prefix still maps every text layer onto its packed matrices; the vision tower does not
+    assert core.packed_pieces("model.language_model.layers.3.mlp.gate_up_proj",
+                              {"model.layers.3.mlp.gate_proj", "model.layers.3.mlp.up_proj"}) == \
+        ["model.layers.3.mlp.gate_proj", "model.layers.3.mlp.up_proj"]
+    assert core.packed_pieces("model.visual.blocks.3.mlp.linear_fc1", {"model.layers.3.mlp.gate_proj"}) is None
 
 
 def test_embed_op_matches_q4_embed():
