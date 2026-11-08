@@ -80,6 +80,20 @@ SPEC=dspark MAX_LEN=16384 MAX_SEQS=4 bash deploy/serve.sh
 The first start downloads the drafter and compiles (can take ~30 min); later starts are faster.
 Best when you are the only user; for many parallel requests leave it off.
 
+### Images (vision)
+
+The base model's vision tower can be added (kept in bf16, +1 GB; the text model stays 2.5 bpw).
+Export with it at setup time (if you already set up text-only, `rm -rf ~/models/q27-sq` first):
+
+```bash
+VISION=1 HF_TOKEN=hf_xxx bash deploy/setup_server.sh
+```
+
+`serve.sh` then accepts images automatically (`IMAGES=4` per request by default). Send them as
+OpenAI `image_url` parts (an `https://` URL or a `data:image/png;base64,...` URL). Measured on the
+3090 (2026-11-08): both test images (a synthetic number/shapes image and a COCO photo of two cats
+with remotes) described correctly, ~1.3 s per short answer; KV cache ~92k tokens.
+
 ## 4. Check it
 
 On the server:

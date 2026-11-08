@@ -3,12 +3,14 @@
 #   HF_TOKEN=hf_... bash deploy/setup_server.sh            (run from the repo root)
 # Creates ~/sq-venv (vLLM + CuPy + this repo), downloads the private packed model and exports a
 # vLLM checkpoint to ~/models/q27-sq. Re-running is safe (skips what exists).
-# Env: VENV (~/sq-venv), MODEL_DIR (~/models/q27-sq), PACKED (HF repo:file of the packed model).
+# Env: VENV (~/sq-venv), MODEL_DIR (~/models/q27-sq), PACKED (HF repo:file of the packed model),
+#   VISION (1: also export the base model's vision tower (+1 GB) so the server accepts images).
 set -euo pipefail
 VENV=${VENV:-$HOME/sq-venv}
 MODEL_DIR=${MODEL_DIR:-$HOME/models/q27-sq}
 PACKED=${PACKED:-luckymushy/Qwen3.8-27B-shapequant-2.5bpw:s16_25_ft.safetensors}
 PY=${PYTHON:-python3}
+VISION_ARG=""; [ "${VISION:-}" = 1 ] && VISION_ARG=--vision
 log() { echo "[setup] $*"; }
 
 [ -f pyproject.toml ] && grep -q shapequant pyproject.toml || { echo "run from the repo root"; exit 1; }
@@ -41,6 +43,8 @@ fi
 if [ ! -f "$MODEL_DIR/config.json" ]; then
   log "downloading + exporting the model to $MODEL_DIR (~10 GB)"
   mkdir -p "$(dirname "$MODEL_DIR")"
-  "$VENV/bin/python" scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$MODEL_DIR"
+  "$VENV/bin/python" scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$MODEL_DIR" $VISION_ARG
+elif [ "${VISION:-}" = 1 ] && [ ! -f "$MODEL_DIR/visual.safetensors" ]; then
+  log "$MODEL_DIR is text-only: re-export with images by removing it first (rm -rf $MODEL_DIR)"
 fi
 log "done. Start the server with: bash deploy/serve.sh"

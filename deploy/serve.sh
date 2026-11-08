@@ -7,7 +7,8 @@
 #   MAX_SEQS (16), GPU_UTIL (0.92), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), NAME (served model
 #   name), KV_DTYPE (auto | fp8: halves KV memory -> longer contexts), TOOL_PARSER (enables tool calls,
 #   e.g. qwen3_coder; see RUNBOOK), SPEC (dspark: RedHat's DSpark drafter, ~2x single-request speed,
-#   less KV room -> use MAX_LEN<=16384, MAX_SEQS<=4), EXTRA (more vllm serve args).
+#   less KV room -> use MAX_LEN<=16384, MAX_SEQS<=4), IMAGES (max images per request when the model
+#   was exported with VISION=1; default 4), EXTRA (more vllm serve args).
 set -euo pipefail
 VENV=${VENV:-$HOME/sq-venv}
 MODEL_DIR=${MODEL_DIR:-$HOME/models/q27-sq}
@@ -22,9 +23,10 @@ KV_DTYPE=${KV_DTYPE:-auto}
 [ -f "$MODEL_DIR/config.json" ] || { echo "no model at $MODEL_DIR: run deploy/setup_server.sh first"; exit 1; }
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SPEC_ARGS=()
+[ -f "$MODEL_DIR/visual.safetensors" ] && SPEC_ARGS+=(--limit-mm-per-prompt "{\"image\": ${IMAGES:-4}}")
 case "${SPEC:-}" in
   "") ;;
-  dspark) SPEC_ARGS=(--speculative-config '{"model":"RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":7,"method":"dspark"}') ;;
+  dspark) SPEC_ARGS+=(--speculative-config '{"model":"RedHatAI/Qwen3.8-27B-speculator.dspark","num_speculative_tokens":7,"method":"dspark"}') ;;
   *) echo "SPEC=$SPEC: only 'dspark' is supported"; exit 1 ;;
 esac
 # first start compiles the kernels and tunes each matrix shape (a few minutes); later starts reuse
