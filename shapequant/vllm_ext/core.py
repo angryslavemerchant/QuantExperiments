@@ -416,9 +416,31 @@ def register(ps) -> int:
     return len(_REGISTRY) - 1
 
 
+_DEBUG = {"on": __import__("os").environ.get("SHAPEQUANT_DEBUG") == "1", "n": 0}
+
+
+def _debug(kind: str, handle: int, x: torch.Tensor, y: torch.Tensor) -> None:
+    """SHAPEQUANT_DEBUG=1 (eager runs): report non-finite outputs / inputs over the fp16 range."""
+    if not _DEBUG["on"] or torch.cuda.is_current_stream_capturing() or _DEBUG["n"] > 60:
+        return
+    xa = x.float().abs().max().item() if x.is_floating_point() and x.numel() else 0.0
+    yf = bool(torch.isfinite(y).all().item()) if y.numel() else True
+    seen = _DEBUG.setdefault("seen", set())
+    if handle not in seen and x.shape[0] > 1:          # one line per layer on the first real batch
+        seen.add(handle)
+        print(f"[shapequant trace] {handle} M {x.shape[0]} x absmax {xa:.4g} rms {x.float().pow(2).mean().sqrt().item():.4g}"
+              f" -> y rms {y.float().pow(2).mean().sqrt().item():.4g} finite {yf}", flush=True)
+    if not yf or xa > 6e4 or not (xa == xa):
+        _DEBUG["n"] += 1
+        print(f"[shapequant debug] {kind} handle {handle} {type(_REGISTRY[handle]).__name__} x {tuple(x.shape)} "
+              f"{x.dtype} absmax {xa:.4g} y finite {yf} y absmax {y.float().abs().max().item():.4g}", flush=True)
+
+
 @torch.library.custom_op("shapequant::linear", mutates_args=())
 def linear_op(x: torch.Tensor, handle: int) -> torch.Tensor:
-    return _REGISTRY[handle].forward(x)
+    y = _REGISTRY[handle].forward(x)
+    _debug("linear", handle, x, y)
+    return y
 
 
 @linear_op.register_fake
@@ -428,7 +450,12 @@ def _(x: torch.Tensor, handle: int) -> torch.Tensor:
 
 @torch.library.custom_op("shapequant::embed", mutates_args=())
 def embed_op(ids: torch.Tensor, handle: int) -> torch.Tensor:
-    return _REGISTRY[handle].forward(ids)
+    y = _REGISTRY[handle].forward(ids)
+    if _DEBUG["on"] and not torch.cuda.is_current_stream_capturing() and _DEBUG["n"] < 3 and y.numel():
+        _DEBUG["n"] += 1
+        print(f"[shapequant debug] embed ids {tuple(ids.shape)} first {ids.flatten()[:4].tolist()} "
+              f"y rms {y.float().pow(2).mean().sqrt().item():.4g}", flush=True)
+    return y
 
 
 @embed_op.register_fake
