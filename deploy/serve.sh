@@ -6,10 +6,11 @@
 #   HOST (127.0.0.1; use your Tailscale IP to reach it from home), PORT (8000), MAX_LEN (32768),
 #   MAX_SEQS (16), GPU_UTIL (0.92), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
 #   name), KV_DTYPE (auto | fp8: halves KV memory -> longer contexts), TOOL_PARSER (enables tool calls,
-#   e.g. qwen3_coder; see RUNBOOK), SPEC (dspark: RedHat's DSpark drafter, ~2x single-request speed,
-#   less KV room -> use MAX_LEN<=16384, MAX_SEQS<=4; mtp: Qwen3.8's own MTP head, needs a checkpoint exported
-#   with --embed-head bf16 --mtp, see RUNBOOK), SPEC_K (draft tokens; default dspark 7, mtp 2),
-#   ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF; default expandable_segments:True, set "" on WSL2), IMAGES (max images per request when the model
+#   e.g. qwen3_coder; see RUNBOOK), SPEC (dspark: DSpark drafter (default: the FP8 build of RedHat's), ~2.4x
+#   single-request speed, less KV room; mtp: Qwen3.8's own MTP head, needs a checkpoint exported
+#   with --embed-head bf16 --mtp, see RUNBOOK), SPEC_K (draft tokens; default dspark 7, mtp 2), SPEC_MODEL (DSpark drafter repo),
+#   RSSM (1: RecoverSSM for the DeltaNet layers under SPEC, much more KV room; needs the patched venv from
+#   deploy/patches/make_recoverssm_venv.sh, used automatically), #   ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF; default expandable_segments:True, set "" on WSL2), IMAGES (max images per request when the model
 #   was exported with VISION=1; default 4), EXTRA (more vllm serve args).
 set -euo pipefail
 VENV=${VENV:-$HOME/sq-venv}
@@ -29,12 +30,25 @@ SPEC_ARGS=()
 [ -f "$MODEL_DIR/visual.safetensors" ] && SPEC_ARGS+=(--limit-mm-per-prompt "{\"image\": ${IMAGES:-4}}")
 case "${SPEC:-}" in
   "") ;;
-  dspark) SPEC_ARGS+=(--speculative-config "{\"model\":\"RedHatAI/Qwen3.8-27B-speculator.dspark\",\"num_speculative_tokens\":${SPEC_K:-7},\"method\":\"dspark\"}") ;;
+  dspark) SPEC_K=${SPEC_K:-7}
+    SPEC_ARGS+=(--speculative-config "{\"model\":\"${SPEC_MODEL:-inference-optimization/Qwen3.8-27B-DSpark-FP8-DYNAMIC}\",\"num_speculative_tokens\":$SPEC_K,\"method\":\"dspark\"}") ;;
   mtp)
     [ -f "$MODEL_DIR/mtp.safetensors" ] || { echo "SPEC=mtp needs a checkpoint with the MTP head (export --embed-head bf16 --mtp; see RUNBOOK)"; exit 1; }
-    SPEC_ARGS+=(--speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":${SPEC_K:-2}}") ;;
+    SPEC_K=${SPEC_K:-2}
+    SPEC_ARGS+=(--speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$SPEC_K}") ;;
   *) echo "SPEC=$SPEC: use 'dspark' or 'mtp'"; exit 1 ;;
 esac
+if [ -n "${SPEC:-}" ]; then
+  # CUDA graphs only up to what can run at once (MAX_SEQS x (K + 1) tokens), not vLLM's default 64+
+  cap=$(( (MAX_SEQS * (SPEC_K + 1) + 7) / 8 * 8 ))
+  SPEC_ARGS+=(--compilation-config "{\"max_cudagraph_capture_size\":$cap}")
+fi
+if [ "${RSSM:-}" = 1 ]; then
+  [ -n "${SPEC:-}" ] || { echo "RSSM=1 needs SPEC (RecoverSSM replaces the speculative state copies)"; exit 1; }
+  [ "$VENV" = "$HOME/sq-venv" ] && VENV=$HOME/sq-venv-rssm
+  [ -x "$VENV/bin/vllm" ] || { echo "no RecoverSSM venv at $VENV: run deploy/patches/make_recoverssm_venv.sh"; exit 1; }
+  SPEC_ARGS+=(--use-replayssm --mamba-backend triton)
+fi
 # first start compiles the kernels and tunes each matrix shape (a few minutes); later starts reuse
 # vLLM's compile cache, the shape tuning reruns (~1-2 min)
 exec "$VENV/bin/vllm" serve "$MODEL_DIR" \

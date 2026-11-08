@@ -3,9 +3,9 @@
 # drafter, and Qwen3.8's own MTP head; decode tok/s at conc 1 / 4 and acceptance (spec_bench.py),
 # plus a 7x8 sanity answer per config.
 #   bash scripts/spec_stage.sh <out_dir>
-# Env: CONFIGS ("base dspark mtp"), DSPARK_K (7), MTP_K (3), MAX_LEN (16384); for a local box: VENV, CK, CKM
+# Env: CONFIGS ("base dspark mtp"), DSPARK_K (7), DSPARK_MODEL (drafter repo), MTP_K (3), MAX_LEN (16384); for a local box: VENV, CK, CKM
 # (checkpoint dirs), PACKED_LOCAL (export from a local packed file), ALLOC_CONF ("" on WSL2: expandable
-# segments make the plugin's shape tuning crawl there).
+# segments make the plugin's shape tuning crawl there), EXTRA (more vllm serve args).
 set -uo pipefail
 OUT=$1
 PY=${PYTHON:-$(command -v python3 || command -v python)}
@@ -13,6 +13,7 @@ VENV=${VENV:-/workspace/vllm_env}; VPY=$VENV/bin/python
 PACKED=${PACKED:-luckymushy/Qwen3.8-27B-shapequant-2.5bpw:s16_25_ft.safetensors}
 CONFIGS=${CONFIGS:-"base dspark mtp"}
 DSPARK_K=${DSPARK_K:-7}; MTP_K=${MTP_K:-3}; MAX_LEN=${MAX_LEN:-16384}
+DSPARK_MODEL=${DSPARK_MODEL:-RedHatAI/Qwen3.8-27B-speculator.dspark}
 mkdir -p "$OUT"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 SRC=(--packed-hf "$PACKED"); [ -n "${PACKED_LOCAL:-}" ] && SRC=(--packed "$PACKED_LOCAL")
@@ -36,15 +37,15 @@ for cfg in $CONFIGS; do
   stop
   case $cfg in
     base)        ck=$CK;  spec="" ;;
-    dspark)      ck=$CK;  spec="{\"model\":\"RedHatAI/Qwen3.8-27B-speculator.dspark\",\"num_speculative_tokens\":$DSPARK_K,\"method\":\"dspark\"}" ;;
-    dspark_bf16) ck=$CKM; spec="{\"model\":\"RedHatAI/Qwen3.8-27B-speculator.dspark\",\"num_speculative_tokens\":$DSPARK_K,\"method\":\"dspark\"}" ;;
+    dspark)      ck=$CK;  spec="{\"model\":\"$DSPARK_MODEL\",\"num_speculative_tokens\":$DSPARK_K,\"method\":\"dspark\"}" ;;
+    dspark_bf16) ck=$CKM; spec="{\"model\":\"$DSPARK_MODEL\",\"num_speculative_tokens\":$DSPARK_K,\"method\":\"dspark\"}" ;;
     mtp)         ck=$CKM; spec="{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$MTP_K}" ;;
     *) log "unknown config $cfg"; continue ;;
   esac
   log "server: $cfg"
   env ${ALLOC_CONF:+PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF} nohup "$VENV/bin/vllm" serve "$ck" --served-model-name ours \
     --host 127.0.0.1 --port 8000 --dtype bfloat16 --max-model-len $MAX_LEN --max-num-seqs 8 --gpu-memory-utilization 0.93 \
-    --max-num-batched-tokens 4096 --seed 0 ${spec:+--speculative-config "$spec"} > "$OUT/server_$cfg.log" 2>&1 &
+    --max-num-batched-tokens 4096 --seed 0 ${spec:+--speculative-config "$spec"} ${EXTRA:-} > "$OUT/server_$cfg.log" 2>&1 &
   pid=$!; up=0
   for _ in $(seq 270); do        # 45 min: a drafter download + compile can take ~30
     curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && { up=1; break; }

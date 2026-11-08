@@ -298,4 +298,7 @@ def _patch_qwen35_embedding() -> None:
 
 
 def register() -> None:
-    """vllm.general_plugins entry point: importing this module registers the config."""
+    """vllm.general_plugins entry point: importing this module registers the config; also installs
+    the least-waste hybrid KV grouping (kv_grouping.py; SHAPEQUANT_KV_GROUPING=0 to skip)."""
+    from . import kv_grouping
+    kv_grouping.install()
