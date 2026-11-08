@@ -25,7 +25,7 @@ WORDS = ["amber", "falcon", "quartz", "tundra", "velvet", "cobalt", "saffron", "
 
 def filler_text() -> str:
     from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train[:60000]")
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train[:60000]")
     return "".join(t for t in ds["text"] if t.strip())
 
 
