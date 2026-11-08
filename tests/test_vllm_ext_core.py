@@ -23,6 +23,8 @@ def test_packed_pieces():
     assert core.packed_pieces("model.layers.0.linear_attn.in_proj_ba", names) is None
     assert core.packed_pieces("model.layers.0.linear_attn.conv1d", names) is None
     assert core.packed_pieces("lm_head", names) is None
+    assert core.packed_pieces("mtp.layers.0.mlp.down_proj", names) is None
+    assert core.packed_pieces("model.mtp.layers.0.mlp.down_proj", names) is None
     with pytest.raises(ValueError):
         core.packed_pieces("model.layers.0.mlp.gate_up_proj", names | {"model.layers.0.mlp.gate_proj"})
 

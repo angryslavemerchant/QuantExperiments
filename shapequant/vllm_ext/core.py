@@ -40,6 +40,8 @@ _LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.(.+)$")
 def packed_pieces(prefix: str, names) -> list[str] | None:
     """Packed matrix names (model.layers.N.<kind>) making up the vLLM layer at `prefix`, or None
     when the layer is not (entirely) packed. names: the packed file's matrix names."""
+    if prefix.startswith("mtp.") or ".mtp." in prefix:
+        return None          # the MTP draft's own layers (bf16), not the main model's layers.N
     m = _LAYER.search(prefix)
     if m is None:
         return None

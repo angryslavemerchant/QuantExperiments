@@ -75,7 +75,24 @@ def dense_tensors(pf, chunk: int = 16384, embed_head: str = "packed") -> dict[st
     return out
 
 
-def export(packed: str, out: Path, base: str | None = None, embed_head: str = "packed") -> dict:
+def mtp_tensors(base: str) -> dict[str, torch.Tensor]:
+    """The base checkpoint's MTP head (mtp.* tensors, bf16) for vLLM's qwen3_5_mtp speculative
+    decoding: only the shards holding them are downloaded."""
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    idx = json.loads(Path(hf_hub_download(base, "model.safetensors.index.json")).read_text())["weight_map"]
+    names = [n for n in idx if n.startswith("mtp.") or ".mtp." in n]
+    out = {}
+    for shard in sorted({idx[n] for n in names}):
+        with safe_open(hf_hub_download(base, shard), "pt") as f:
+            for n in names:
+                if idx[n] == shard:
+                    key = n[n.index("mtp."):]
+                    out[key] = f.get_tensor(n).to(torch.bfloat16).contiguous()
+    return out
+
+
+def export(packed: str, out: Path, base: str | None = None, embed_head: str = "packed", mtp: bool = False) -> dict:
     from safetensors.torch import save_file
     from shapequant.packed import PackedFile
     pf = PackedFile(packed)
@@ -88,6 +105,12 @@ def export(packed: str, out: Path, base: str | None = None, embed_head: str = "p
     tensors = dense_tensors(pf, embed_head=embed_head)
     save_file(tensors, str(out / "model.safetensors"), metadata={"format": "pt"})
     log(f"wrote {len(tensors)} dense tensors ({sum(t.numel() * 2 for t in tensors.values()) / 1e9:.2f} GB)")
+    if mtp:
+        mt = mtp_tensors(base)
+        if not mt:
+            raise ValueError(f"{base} has no mtp.* tensors")
+        save_file(mt, str(out / "mtp.safetensors"), metadata={"format": "pt"})
+        log(f"wrote {len(mt)} MTP tensors ({sum(t.numel() * 2 for t in mt.values()) / 1e9:.2f} GB)")
     dst = out / PACKED_NAME
     if dst.exists():
         dst.unlink()
@@ -118,6 +141,7 @@ def main() -> int:
     src.add_argument("--packed-hf", help="REPO:FILE")
     ap.add_argument("--base", help="tokenizer / chat template source (default: the packed file's base model)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--mtp", action="store_true", help="also the base model's MTP head (bf16), for MTP speculative decoding")
     ap.add_argument("--embed-head", choices=["packed", "bf16"], default="packed",
                     help="packed: plugin serves the q4 embedding / q8 head; bf16: dequantized into model.safetensors")
     a = ap.parse_args()
@@ -126,7 +150,7 @@ def main() -> int:
         from huggingface_hub import hf_hub_download
         repo, fname = a.packed_hf.split(":", 1)
         packed = hf_hub_download(repo, fname)
-    export(packed, Path(a.out), a.base, a.embed_head)
+    export(packed, Path(a.out), a.base, a.embed_head, a.mtp)
     return 0
 
 
