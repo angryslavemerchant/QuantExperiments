@@ -281,8 +281,14 @@ class Qwen35Engine:
         return sorted(ts)[len(ts) // 2]
 
 
+def default_large(dev="cuda") -> tuple[int, int]:
+    """(threads, blocks_per_sm) for matrices with R > 4096: Ampere (sm_80 / sm_86) prefers 1024-thread
+    blocks (3090 27B tg 48.8 vs 43.3 tok/s at 512, s38 sweep), newer GPUs 512 (PRO 6000 / 5090)."""
+    return (1024, 1) if (8, 0) <= torch.cuda.get_device_capability(dev) < (8, 9) else (512, 1)
+
+
 def engine_from_packed(packed_path, *, model=None, max_len: int = 2048, dev="cuda", small=(0, 1),
-                       large=(512, 1), fused: bool | None = None) -> tuple[Qwen35Engine, dict]:
+                       large=None, fused: bool | None = None) -> tuple[Qwen35Engine, dict]:
     """Qwen3.5 engine from a packed file: self-contained (aux section) unless `model` is given,
     in which case the non-block tensors come from the HF model (fp16 embedding, 8-bit head)."""
     from .runtime import _AuxSource, _ModelSource, runs_linear
@@ -304,7 +310,7 @@ def engine_from_packed(packed_path, *, model=None, max_len: int = 2048, dev="cud
         L = {"ln1": w1p(src.get(p + "input_layernorm.weight")), "ln2": w1p(src.get(p + "post_attention_layernorm.weight"))}
         names = dict(MLP, **(LIN if typ == "linear_attention" else ATT))
         for k, n in names.items():
-            L[k] = runs_linear(pf, p + n, dev, 1, small, large)
+            L[k] = runs_linear(pf, p + n, dev, 1, small, large or default_large(dev))
         if typ == "linear_attention":
             la = p + "linear_attn."
             L.update(wa=f32(src.get(la + "in_proj_a.weight")), wb=f32(src.get(la + "in_proj_b.weight")),

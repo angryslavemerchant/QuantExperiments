@@ -53,7 +53,8 @@ def run(a) -> int:
     t0 = time.time()
     llm = LLM(model=a.model, dtype="bfloat16", max_model_len=a.max_model_len, gpu_memory_utilization=a.gpu_mem,
               max_num_seqs=a.max_num_seqs, enable_prefix_caching=False, seed=0,
-              enforce_eager=a.eager)
+              enforce_eager=a.eager, **({"max_num_batched_tokens": a.max_num_batched_tokens}
+                                        if a.max_num_batched_tokens else {}))
     rec["load_s"] = round(time.time() - t0, 1)
     rec["torch_mem_GB"] = round(torch.cuda.memory_allocated() / 1e9, 2) if torch.cuda.is_initialized() else None
     log(f"loaded in {rec['load_s']}s")
@@ -140,6 +141,7 @@ def main() -> int:
     r.add_argument("--gpu-mem", type=float, default=0.85)
     r.add_argument("--max-num-seqs", type=int, default=256)
     r.add_argument("--eager", action="store_true", help="no torch.compile / CUDA graphs")
+    r.add_argument("--max-num-batched-tokens", type=int, help="prefill chunk / step token budget (vLLM default if unset)")
     r.add_argument("--windows", type=int, default=16)
     r.add_argument("--window", type=int, default=1024)
     r.add_argument("--chat-tokens", type=int, default=128)

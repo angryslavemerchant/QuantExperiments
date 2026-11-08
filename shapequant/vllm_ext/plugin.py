@@ -52,7 +52,11 @@ class ShapeQuantConfig(QuantizationConfig):
                  chunk_mb: int = 24, xs: bool = False, warps: int = 8, tune: bool = False,
                  embed_head: str = "bf16"):
         super().__init__()
-        self.packed_file, self.bmax, self.layout = packed_file, bmax, layout
+        self.packed_file, self.bmax = packed_file, bmax
+        # "tile": the batched kernel reads a repacked copy of every matrix's words (faster warp loads,
+        # but a second copy of the weights: 27B 19.8 GB at load vs ~11 on a 3090, s38); "lane" reads
+        # them in place. SHAPEQUANT_LAYOUT overrides.
+        self.layout = os.environ.get("SHAPEQUANT_LAYOUT", layout)
         # SHAPEQUANT_LARGE / SHAPEQUANT_CHUNK_MB / SHAPEQUANT_BMAX / SHAPEQUANT_XS / SHAPEQUANT_WARPS
         # override the checkpoint's choice (benchmarking)
         self.bmax = int(os.environ.get("SHAPEQUANT_BMAX", bmax))

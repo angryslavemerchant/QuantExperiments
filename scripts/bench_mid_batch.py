@@ -70,6 +70,7 @@ def main() -> int:
     ap.add_argument("--Ms", default="1,8,32,48,64,96,128,192,256,512,1024")
     ap.add_argument("--slow", action="store_true", help="also dequant + GEMM")
     ap.add_argument("--bm-sweep", action="store_true", help="also the fused kernel at other token tiles")
+    ap.add_argument("--lane", action="store_true", help="also the batched kernels on the in-place (lane) layout")
     ap.add_argument("--out")
     a = ap.parse_args()
     from shapequant.kernels import batched_runs as br, cuda_dequant, runs_gemm
@@ -82,6 +83,10 @@ def main() -> int:
         R, C = rl.R, rl.nch * 4
         lb = br.RunsBatch(rl, bmax=32, layout="tile")
         lbx = {w: br.RunsBatch(rl, bmax=128, layout="tile", xs=True, warps=w) for w in (4, 8)}
+        lane = {}
+        if a.lane:
+            lane = {"lane_batched": (br.RunsBatch(rl, bmax=32, layout="lane"), 32),
+                    "lane_xs_w8": (br.RunsBatch(rl, bmax=128, layout="lane", xs=True, warps=8), 128)}
         Wd = cuda_dequant.dequant(rl).clone().view(R, C).to(torch.bfloat16)
         for M in map(int, a.Ms.split(",")):
             x = torch.randn(M, C, device="cuda").half()
@@ -96,6 +101,7 @@ def main() -> int:
             r = {"name": name, "R": R, "C": C, "bits": rl.bits, "M": M,
                  "batched_us": timeit(chunks(lb, 32)),
                  **{f"xs_w{w}_us": timeit(chunks(l, 128)) for w, l in lbx.items()},
+                 **{f"{k}_us": timeit(chunks(l, n)) for k, (l, n) in lane.items()},
                  "fused_us": timeit(lambda: runs_gemm.gemm(x, [rl], out=y)) if runs_gemm.supported(rl) else None,
                  **({f"fused_bm{bm}_us": timeit(lambda bm=bm: runs_gemm.gemm(x, [rl], out=y, bm=bm))
                      for bm in (32, 64, 128) if bm != runs_gemm.auto_bm(M) and bm * 4 >= M} if a.bm_sweep and M > 16 else {}),
