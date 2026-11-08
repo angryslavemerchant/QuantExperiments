@@ -20,7 +20,14 @@ if [[ " $CONFIGS " == *" mtp "* || " $CONFIGS " == *" dspark_bf16 "* ]] && [ ! -
   $PY scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$CKM" --embed-head bf16 --mtp > "$OUT/export_mtp.log" 2>&1 \
     || { log "MTP export failed"; tail -5 "$OUT/export_mtp.log"; }
 fi
-stop() { pkill -f "vllm serve" 2>/dev/null; sleep 15; }
+stop() {         # kill every vLLM process and wait until the GPU is actually free (s40c s3: a slow DSpark
+  pkill -f "vllm serve" 2>/dev/null   # start outlived the health wait, kept the GPU, and the next config's bench hit it)
+  for _ in $(seq 60); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+    pgrep -f "vllm serve|EngineCore" > /dev/null || { [ "${used:-0}" -lt 2000 ] && break; }
+    pkill -9 -f "vllm serve|EngineCore" 2>/dev/null; sleep 5
+  done
+}
 for cfg in $CONFIGS; do
   stop
   case $cfg in
@@ -34,8 +41,11 @@ for cfg in $CONFIGS; do
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup "$VENV/bin/vllm" serve "$ck" --served-model-name ours \
     --host 127.0.0.1 --port 8000 --dtype bfloat16 --max-model-len $MAX_LEN --max-num-seqs 8 --gpu-memory-utilization 0.93 \
     --max-num-batched-tokens 4096 --seed 0 ${spec:+--speculative-config "$spec"} > "$OUT/server_$cfg.log" 2>&1 &
-  up=0
-  for _ in $(seq 150); do curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && { up=1; break; }; sleep 10; done
+  pid=$!; up=0
+  for _ in $(seq 270); do        # 45 min: a drafter download + compile can take ~30
+    curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && { up=1; break; }
+    kill -0 $pid 2>/dev/null || break; sleep 10
+  done
   if [ $up = 0 ]; then log "$cfg: server did not come up"; grep -E "Error|error" "$OUT/server_$cfg.log" | tail -6; continue; fi
   grep -E "KV cache size|took .* GiB" "$OUT/server_$cfg.log" | tail -2
   curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
