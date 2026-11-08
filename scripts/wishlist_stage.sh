@@ -26,14 +26,23 @@ wait_up() {      # port timeout_s
   return 1
 }
 stop_all() { pkill -f "vllm serve" 2>/dev/null; pkill -f llama-server 2>/dev/null; sleep 15; }
-ours_up() {      # tag max_len kv_dtype
-  stop_all
-  log "ours server ($1: max_len $2, kv $3)"
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup "$VENV/bin/vllm" serve "$CK" --served-model-name ours \
-    --host 127.0.0.1 --port 8000 --dtype bfloat16 --max-model-len $2 --max-num-seqs 8 --gpu-memory-utilization 0.94 \
-    --max-num-batched-tokens 4096 --kv-cache-dtype $3 --seed 0 > "$OUT/server_ours_$1.log" 2>&1 &
-  wait_up 8000 1500 || { log "ours ($1) did not come up"; grep -E "Error|error" "$OUT/server_ours_$1.log" | tail -5; return 1; }
-  grep -E "KV cache size|Maximum concurrency|took .* GiB" "$OUT/server_ours_$1.log" | tail -3
+ours_up() {      # tag max_len kv_dtype [max_seqs]: on a KV-cache shortfall, retry once at vLLM's estimated max length
+  local len=$2 try
+  for try in 1 2; do
+    stop_all
+    log "ours server ($1: max_len $len, kv $3)"
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup "$VENV/bin/vllm" serve "$CK" --served-model-name ours       --host 127.0.0.1 --port 8000 --dtype bfloat16 --max-model-len $len --max-num-seqs ${4:-8} --gpu-memory-utilization 0.94       --max-num-batched-tokens 2048 --kv-cache-dtype $3 --seed 0 > "$OUT/server_ours_$1.log" 2>&1 &
+    if wait_up 8000 1500; then
+      grep -E "KV cache size|Maximum concurrency|took .* GiB" "$OUT/server_ours_$1.log" | tail -3
+      echo "$len" > "$OUT/ours_$1.max_len"
+      return 0
+    fi
+    local est=$(grep -oE "estimated maximum model length is [0-9]+" "$OUT/server_ours_$1.log" | grep -oE "[0-9]+$" | tail -1)
+    log "ours ($1) did not come up at $len${est:+ (vLLM estimate $est)}"; grep -E "Error" "$OUT/server_ours_$1.log" | tail -3
+    [ -n "$est" ] && [ "$try" = 1 ] || return 1
+    len=$(( est / 1024 * 1024 )); mv "$OUT/server_ours_$1.log" "$OUT/server_ours_$1.try1.log"
+  done
+  return 1
 }
 LSERVER=""; LLIBS=""
 llama_setup() {
@@ -67,7 +76,7 @@ if has quality; then
   fi
 fi
 if has longctx; then
-  if ours_up longctx $OURS_MAX_LEN auto; then
+  if ours_up longctx $OURS_MAX_LEN auto 2; then
     "$VPY" scripts/long_ctx.py --endpoint http://127.0.0.1:8000 --model ours --name ours-bf16kv --lengths "$LENGTHS" \
       --depths "$DEPTHS" --out "$OUT/longctx_ours_bf16kv.json" > "$OUT/longctx_ours_bf16kv.log" 2>&1; tail -8 "$OUT/longctx_ours_bf16kv.log"
   fi
@@ -78,7 +87,7 @@ if has longctx; then
 fi
 if has kvquant; then
   # ours with fp8 KV out to the model's 262k; llama q4_0 KV at 128k; llama f16 KV at 128k (expected not to fit)
-  if ours_up fp8kv 262144 fp8; then
+  if ours_up fp8kv 262144 fp8 2; then
     "$VPY" scripts/long_ctx.py --endpoint http://127.0.0.1:8000 --model ours --name ours-fp8kv --lengths "$LENGTHS,200000,250000" \
       --depths "$DEPTHS" --out "$OUT/longctx_ours_fp8kv.json" > "$OUT/longctx_ours_fp8kv.log" 2>&1; tail -8 "$OUT/longctx_ours_fp8kv.log"
   fi

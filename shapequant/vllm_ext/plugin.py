@@ -81,6 +81,14 @@ class ShapeQuantConfig(QuantizationConfig):
         if embed_head == "packed":
             _patch_qwen35_embedding()
 
+    def __setstate__(self, state):
+        # vLLM builds the config in its front-end process and pickles it into the engine process:
+        # __init__ never runs there, so the embedding patch must also be installed on unpickle
+        # (s38 / s40c: without it embed_tokens was a stock, never-loaded layer -> NLL = log(vocab))
+        self.__dict__.update(state)
+        if self.embed_head == "packed":
+            _patch_qwen35_embedding()
+
     def __repr__(self) -> str:
         return (f"ShapeQuantConfig(packed_file={self.packed_file!r}, bmax={self.bmax}, large={self.large!r}, "
                 f"chunk_mb={self.chunk_mb}, xs={self.xs}, warps={self.warps}, layout={self.layout!r}, "
@@ -189,6 +197,9 @@ class ShapeQuantHeadMethod(QuantizeMethodBase):
         if sum(output_partition_sizes) != output_size:
             raise NotImplementedError("shapequant: tensor parallelism is not supported (use TP = 1)")
         _aux_check(self.cfg, output_size, input_size, "lm_head")
+        if not _EMBED_BUILT:          # Qwen3.5 builds embed_tokens before lm_head
+            raise RuntimeError("shapequant embed_head=packed: the token embedding was not built by the shapequant "
+                               "method (the Qwen3.5 embedding patch did not apply); it would run unloaded")
         dev = torch.device("cuda", torch.cuda.current_device())
         with core.neutral_defaults():
             head = core.Q8Head(self.cfg.pf.aux_tensor("lm_head.q").to(dev).contiguous(),
@@ -225,6 +236,8 @@ class ShapeQuantEmbedMethod(QuantizeMethodBase):
         if q.shape[1] * 2 != input_size:
             raise ValueError(f"embedding: packed C {q.shape[1] * 2}, layer {input_size}")
         emb = core.Q4Embedding(q, sc, params_dtype)
+        global _EMBED_BUILT
+        _EMBED_BUILT = True
         layer.sq_handle = core.register(emb)
         layer.sq_shards = emb
 
@@ -233,6 +246,9 @@ class ShapeQuantEmbedMethod(QuantizeMethodBase):
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return torch.ops.shapequant.embed(input_, layer.sq_handle)
+
+
+_EMBED_BUILT = False
 
 
 def _patch_qwen35_embedding() -> None:
