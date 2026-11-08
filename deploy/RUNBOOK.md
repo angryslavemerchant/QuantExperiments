@@ -66,6 +66,19 @@ Useful settings (environment variables for `serve.sh`):
 | `GPU_UTIL` | `0.92` | Fraction of GPU memory vLLM may use (the rest of it becomes KV cache) |
 | `KV_DTYPE` | `auto` | `fp8` halves KV-cache memory: longer contexts / more requests |
 | `TOOL_PARSER` | off | Enables tool / function calling (see notes) |
+| `SPEC` | off | `dspark`: speculative decoding with RedHat's DSpark drafter (+4 GB download) |
+
+### Faster single requests: DSpark speculative decoding
+
+Measured on the 3090: 79 tok/s for one request instead of 38 (2.1x), 123 vs 102 tok/s total at 4
+requests. The drafter takes ~4 GB of GPU memory, so the KV cache shrinks to ~25k tokens total:
+
+```bash
+SPEC=dspark MAX_LEN=16384 MAX_SEQS=4 bash deploy/serve.sh
+```
+
+The first start downloads the drafter and compiles (can take ~30 min); later starts are faster.
+Best when you are the only user; for many parallel requests leave it off.
 
 ## 4. Check it
 
