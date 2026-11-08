@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import re
 import time
 import urllib.request
@@ -44,8 +45,11 @@ def one(endpoint: str, model: str, prompt: str, seed: int, max_tokens: int) -> t
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
             "temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": seed, "ignore_eos": True,
             "chat_template_kwargs": {"enable_thinking": True}}
+    hdr = {"Content-Type": "application/json"}
+    if os.environ.get("SQ_API_KEY"):          # deploy/serve.sh requires a key
+        hdr["Authorization"] = f"Bearer {os.environ['SQ_API_KEY']}"
     req = urllib.request.Request(endpoint.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=hdr)
     t0 = time.time()
     res = json.loads(urllib.request.urlopen(req, timeout=3600).read())
     return res["usage"]["completion_tokens"], time.time() - t0
