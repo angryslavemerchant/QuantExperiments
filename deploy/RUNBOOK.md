@@ -8,7 +8,9 @@ request, up to 16 requests at once by default, protected by an API key.
 
 - Linux, or Windows with **WSL2** (Ubuntu 22.04/24.04). vLLM does not run on native Windows.
   - WSL2: install the normal Windows NVIDIA driver; inside WSL `nvidia-smi` must show the GPU.
-- NVIDIA driver supporting CUDA 12.8 or newer (`nvidia-smi` top right shows "CUDA Version").
+- NVIDIA driver **580 or newer** (`nvidia-smi` top right must show "CUDA Version: 13.0" or higher).
+  The vLLM 0.33 packages are built for CUDA 13; on an older driver (e.g. 570 = CUDA 12.8) vLLM fails
+  with `libcudart.so.13: cannot open shared object file`. Updating the driver is the fix.
 - Python 3.10-3.12, git, ~40 GB free disk (15 GB vLLM environment, 10 GB model, caches).
 - A Hugging Face **read** token with access to `luckymushy/Qwen3.8-27B-shapequant-2.5bpw`.
 

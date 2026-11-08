@@ -14,6 +14,10 @@ log() { echo "[setup] $*"; }
 [ -f pyproject.toml ] && grep -q shapequant pyproject.toml || { echo "run from the repo root"; exit 1; }
 command -v nvidia-smi > /dev/null || { echo "nvidia-smi not found: install the NVIDIA driver (WSL2: the Windows driver)"; exit 1; }
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
+if [ "${drv:-0}" -lt 580 ]; then
+  echo "NVIDIA driver $drv is too old: vLLM 0.33 needs a CUDA 13 driver (580+). Update the driver first."; exit 1
+fi
 [ -n "${HF_TOKEN:-}" ] || { echo "set HF_TOKEN (a read token with access to the private model repo)"; exit 1; }
 
 if [ ! -x "$VENV/bin/python" ]; then
