@@ -93,3 +93,19 @@ def test_think_eval_summary():
             for e in (1, 0, 1, 1)]
     s = te.summarize(rows, "exact_match")
     assert s["n"] == 4 and s["exact_match"] == 0.75 and s["exact_match_stderr"] > 0 and s["max_gen_tokens_hit"] == 0
+
+
+def test_think_eval_lighteval_style_answers():
+    assert te.score("gpqa", {"gold": "C"}, "<think>hm</think>reasoning...\nAnswer: C")["exact_match"] == 1
+    assert te.score("gpqa", {"gold": "C"}, "<think>hm</think>Answer: (B)")["exact_match"] == 0
+    r = te.score("math500", {"answer": "12"}, "<think>x</think>so\nANSWER: 12")
+    assert r["math_verify"] == 1 and r["no_answer"] == 0
+    p = te.LE_GPQA_PROMPT.format(question="Q?", A="a", B="b", C="c", D="d")
+    assert p.startswith("Answer the following multiple choice question.") and p.endswith("D) d")
+
+
+def test_think_eval_summary_over_samples():
+    rows = [{"scores": {"exact_match": 0.75, "no_answer": 0.0}, "gen_tokens": 10, "finish": "stop", "n_samples": 4},
+            {"scores": {"exact_match": 0.25, "no_answer": 0.0}, "gen_tokens": 30, "finish": "length", "n_samples": 4}]
+    s = te.summarize(rows, "exact_match")
+    assert s["exact_match"] == 0.5 and s["samples_per_question"] == 4 and s["max_gen_tokens_hit"] == 0.5

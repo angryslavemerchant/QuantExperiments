@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -25,38 +26,70 @@ _spec.loader.exec_module(tt)
 GPQA_PROMPT = ("{question}\n\nA) {A}\nB) {B}\nC) {C}\nD) {D}\n\n"
                "Please reason step by step, and put the letter of your final answer within \\boxed{{}}.")
 MATH_PROMPT = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+# --style lighteval: lighteval 0.13.0's wording (tasks/tasks/gpqa.py gpqa_instruct_prompt,
+# tasks/tasks/math_500.py MATH_QUERY_TEMPLATE)
+LE_GPQA_PROMPT = ("Answer the following multiple choice question. The last line of your response should be of the "
+                  "following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by "
+                  "step before answering.\n\n{question}\n\nA) {A}\nB) {B}\nC) {C}\nD) {D}")
+LE_MATH_PROMPT = ('Solve the following problem. The final line of your response MUST be of the following format: '
+                  '"ANSWER: $ANSWER" (without quotes) where $ANSWER is the final answer. Think step by step before '
+                  'answering.\n\n{problem}')
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def load_task(task: str) -> list[dict]:
+def load_task(task: str, style: str = "boxed") -> list[dict]:
     from datasets import load_dataset
+    le = style == "lighteval"
     if task == "gpqa":
         ds = tt.gpqa_docs(load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train"))
-        return [{"id": i, "prompt": GPQA_PROMPT.format(**d), "doc": {"gold": d["gold"]}} for i, d in enumerate(ds)]
+        tpl = LE_GPQA_PROMPT if le else GPQA_PROMPT
+        return [{"id": i, "prompt": tpl.format(**d), "doc": {"gold": d["gold"]}} for i, d in enumerate(ds)]
     if task == "math500":
         ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
-        return [{"id": i, "prompt": MATH_PROMPT.format(problem=d["problem"]), "doc": {"answer": d["answer"]}}
+        tpl = LE_MATH_PROMPT if le else MATH_PROMPT
+        return [{"id": i, "prompt": tpl.format(problem=d["problem"]), "doc": {"answer": d["answer"]}}
                 for i, d in enumerate(ds)]
     raise ValueError(task)
 
 
+def _answer_line(final: str, tag: str) -> str | None:
+    """Text after the last 'Answer:' / 'ANSWER:' marker (lighteval-style responses)."""
+    hits = re.findall(rf"{tag}\s*:\s*(.+)", final, flags=re.IGNORECASE)
+    return hits[-1].strip().strip("*$ .") if hits else None
+
+
 def score(task: str, doc: dict, text: str) -> dict:
+    """Boxed answers first; else (lighteval-style prompts) the 'Answer: X' / 'ANSWER: x' line."""
     final = text.split("</think>")[-1] if "</think>" in text else ""   # no </think>: cut off while thinking
-    r = tt.gpqa_results(doc, [final]) if task == "gpqa" else tt.math_results(doc, [final])
+    if task == "gpqa":
+        r = tt.gpqa_results(doc, [final])
+        if r["no_answer"]:
+            line = _answer_line(final, "answer")
+            m = re.match(r"\(?([ABCD])\b", line) if line else None
+            if m:
+                r = {"exact_match": int(m.group(1) == doc["gold"]), "no_answer": 0}
+    else:
+        r = tt.math_results(doc, [final])
+        if r["no_answer"]:
+            line = _answer_line(final, "answer")
+            if line:
+                r = tt.math_results(doc, ["\\boxed{" + line + "}"])
     r["think_closed"] = int("</think>" in text)
     return r
 
 
 def summarize(rows: list[dict], metric: str) -> dict:
+    """Per-question scores are means over that question's samples; stderr over questions."""
     n = len(rows)
-    out = {"n": n}
+    out = {"n": n, "samples_per_question": rows[0].get("n_samples", 1)}
     for k in rows[0]["scores"]:
-        p = sum(r["scores"][k] for r in rows) / n
+        vals = [r["scores"][k] for r in rows]
+        p = sum(vals) / n
         out[k] = p
-        out[k + "_stderr"] = math.sqrt(p * (1 - p) / (n - 1)) if n > 1 else None
+        out[k + "_stderr"] = (math.sqrt(sum((v - p) ** 2 for v in vals) / (n - 1) / n) if n > 1 else None)
     out["mean_gen_tokens"] = sum(r["gen_tokens"] for r in rows) / n
     out["max_gen_tokens_hit"] = sum(r["finish"] == "length" for r in rows) / n
     out["headline"] = metric
@@ -76,6 +109,8 @@ def main() -> int:
     ap.add_argument("--max-num-seqs", type=int, default=256)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--limit", type=int, help="first N questions per task (smoke)")
+    ap.add_argument("--n", type=int, default=1, help="samples per question (pass@1 averaged over them)")
+    ap.add_argument("--style", choices=["boxed", "lighteval"], default="boxed", help="prompt wording")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -91,7 +126,7 @@ def main() -> int:
 
     for task in a.tasks.split(","):
         metric = "exact_match" if task == "gpqa" else "math_verify"
-        items = load_task(task)
+        items = load_task(task, a.style)
         if a.limit:
             items = items[:a.limit]
         sp_path = out / f"samples_{task}.jsonl"
@@ -106,15 +141,21 @@ def main() -> int:
             chunk = todo[c0:c0 + a.chunk]
             t1 = time.time()
             # one seed per question: reruns of a question give the same sample
-            params = [SamplingParams(temperature=0.6, top_p=0.95, top_k=20, max_tokens=a.max_tokens,
+            params = [SamplingParams(temperature=0.6, top_p=0.95, top_k=20, max_tokens=a.max_tokens, n=a.n,
                                      seed=1000 + it["id"]) for it in chunk]
             msgs = [[{"role": "user", "content": it["prompt"]}] for it in chunk]
             res = llm.chat(msgs, params, use_tqdm=False, chat_template_kwargs={"enable_thinking": True})
             with open(sp_path, "a", encoding="utf-8") as f:
                 for it, r in zip(chunk, res):
-                    o = r.outputs[0]
-                    row = {"id": it["id"], "scores": score(task, it["doc"], o.text), "gen_tokens": len(o.token_ids),
-                           "finish": o.finish_reason, "target": it["doc"], "text": o.text}
+                    per = [score(task, it["doc"], o.text) for o in r.outputs]
+                    k = len(per)
+                    row = {"id": it["id"], "n_samples": k,
+                           "scores": {m: sum(p[m] for p in per) / k for m in per[0]},
+                           "gen_tokens": sum(len(o.token_ids) for o in r.outputs) / k,
+                           "finish": "length" if any(o.finish_reason == "length" for o in r.outputs) else "stop",
+                           "target": it["doc"], "samples": [{"scores": p, "finish": o.finish_reason,
+                                                             "gen_tokens": len(o.token_ids), "text": o.text}
+                                                            for p, o in zip(per, r.outputs)]}
                     done[it["id"]] = row
                     f.write(json.dumps(row) + "\n")
             rows = [done[i] for i in sorted(done)]
