@@ -48,6 +48,10 @@ bash deploy/serve.sh
 The first start compiles the kernels and tunes each matrix shape: wait for
 `Application startup complete` (a few minutes; later starts are faster).
 
+Measured on an RTX 3090 (2026-11-08, defaults): wikitext NLL 2.113 (= the reference), ~36 tok/s
+for one request, ~180 tok/s total at 8 requests, ~300 tok/s at 32; KV cache room for ~130k tokens
+in total (shared by all running requests).
+
 Keep it running after you log out: run it inside `tmux` (`tmux new -s sq`, start, then `Ctrl-b d`
 to detach; `tmux attach -t sq` to come back).
 
@@ -134,9 +138,8 @@ connection with that URL and key.
   `deploy/setup_server.sh`.
 - **Slow first answer after start**: kernels compile on first use of each batch size; it settles
   after a few requests.
-- **Tool calling**: set `TOOL_PARSER` to the parser matching Qwen3.8's chat template
-  (`qwen3_coder` for the XML `<function=...>` format, `hermes` for JSON `<tool_call>`); check the
-  template in `~/models/q27-sq/chat_template.jinja`.
+- **Tool calling**: `TOOL_PARSER=qwen3_coder bash deploy/serve.sh` (verified on a 3090: an
+  OpenAI `tools` request comes back as a proper `tool_calls` entry with `finish_reason: tool_calls`).
 
 ## Security notes
 
