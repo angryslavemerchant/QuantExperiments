@@ -14,8 +14,7 @@ a delegated operator was too slow to react to messages).
   across a campaign yourself (`max_total_usd` is per manifest).
 - The `vast-operator` agent (`.claude/agents/vast-operator.md`) remains
   available if the user asks to delegate a run.
-- Local Python is the conda env ToastEnv
-  (`C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe`). Run pytest with
+- Local Python depends on the machine (see "Machines" below). Run pytest with
   `--basetemp` pointing into a writable folder if the default temp dir is
   access-denied.
 - While a run is live, read experiment outputs directly, read-only:
@@ -37,3 +36,19 @@ a delegated operator was too slow to react to messages).
   `python vast/ops.py reconcile --restart-monitors`.
 
 Tests: `python -m pytest tests -q`.
+
+## Machines
+
+- **Home PC**: conda env ToastEnv
+  (`C:\Users\JmgLi\anaconda3\envs\ToastEnv\python.exe`); GPU work goes to
+  Vast rentals.
+- **Work 3090** (Windows 11, RTX 3090 24 GB, driver 610 / CUDA 13): GPU work
+  runs locally, which is the point of this machine. Repo at
+  `C:\Users\AIUSER\SorenzoSandbox\QuantExperiments`. vLLM only runs in WSL2:
+  `wsl -d Ubuntu-24.04` (Python 3.12; repo visible at
+  `/mnt/c/Users/AIUSER/SorenzoSandbox/QuantExperiments`). Follow
+  `deploy/RUNBOOK.md` there (venv `~/sq-venv`, checkpoint `~/models/q27-sq`).
+  The packed model is already local at `models/Qwen3.8-27B-shapequant-2.5bpw/s16_25_ft.safetensors`
+  (excluded from git via `.git/info/exclude`): export with
+  `scripts/export_vllm_checkpoint.py --packed <that file>` instead of
+  downloading it again.
