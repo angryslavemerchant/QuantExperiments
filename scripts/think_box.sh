@@ -60,7 +60,7 @@ PYEOF
 }
 
 log "lighteval smoke (4 GPQA questions, 2 samples, 2k tokens)"
-if "$VPY" scripts/lighteval_run.py vllm "$(margs 1234 2048)" "gpqa:diamond@k=1@n=2|0" --max-samples 4 \
+if [ "${LIGHTEVAL:-1}" = 1 ] && "$VPY" scripts/lighteval_run.py vllm "$(margs 1234 2048)" "gpqa:diamond@k=1@n=2|0" --max-samples 4 \
      --output-dir "$OUT/le_smoke" > "$OUT/le_smoke.log" 2>&1 && summ "$OUT/le_smoke"; then
   grep -E "\[lighteval_run\]" "$OUT/le_smoke.log" | head -3
   i=0
@@ -75,7 +75,7 @@ else
   log "lighteval smoke failed; tail:"; tail -25 "$OUT/le_smoke.log"
   log "fallback: think_eval.py --style lighteval (GPQA n=8, then MATH-500 n=1)"
   "$VPY" scripts/think_eval.py --model "$CK" --name "$NAME" --out "$OUT/fallback" --tasks gpqa --style lighteval \
-      --n 8 --chunk 100 ${FALLBACK_ARGS:-} > "$OUT/fallback_gpqa.log" 2>&1
+      --n ${GPQA_N:-8} ${FALLBACK_ARGS:-} > "$OUT/fallback_gpqa.log" 2>&1
   grep -E "^\[" "$OUT/fallback_gpqa.log" | tail -4
   "$VPY" scripts/think_eval.py --model "$CK" --name "$NAME" --out "$OUT/fallback" --tasks math500 --style lighteval \
       --n 1 ${FALLBACK_ARGS:-} > "$OUT/fallback_math.log" 2>&1

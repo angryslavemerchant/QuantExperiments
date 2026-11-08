@@ -1,9 +1,12 @@
 """Thinking-mode GPQA-diamond and MATH-500 straight on vLLM, saved chunk by chunk.
 
 Same prompts, sampling and scoring as configs/lm_eval_tasks/{gpqa_diamond,math500}_think.yaml
-(think_tasks.py scorers), without lm-eval: each chunk of questions is generated and scored, then
-appended to <out>/samples_<task>.jsonl and summarized in <out>/summary.json, so a cutoff keeps
-every finished chunk; a rerun skips questions already in the samples file.
+(think_tasks.py scorers), without lm-eval. Default (--chunk 0): every question is queued on the
+vLLM engine at once and each one is scored and appended to <out>/samples_<task>.jsonl the moment
+its samples finish (summary.json refreshed every --summary-every), so a cutoff loses only the
+questions still generating. --chunk N instead generates N questions per blocking llm.chat call
+(nothing of a chunk is saved until all of it finishes: 100 questions x 8 samples of 32k-token
+reasoning outlasted a 3.4 h window, s37). A rerun skips questions already in the samples file.
 
   python scripts/think_eval.py --model DIR --name ours --out artifacts/think27b/ours --tasks gpqa,math500
 """
@@ -102,8 +105,9 @@ def main() -> int:
     ap.add_argument("--name", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--tasks", default="gpqa,math500")
-    ap.add_argument("--chunk", type=int, default=250,
-                    help="questions per chunk (results saved after each; each chunk ends in a long-generation tail)")
+    ap.add_argument("--chunk", type=int, default=0,
+                    help="0: stream (save each question as it finishes); N: blocking chunks of N questions")
+    ap.add_argument("--summary-every", type=int, default=10, help="stream mode: refresh summary.json every N questions")
     ap.add_argument("--max-tokens", type=int, default=32768)
     ap.add_argument("--max-model-len", type=int, default=36864)
     ap.add_argument("--max-num-seqs", type=int, default=256)
@@ -137,6 +141,61 @@ def main() -> int:
                 done[r["id"]] = r
         todo = [it for it in items if it["id"] not in done]
         log(f"{task}: {len(items)} questions, {len(done)} already done")
+
+        def make_row(it, r):
+            per = [score(task, it["doc"], o.text) for o in r.outputs]
+            k = len(per)
+            return {"id": it["id"], "n_samples": k,
+                    "scores": {m: sum(p[m] for p in per) / k for m in per[0]},
+                    "gen_tokens": sum(len(o.token_ids) for o in r.outputs) / k,
+                    "finish": "length" if any(o.finish_reason == "length" for o in r.outputs) else "stop",
+                    "target": it["doc"], "samples": [{"scores": p, "finish": o.finish_reason,
+                                                      "gen_tokens": len(o.token_ids), "text": o.text}
+                                                     for p, o in zip(per, r.outputs)]}
+
+        def write_summary():
+            rows = [done[i] for i in sorted(done)]
+            if not rows:
+                return
+            summary["tasks"][task] = summarize(rows, metric)
+            summary["tasks"][task]["complete"] = len(rows) == len(items)
+            summary_path.write_text(json.dumps(summary, indent=2))
+            s = summary["tasks"][task]
+            log(f"{task}: {len(rows)}/{len(items)} done, {metric} {100 * s[metric]:.1f} +- "
+                f"{100 * (s[metric + '_stderr'] or 0):.1f}, no_answer {100 * s['no_answer']:.1f}%, "
+                f"mean {s['mean_gen_tokens']:.0f} tokens")
+
+        if a.chunk <= 0 and todo:
+            # streaming: all questions queued; each saved as soon as its n samples finish
+            eng = llm.llm_engine
+            tok = llm.get_tokenizer()
+            by_id = {}
+            for it in todo:
+                prompt = tok.apply_chat_template([{"role": "user", "content": it["prompt"]}], tokenize=False,
+                                                 add_generation_prompt=True, enable_thinking=True)
+                sp = SamplingParams(temperature=0.6, top_p=0.95, top_k=20, max_tokens=a.max_tokens, n=a.n,
+                                    seed=1000 + it["id"])
+                eng.add_request(f"{task}-{it['id']}", prompt, sp)
+                by_id[f"{task}-{it['id']}"] = it
+            t1, last, fresh = time.time(), time.time(), 0
+            with open(sp_path, "a", encoding="utf-8") as f:
+                while eng.has_unfinished_requests():
+                    for r in eng.step():
+                        if not getattr(r, "finished", False) or r.request_id not in by_id:
+                            continue
+                        it = by_id.pop(r.request_id)
+                        row = make_row(it, r)
+                        done[it["id"]] = row
+                        f.write(json.dumps(row) + "\n")
+                        f.flush()
+                        fresh += 1
+                        if fresh % a.summary_every == 0:
+                            write_summary()
+                    if time.time() - last > 300:
+                        last = time.time()
+                        log(f"{task}: {fresh} finished this run, {len(by_id)} generating/queued ({time.time() - t1:.0f}s)")
+            write_summary()
+            continue
         for c0 in range(0, len(todo), a.chunk):
             chunk = todo[c0:c0 + a.chunk]
             t1 = time.time()
