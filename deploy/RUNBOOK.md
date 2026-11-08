@@ -16,17 +16,12 @@ request, up to 16 requests at once by default, protected by an API key.
 
 ## 1. Get the code onto the machine
 
-The repo is not on GitHub. On the home PC, from the repo folder:
-
 ```bash
-git bundle create qe.bundle HEAD          # one file with the full history
+git clone https://github.com/angryslavemerchant/QuantExperiments.git quant-experiments && cd quant-experiments
 ```
 
-Copy `qe.bundle` to the work machine (USB, scp, cloud drive), then there:
-
-```bash
-git clone qe.bundle quant-experiments && cd quant-experiments
-```
+(Without GitHub access: `git bundle create qe.bundle HEAD` on a machine that has the repo, copy the
+file over, then `git clone qe.bundle quant-experiments`.)
 
 ## 2. One-time setup (~15-25 min, mostly downloads)
 
@@ -48,9 +43,10 @@ bash deploy/serve.sh
 The first start compiles the kernels and tunes each matrix shape: wait for
 `Application startup complete` (a few minutes; later starts are faster).
 
-Measured on an RTX 3090 (2026-11-08, defaults): wikitext NLL 2.113 (= the reference), ~36 tok/s
-for one request, ~180 tok/s total at 8 requests, ~300 tok/s at 32; KV cache room for ~130k tokens
-in total (shared by all running requests).
+Measured on an RTX 3090 (2026-11-08): wikitext NLL 2.113 (= the reference); ~50 tok/s decode for
+one request (llama.cpp on the same card: UD-IQ2_S 45, UD-Q4_K_M 41), ~220 tok/s total at 8
+requests, ~340 tok/s at 32; KV cache room for ~130k tokens in total with the defaults (shared by
+all running requests).
 
 Keep it running after you log out: run it inside `tmux` (`tmux new -s sq`, start, then `Ctrl-b d`
 to detach; `tmux attach -t sq` to come back).
