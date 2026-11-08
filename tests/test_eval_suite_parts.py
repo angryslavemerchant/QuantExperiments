@@ -74,3 +74,22 @@ def test_block_names_multimodal_layout():
 def test_block_names_text_layout():
     names = ["model.layers.1.mlp.up_proj.weight", "model.embed_tokens.weight"]
     assert ex.block_names(names, ex.text_prefix(names)) == {"model.layers.1.mlp.up_proj": "model.layers.1.mlp.up_proj.weight"}
+
+
+te = _load(ROOT / "scripts" / "think_eval.py", "think_eval")
+
+
+def test_think_eval_scores_only_the_final_answer():
+    doc = {"gold": "B"}
+    assert te.score("gpqa", doc, r"<think>maybe \boxed{A}</think>So \boxed{B}")["exact_match"] == 1
+    r = te.score("gpqa", doc, r"<think>still thinking \boxed{B}")      # cut off inside the thinking
+    assert r["exact_match"] == 0 and r["no_answer"] == 1 and r["think_closed"] == 0
+    m = te.score("math500", {"answer": "3"}, r"<think>x</think>\boxed{3}")
+    assert m["math_verify"] == 1 and m["think_closed"] == 1
+
+
+def test_think_eval_summary():
+    rows = [{"scores": {"exact_match": e, "no_answer": 0, "think_closed": 1}, "gen_tokens": 10, "finish": "stop"}
+            for e in (1, 0, 1, 1)]
+    s = te.summarize(rows, "exact_match")
+    assert s["n"] == 4 and s["exact_match"] == 0.75 and s["exact_match_stderr"] > 0 and s["max_gen_tokens_hit"] == 0
