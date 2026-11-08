@@ -247,12 +247,79 @@ class PackedShards:
         return yt.t().contiguous()
 
 
+class Q8Head:
+    """The packed file's 8-bit block-32 lm_head (aux.lm_head: q int8 [V, C], scale fp16 [V, C/32])
+    as Y [M, R] = X [M, C] . W^T, R >= V (vLLM pads the vocab; padded logits are 0):
+
+      M <= small_max: kernels.batched_runs.gemv_q8_batched on the natural layout (1.35 GB read for
+          27B's 248k x 5120 head vs 2.5 GB bf16);
+      M >  small_max: row chunks dequantized to fp16 into the shared scratch, then a GEMM each.
+
+    Same forward / R interface as PackedShards, so it runs through the shapequant::linear op."""
+
+    def __init__(self, q: torch.Tensor, sc: torch.Tensor, R: int | None = None, small_max: int = 32,
+                 chunk_rows: int = 8192):
+        self.q, self.sc = q, sc
+        self.V, self.C = q.shape
+        if self.C % 32 or sc.shape != (self.V, self.C // 32):
+            raise ValueError(f"q8 head: q {tuple(q.shape)}, scale {tuple(sc.shape)}")
+        self.R = self.V if R is None else R
+        if self.R < self.V:
+            raise ValueError(f"q8 head has {self.V} rows, layer wants {self.R}")
+        self.small_max, self.chunk_rows = small_max, chunk_rows
+
+    def nbytes(self) -> int:
+        return self.q.numel() + self.sc.numel() * 2
+
+    def dense(self) -> torch.Tensor:
+        """fp16 [V, C] (testing)."""
+        return torch.cat([self._rows(s, min(self.V, s + self.chunk_rows)).clone()
+                          for s in range(0, self.V, self.chunk_rows)])
+
+    def _rows(self, s: int, e: int, out: torch.Tensor | None = None) -> torch.Tensor:
+        n = e - s
+        w = self.q[s:e].view(n, self.C // 32, 32).to(torch.float16)
+        o = w if out is None else out[:n * self.C].view(n, self.C // 32, 32)
+        torch.mul(w, self.sc[s:e, :, None], out=o)
+        return o.view(n, self.C)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shp = x.shape
+        x16 = x.reshape(-1, self.C).to(torch.float16).contiguous()
+        M = x16.shape[0]
+        y = torch.empty(M, self.R, dtype=torch.float16, device=x16.device)
+        if self.R > self.V:
+            y[:, self.V:] = 0
+        if 0 < M <= self.small_max:
+            from ..kernels import batched_runs as br
+            yv = y if self.R == self.V else torch.empty(M, self.V, dtype=torch.float16, device=x16.device)
+            br.gemv_q8_batched(self.q, self.sc, x16, yv, self.V, self.C, M)
+            if yv is not y:
+                y[:, :self.V] = yv
+        elif M > 0:
+            scratch = _Scratch.get(self.chunk_rows * self.C, x16.device)
+            for s in range(0, self.V, self.chunk_rows):
+                e = min(self.V, s + self.chunk_rows)
+                y[:, s:e] = x16 @ self._rows(s, e, scratch).t()
+        return y.to(x.dtype).view(*shp[:-1], self.R)
+
+
+def q4_embed(q: torch.Tensor, sc: torch.Tensor, ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Rows `ids` (any shape) of the packed file's 4-bit block-32 embedding (aux.embed), [*ids, C]
+    in dtype. Plain torch ops (traceable by torch.compile, CUDA-graph capturable)."""
+    flat = ids.reshape(-1)
+    b = q[flat]
+    n = torch.stack([b & 15, b >> 4], -1).view(flat.shape[0], -1, 32).to(torch.float32) - 8
+    rows = (n * sc[flat].to(torch.float32)[..., None]).view(flat.shape[0], -1)
+    return rows.to(dtype).view(*ids.shape, -1)
+
+
 # ------------------------------------------------------------------ torch custom op
 
-_REGISTRY: list[PackedShards] = []
+_REGISTRY: list = []        # PackedShards | Q8Head
 
 
-def register(ps: PackedShards) -> int:
+def register(ps) -> int:
     _REGISTRY.append(ps)
     return len(_REGISTRY) - 1
 

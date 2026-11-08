@@ -140,3 +140,61 @@ def test_fused_hands_long_batches_to_dequant():
         x = torch.randn(M, 1280 * 4, device="cuda", dtype=torch.bfloat16)
         ref = _ref(x.half(), [a])
         assert (ps.forward(x).float() - ref).norm() / ref.norm() < 1e-2
+
+
+def _q8_parts(V=300, C=128, seed=0):
+    from shapequant.kernels import proto_formats as pfm
+    g = torch.Generator().manual_seed(seed)
+    w = torch.randn(V, C, generator=g) * 0.05
+    q, sc, _ = pfm.q8_pack(w)
+    return q, sc
+
+
+def test_q4_embed_matches_reference_rows():
+    from shapequant.packed import q4_embed_pack, q4_embed_rows
+    g = torch.Generator().manual_seed(1)
+    q, sc = q4_embed_pack(torch.randn(500, 256, generator=g) * 0.03)
+    ids = torch.tensor([[0, 7, 499], [3, 3, 250]])
+    out = core.q4_embed(q, sc, ids, torch.bfloat16)
+    assert out.shape == (2, 3, 256) and out.dtype == torch.bfloat16
+    ref = q4_embed_rows(q, sc, ids.reshape(-1)).to(torch.bfloat16).view(2, 3, 256)
+    assert torch.equal(out, ref)
+
+
+def test_q8_head_chunked_path_cpu():
+    from shapequant.packed import q8_rows
+    q, sc = _q8_parts()
+    head = core.Q8Head(q, sc, R=320, small_max=0, chunk_rows=64)   # padded vocab, every M on the chunked path
+    x = torch.randn(5, 128) * 0.1
+    y = head.forward(x)
+    assert y.shape == (5, 320) and y.dtype == x.dtype
+    w = q8_rows(q, sc)
+    assert torch.allclose(y[:, :300], x @ w.t(), atol=2e-3, rtol=1e-2)
+    assert torch.count_nonzero(y[:, 300:]) == 0
+    assert torch.allclose(head.dense().float(), w, atol=1e-3)
+    with pytest.raises(ValueError):
+        core.Q8Head(q, sc, R=299)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("M", [1, 7, 32, 33, 80])
+def test_q8_head_gpu_matches_dense(M):
+    pytest.importorskip("cupy")
+    from shapequant.packed import q8_rows
+    q, sc = _q8_parts(V=1000, C=256)
+    head = core.Q8Head(q.cuda(), sc.cuda(), chunk_rows=384)
+    x = (torch.randn(M, 256) * 0.1).to(torch.bfloat16).cuda()
+    y = torch.ops.shapequant.linear(x, core.register(head))
+    ref = x.float() @ q8_rows(q, sc).cuda().t()
+    assert y.shape == (M, 1000) and y.dtype == torch.bfloat16
+    assert torch.allclose(y.float(), ref, atol=3e-2, rtol=3e-2)
+
+
+def test_export_config_embed_head_flag():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("export_vllm_checkpoint", ROOT / "scripts" / "export_vllm_checkpoint.py")
+    ex = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ex)
+    cfg = ex.vllm_config({"vocab_size": 10, "dtype": "bfloat16"})
+    assert cfg["quantization_config"]["embed_head"] == "packed" and "dtype" not in cfg
+    assert ex.vllm_config({}, "bf16")["quantization_config"]["embed_head"] == "bf16"

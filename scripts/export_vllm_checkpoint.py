@@ -4,8 +4,10 @@ registers the method).
 
 Output (text-only Qwen3.5 architecture, Qwen3_5ForCausalLM):
   config.json          the packed file's text config + quantization_config
-  model.safetensors    the non-block tensors (norms, DeltaNet gates / conv / A_log / dt_bias)
-                       and the embedding (4-bit) and head (8-bit) at their dequantized values (bf16)
+  model.safetensors    the non-block tensors (norms, DeltaNet gates / conv / A_log / dt_bias);
+                       with --embed-head bf16 also the embedding (4-bit) and head (8-bit) at their
+                       dequantized values (bf16). Default --embed-head packed: the plugin reads both
+                       from the packed file (~3 GB less GPU memory on 27B, same values)
   shapequant.packed    the packed file (block linears; read by the plugin, not by vLLM's loader)
   tokenizer + chat template + generation config from the base repo
 
@@ -38,24 +40,27 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def vllm_config(aux_config: dict) -> dict:
+def vllm_config(aux_config: dict, embed_head: str = "packed") -> dict:
     cfg = dict(aux_config)
     cfg.update(architectures=["Qwen3_5ForCausalLM"], tie_word_embeddings=False, torch_dtype="bfloat16",
                quantization_config={"quant_method": "shapequant", "packed_file": PACKED_NAME,
                                     # PRO 6000 s36: shared-memory batched kernel to a per-shape crossover (<= 64 rows, tuned
                                     # at load), fused GEMM above
-                                    "xs": True, "bmax": 64, "large": "fused", "tune": True})
+                                    "xs": True, "bmax": 64, "large": "fused", "tune": True,
+                                    "embed_head": embed_head})
     cfg.pop("dtype", None)
     cfg.pop("_name_or_path", None)
     return cfg
 
 
-def dense_tensors(pf, chunk: int = 16384) -> dict[str, torch.Tensor]:
+def dense_tensors(pf, chunk: int = 16384, embed_head: str = "packed") -> dict[str, torch.Tensor]:
     from shapequant.packed import q4_embed_rows, q8_rows
     aux = pf.aux
     if aux.get("embed") != "q4_b32" or aux.get("lm_head") != "q8_b32":
         raise ValueError(f"unexpected aux formats: embed {aux.get('embed')}, head {aux.get('lm_head')}")
     out = {n: pf.aux_tensor(f"dense.{n}").to(torch.bfloat16).contiguous() for n in aux["dense"]}
+    if embed_head == "packed":
+        return out
     V = aux["vocab"]
     eq, es = pf.aux_tensor("embed.q"), pf.aux_tensor("embed.scale")
     hq, hs = pf.aux_tensor("lm_head.q"), pf.aux_tensor("lm_head.scale")
@@ -70,7 +75,7 @@ def dense_tensors(pf, chunk: int = 16384) -> dict[str, torch.Tensor]:
     return out
 
 
-def export(packed: str, out: Path, base: str | None = None) -> dict:
+def export(packed: str, out: Path, base: str | None = None, embed_head: str = "packed") -> dict:
     from safetensors.torch import save_file
     from shapequant.packed import PackedFile
     pf = PackedFile(packed)
@@ -79,8 +84,8 @@ def export(packed: str, out: Path, base: str | None = None) -> dict:
     base = base or pf.summary["base_model"]
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    (out / "config.json").write_text(json.dumps(vllm_config(pf.aux["config"]), indent=2))
-    tensors = dense_tensors(pf)
+    (out / "config.json").write_text(json.dumps(vllm_config(pf.aux["config"], embed_head), indent=2))
+    tensors = dense_tensors(pf, embed_head=embed_head)
     save_file(tensors, str(out / "model.safetensors"), metadata={"format": "pt"})
     log(f"wrote {len(tensors)} dense tensors ({sum(t.numel() * 2 for t in tensors.values()) / 1e9:.2f} GB)")
     dst = out / PACKED_NAME
@@ -113,13 +118,15 @@ def main() -> int:
     src.add_argument("--packed-hf", help="REPO:FILE")
     ap.add_argument("--base", help="tokenizer / chat template source (default: the packed file's base model)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--embed-head", choices=["packed", "bf16"], default="packed",
+                    help="packed: plugin serves the q4 embedding / q8 head; bf16: dequantized into model.safetensors")
     a = ap.parse_args()
     packed = a.packed
     if a.packed_hf:
         from huggingface_hub import hf_hub_download
         repo, fname = a.packed_hf.split(":", 1)
         packed = hf_hub_download(repo, fname)
-    export(packed, Path(a.out), a.base)
+    export(packed, Path(a.out), a.base, a.embed_head)
     return 0
 
 
