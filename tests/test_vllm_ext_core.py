@@ -276,3 +276,44 @@ def test_tune_launch_buckets_match_default():
     for M, r in ref.items():
         y = ps.forward(x[:M]).float()
         assert float((y - r).abs().max() / r.abs().max()) < 1e-2, M
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_pool_tile_words_keeps_outputs_and_repoints_launchers():
+    """pool_tile_words: every registered matrix's tile words move into one buffer; outputs (small-M
+    tuned buckets and the compact large-M dequant path) are bit-identical; a second call is a no-op."""
+    pytest.importorskip("cupy")
+    from shapequant.kernels import proto_runs
+    from test_proto_runs import _lin
+    saved = list(core._REGISTRY)
+    core._REGISTRY.clear()
+    try:
+        shards = []
+        for j, Rs in enumerate(((512, 256), (384,))):
+            rls = []
+            for i, R in enumerate(Rs):
+                lin, tags = _lin(R, 2048, 10, G=4, M=1, seed=31 + 10 * j + i)
+                rls.append(proto_runs.RunsLinear(lin, tags, 1))
+            ps = core.PackedShards(rls, bmax=32, layout="tile", xs=True, compact=True)
+            ps.tune_launch(reps=1)
+            core.register(ps)
+            shards.append(ps)
+        x = (torch.randn(80, 2048, device="cuda") * 0.5).to(torch.bfloat16)
+        before = [{M: ps.forward(x[:M]) for M in (1, 5, 32, 80)} for ps in shards]
+        old = [rl._tile_words[0].data_ptr() for ps in shards for rl in ps.rls]
+        n = core.pool_tile_words()
+        words = [rl._tile_words[0] for ps in shards for rl in ps.rls]
+        assert n >= sum(w.numel() * 4 for w in words)
+        base = words[0].untyped_storage().data_ptr()
+        assert all(w.untyped_storage().data_ptr() == base for w in words)      # one shared buffer
+        assert all(w.data_ptr() % 256 == 0 for w in words)
+        assert not set(old) & {w.data_ptr() for w in words}
+        for ps in shards:
+            for lb in list(ps.launchers) + [lb for per in ps.blaunch for lb in per]:
+                assert lb.wt.untyped_storage().data_ptr() == base
+        for ps, ref in zip(shards, before):
+            for M, y in ref.items():
+                assert torch.equal(ps.forward(x[:M]), y), M
+        assert core.pool_tile_words() == 0
+    finally:
+        core._REGISTRY[:] = saved

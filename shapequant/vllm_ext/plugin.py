@@ -27,7 +27,11 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
+from vllm.logger import init_logger
+
 from . import core
+
+logger = init_logger("vllm.shapequant")      # under vllm.*: vLLM only configures handlers there
 
 
 def _model_path() -> tuple[str, str | None]:
@@ -170,6 +174,23 @@ class ShapeQuantLinearMethod(LinearMethodBase):
                 ps.tune()
         layer.sq_handle = core.register(ps)
         layer.sq_shards = ps            # keeps the kernels' tensors alive with the module
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # every layer exists by now: move all tile words into one buffer (the first call does the
+        # work, later ones find nothing new), then return the freed per-matrix blocks to the driver
+        if os.environ.get("SHAPEQUANT_POOL", "1") == "0":
+            return
+        a0 = torch.cuda.memory_allocated()
+        n = core.pool_tile_words()
+        if n:
+            import gc
+            torch.cuda.synchronize()
+            a1 = torch.cuda.memory_allocated()
+            gc.collect()
+            torch.cuda.empty_cache()
+            a2 = torch.cuda.memory_allocated()
+            logger.info("shapequant: pooled %.2f GiB of tile words; allocated %.2f -> %.2f GiB, "
+                        "%.2f GiB after gc", n / 2**30, a0 / 2**30, a1 / 2**30, a2 / 2**30)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         y = torch.ops.shapequant.linear(x, layer.sq_handle)

@@ -75,9 +75,17 @@ BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 LAUNCH_GRID = [(w, b, m) for w in (4, 8) for b in (1, 2, 4) for m in (1, 2, 4, 8)]
 
 
+_TIME_STREAM: dict = {}     # device -> the one side stream every _time warmup runs on
+
+
 def _time(fn, reps: int, n: int = 10) -> float:
-    """GPU ms per call: CUDA-graph replay of n calls (as vLLM's captured decode), median of reps."""
-    s = torch.cuda.Stream()
+    """GPU ms per call: CUDA-graph replay of n calls (as vLLM's captured decode), median of reps.
+    The warmup runs on one reused side stream: torch caches a cuBLAS workspace per stream for the
+    process lifetime, and a fresh stream per call left 31 x 8 MiB (0.25 GiB) behind on the 27B."""
+    dev = torch.cuda.current_device()
+    if dev not in _TIME_STREAM:
+        _TIME_STREAM[dev] = torch.cuda.Stream()
+    s = _TIME_STREAM[dev]
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         fn()                      # compiles kernels, grows shared buffers before capture
@@ -438,6 +446,52 @@ _REGISTRY: list = []        # PackedShards | Q8Head
 def register(ps) -> int:
     _REGISTRY.append(ps)
     return len(_REGISTRY) - 1
+
+
+_POOL_ALIGN = 64            # int32 elements (256 bytes) between pooled matrices
+
+
+def pool_tile_words() -> int:
+    """Move the tile words of every registered matrix not pooled yet into one exact-size buffer per
+    device, repoint its launchers, and free the per-matrix copies. Each matrix's tile words were a
+    separate ~10-60 MB allocation, which the caching allocator rounds up inside 2 MB segments: on the
+    27B, 800 blocks held 8.20 GiB for 7.38 GiB of data. Returns the bytes now pooled (0 if nothing
+    new). The kernels read `RunsBatch.wt` at every call, so nothing else needs to change; call it
+    before any CUDA graph that uses these matrices is captured."""
+    rls, seen = [], set()
+    for ps in _REGISTRY:
+        for rl in getattr(ps, "rls", ()):
+            tw = getattr(rl, "_tile_words", None)
+            if tw is None or id(rl) in seen or getattr(rl, "_tw_pooled", False):
+                continue
+            seen.add(id(rl))
+            rls.append(rl)
+    if not rls:
+        return 0
+    pooled = 0
+    for dev in {rl._tile_words[0].device for rl in rls}:
+        lst = [rl for rl in rls if rl._tile_words[0].device == dev]
+        sizes = [-(-rl._tile_words[0].numel() // _POOL_ALIGN) * _POOL_ALIGN for rl in lst]
+        arena = torch.empty(sum(sizes), dtype=torch.int32, device=dev)
+        remap, off = {}, 0
+        for rl, n in zip(lst, sizes):
+            wt, toff = rl._tile_words
+            assert wt.dtype == torch.int32 and wt.is_contiguous()
+            new = arena[off:off + wt.numel()].view(wt.shape)
+            new.copy_(wt)
+            remap[id(wt)] = (wt, new)
+            rl._tile_words, rl._tw_pooled = (new, toff), True
+            off += n
+        for ps in _REGISTRY:
+            lbs = list(getattr(ps, "launchers", None) or ())
+            lbs += [lb for per in (getattr(ps, "blaunch", None) or ()) for lb in per]
+            for lb in lbs:
+                w = getattr(lb, "wt", None)
+                if w is not None and id(w) in remap:
+                    lb.wt = remap[id(w)][1]
+        pooled += arena.numel() * 4
+        del remap
+    return pooled
 
 
 _DEBUG = {"on": __import__("os").environ.get("SHAPEQUANT_DEBUG") == "1", "n": 0}
