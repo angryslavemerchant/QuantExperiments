@@ -51,4 +51,10 @@ Tests: `python -m pytest tests -q`.
   The packed model is already local at `models/Qwen3.8-27B-shapequant-2.5bpw/s16_25_ft.safetensors`
   (excluded from git via `.git/info/exclude`): export with
   `scripts/export_vllm_checkpoint.py --packed <that file>` instead of
-  downloading it again.
+  downloading it again. Set up 2026-11-08: uv in `~/.local/bin`, `~/sq-venv`
+  (vLLM 0.33.0, torch 2.14 cu132, cupy-cuda13x, `datasets` for the smoke
+  test), gcc + CUDA toolkit 13.2 via apt. Every vLLM command starts with
+  `source ~/sq_env.sh` (venv `bin` + `/usr/local/cuda/bin` on PATH,
+  `CUDA_HOME`). When calling `wsl ... bash -lc '...'` from Windows, `$` in
+  the command gets expanded on the Windows side: put anything with `$` in a
+  script file instead. Pass `HF_TOKEN` with `WSLENV=HF_TOKEN/u`.

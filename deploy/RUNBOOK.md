@@ -12,6 +12,22 @@ request, up to 16 requests at once by default, protected by an API key.
   The vLLM 0.33 packages are built for CUDA 13; on an older driver (e.g. 570 = CUDA 12.8) vLLM fails
   with `libcudart.so.13: cannot open shared object file`. Updating the driver is the fix.
 - Python 3.10-3.12, git, ~40 GB free disk (15 GB vLLM environment, 10 GB model, caches).
+- A C compiler, Python headers and the CUDA toolkit (`nvcc`): Triton and FlashInfer compile kernels
+  at engine start. Rental images ship these; a fresh Ubuntu / WSL2 install does not (errors:
+  `Failed to find C compiler`, `Could not find nvcc`). On WSL2 Ubuntu 24.04 (as root):
+  ```bash
+  apt-get install -y build-essential python3.12-dev
+  wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+  dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update && apt-get install -y cuda-toolkit-13-2
+  ```
+  Then run vLLM with the venv's `bin` (for `ninja`) and CUDA on `PATH`:
+  `export PATH="$HOME/sq-venv/bin:/usr/local/cuda/bin:$PATH" CUDA_HOME=/usr/local/cuda`
+  (`No such file or directory: 'ninja'` means the venv's `bin` is missing from `PATH`).
+  On WSL2 do **not** set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (the rental-box scripts
+  do): the plugin's per-shape tuning at startup then crawls (22+ min stuck in `PackedShards.tune`,
+  CPU-bound, GPU idle) instead of finishing in ~2 min.
+- No `pip` in the system Python (Ubuntu 24.04)? Install uv standalone first:
+  `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 - A Hugging Face **read** token with access to `luckymushy/Qwen3.8-27B-shapequant-2.5bpw`.
 
 ## 1. Get the code onto the machine
