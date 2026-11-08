@@ -207,15 +207,15 @@ class ShapeQuantEmbedMethod(QuantizeMethodBase):
             sc = self.cfg.pf.aux_tensor("embed.scale").to(dev).contiguous()
         if q.shape[1] * 2 != input_size:
             raise ValueError(f"embedding: packed C {q.shape[1] * 2}, layer {input_size}")
-        layer.register_buffer("sq_embed_q", q, persistent=False)
-        layer.register_buffer("sq_embed_scale", sc, persistent=False)
-        layer.sq_dtype = params_dtype
+        emb = core.Q4Embedding(q, sc, params_dtype)
+        layer.sq_handle = core.register(emb)
+        layer.sq_shards = emb
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         raise RuntimeError("shapequant: the 4-bit embedding is not an output head")
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return core.q4_embed(layer.sq_embed_q, layer.sq_embed_scale, input_, layer.sq_dtype)
+        return torch.ops.shapequant.embed(input_, layer.sq_handle)
 
 
 def _patch_qwen35_embedding() -> None:

@@ -77,9 +77,9 @@ log "setup done at $(mins) min"
 
 # ---------------------------------------------------------------- gate 2: servers
 declare -A EPS CONC
-start_vllm() {   # gpu port
+start_vllm() {   # gpu port [ckpt]
   CUDA_VISIBLE_DEVICES=$1 SHAPEQUANT_LAYOUT=$LAYOUT PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    nohup "$VENV/bin/vllm" serve "$CK" --served-model-name ours --host 127.0.0.1 --port $2 \
+    nohup "$VENV/bin/vllm" serve "${3:-$CK}" --served-model-name ours --host 127.0.0.1 --port $2 \
       --dtype bfloat16 --max-model-len $SLOT_CTX --gpu-memory-utilization 0.92 --max-num-seqs 64 \
       --max-num-batched-tokens 8192 --seed 0 > "$OUT/servers/vllm_$2.log" 2>&1 &
 }
@@ -102,7 +102,14 @@ healthy() {      # port timeout_s -> 0 when /health is 200 and a tiny chat answe
     if curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
       curl -sf "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
         -d '{"model":"x","messages":[{"role":"user","content":"Say OK."}],"max_tokens":8,"chat_template_kwargs":{"enable_thinking":false}}' \
-        > "$OUT/servers/hello_$port.json" 2>&1 && return 0
+        > "$OUT/servers/hello_$port.json" 2>&1 || { sleep 10; continue; }
+      # sanity: a correct answer, not just any text (s38: a broken embedding gave uniform logits)
+      curl -sf "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model":"x","messages":[{"role":"user","content":"What is 7 times 8? Reply with only the number."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
+        > "$OUT/servers/sanity_$port.json" 2>&1
+      if grep -q '56' "$OUT/servers/sanity_$port.json"; then return 0; fi
+      log ":$port answers but fails the 7x8 sanity check: $(head -c 300 "$OUT/servers/sanity_$port.json")"
+      return 2
     fi
     sleep 10
   done
@@ -121,6 +128,15 @@ check() {        # model base_port gpus conc timeout
   EPS[$m]=$eps; CONC[$m]=$4
 }
 check ours 8000 "$OURS_GPUS" 64 1500
+if [ -n "$OURS_GPUS" ] && [ -z "${EPS[ours]}" ]; then
+  # fallback: embedding / head dequantized to bf16 in model.safetensors (the path validated on s35/s36)
+  log "ours failed its gate: retrying with --embed-head bf16"
+  pkill -f "vllm serve" 2>/dev/null; sleep 15
+  $PY scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$CK.bf16" --embed-head bf16 > "$OUT/export_bf16.log" 2>&1
+  i=0; for g in $OURS_GPUS; do start_vllm $g $((8000 + i)) "$CK.bf16"; i=$((i + 1)); done
+  check ours 8000 "$OURS_GPUS" 64 1500
+  [ -n "${EPS[ours]}" ] && echo bf16 > "$OUT/ours_embed_head.txt"
+fi
 check iq2s 8100 "$IQ2S_GPUS" $IQ2S_SLOTS 600
 check q4km 8200 "$Q4KM_GPUS" $Q4KM_SLOTS 600
 nvidia-smi --query-gpu=index,memory.used --format=csv > "$OUT/servers/mem_after_load.txt"

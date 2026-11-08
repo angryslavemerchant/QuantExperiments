@@ -198,3 +198,24 @@ def test_export_config_embed_head_flag():
     cfg = ex.vllm_config({"vocab_size": 10, "dtype": "bfloat16"})
     assert cfg["quantization_config"]["embed_head"] == "packed" and "dtype" not in cfg
     assert ex.vllm_config({}, "bf16")["quantization_config"]["embed_head"] == "bf16"
+
+
+def test_embed_op_matches_q4_embed():
+    from shapequant.packed import q4_embed_pack
+    g = torch.Generator().manual_seed(2)
+    q, sc = q4_embed_pack(torch.randn(100, 64, generator=g) * 0.03)
+    h = core.register(core.Q4Embedding(q, sc, torch.bfloat16))
+    ids = torch.tensor([3, 99, 0])
+    out = torch.ops.shapequant.embed(ids, h)
+    assert out.shape == (3, 64) and out.dtype == torch.bfloat16
+    assert torch.equal(out, core.q4_embed(q, sc, ids, torch.bfloat16)) and out.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_embed_op_compiles_on_gpu():
+    from shapequant.packed import q4_embed_pack
+    q, sc = q4_embed_pack(torch.randn(100, 64) * 0.03)
+    h = core.register(core.Q4Embedding(q.cuda(), sc.cuda(), torch.bfloat16))
+    ids = torch.tensor([3, 99, 0], device="cuda")
+    f = torch.compile(lambda i: torch.ops.shapequant.embed(i, h) * 2, fullgraph=True)
+    assert torch.equal(f(ids), torch.ops.shapequant.embed(ids, h) * 2)

@@ -314,6 +314,19 @@ def q4_embed(q: torch.Tensor, sc: torch.Tensor, ids: torch.Tensor, dtype: torch.
     return rows.to(dtype).view(*ids.shape, -1)
 
 
+class Q4Embedding:
+    """The 4-bit embedding behind the shapequant::embed op (an integer handle, like the linears:
+    vLLM's model build / load / torch.compile never see its tensors; s38: as registered module
+    buffers it came back all zeros inside vLLM)."""
+
+    def __init__(self, q: torch.Tensor, sc: torch.Tensor, dtype: torch.dtype):
+        self.q, self.sc, self.dtype = q, sc, dtype
+        self.C = q.shape[1] * 2
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return q4_embed(self.q, self.sc, ids, self.dtype)
+
+
 # ------------------------------------------------------------------ torch custom op
 
 _REGISTRY: list = []        # PackedShards | Q8Head
@@ -332,3 +345,14 @@ def linear_op(x: torch.Tensor, handle: int) -> torch.Tensor:
 @linear_op.register_fake
 def _(x: torch.Tensor, handle: int) -> torch.Tensor:
     return x.new_empty(*x.shape[:-1], _REGISTRY[handle].R)
+
+
+@torch.library.custom_op("shapequant::embed", mutates_args=())
+def embed_op(ids: torch.Tensor, handle: int) -> torch.Tensor:
+    return _REGISTRY[handle].forward(ids)
+
+
+@embed_op.register_fake
+def _(ids: torch.Tensor, handle: int) -> torch.Tensor:
+    e = _REGISTRY[handle]
+    return torch.empty(*ids.shape, e.C, dtype=e.dtype, device=ids.device)
