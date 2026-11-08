@@ -19,6 +19,16 @@ nvidia-smi --query-gpu=name,memory.total --format=csv | tee "$OUT/gpu.txt"
 # env (reused by later stages) + this checkout; tests "none" so kernel_dev_box only builds
 TESTS=none MS=1 NAMES=model.layers.0.mlp.down_proj bash scripts/kernel_dev_box.sh "$OUT/setup" > "$OUT/setup.log" 2>&1
 tail -3 "$OUT/setup.log"
+# one CuPy build only (an env built before the kernel_dev_box fix may hold both + stale cubins)
+if [ "$($PY -m uv pip list --python "$VPY" 2>/dev/null | grep -c '^cupy-cuda')" != 1 ]; then
+  log "fixing CuPy install"
+  for pkg in cupy-cuda13x cupy-cuda12x; do
+    $PY -m uv pip uninstall --python "$VPY" -q cupy-cuda13x cupy-cuda12x > /dev/null 2>&1
+    rm -rf "$HOME/.cupy/kernel_cache"
+    $PY -m uv pip install --python "$VPY" -q $pkg > /dev/null 2>&1
+    "$VPY" -c "import cupy as cp; k = cp.RawKernel(r'extern \"C\" __global__ void f(float* x){x[0]=1.f;}', 'f'); x = cp.zeros(1, dtype=cp.float32); k((1,), (1,), (x,)); assert float(x[0]) == 1" > /dev/null 2>&1 && { log "cupy: $pkg"; break; }
+  done
+fi
 PK=$($PY -c "from huggingface_hub import hf_hub_download as d; r, f = '$PACKED'.split(':', 1); print(d(r, f))") || { log "packed download failed"; exit 1; }
 if has tests; then
   log "tests"

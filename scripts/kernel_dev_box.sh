@@ -22,6 +22,8 @@ if [ ! -e "$VENV/.ready" ]; then
   ) > "$OUT/env.log" 2>&1 || { log "env build failed"; tail -20 "$OUT/env.log"; exit 1; }
   ok=0
   for pkgs in "cupy-cuda13x" "cupy-cuda12x"; do
+    $PY -m uv pip uninstall --python "$VENV/bin/python" -q cupy-cuda13x cupy-cuda12x >> "$OUT/env.log" 2>&1
+    rm -rf "$HOME/.cupy/kernel_cache"        # a failed build's cached cubins (s40: CUDA_ERROR_INVALID_IMAGE)
     $PY -m uv pip install --python "$VENV/bin/python" -q $pkgs >> "$OUT/env.log" 2>&1
     if "$VENV/bin/python" -c "import cupy as cp; k = cp.RawKernel(r'extern \"C\" __global__ void f(float* x){x[0]=1.f;}', 'f'); x = cp.zeros(1, dtype=cp.float32); k((1,), (1,), (x,)); assert float(x[0]) == 1" >> "$OUT/env.log" 2>&1; then
       ok=1; break

@@ -25,16 +25,14 @@ def main() -> int:
         src = f"#define BITS {bits}\n#define TSMEM {tsmem}\n#define BM {bm}\n#define GROUPED {grouped}\n" + rg._SRC
         cp.RawModule(code=src, options=opts).compile()
         n += 1
-    for bits, nb8, smem, books, tile, xs in itertools.product((8, 12), (1, 4, 16), (0, 1), (0, 1), (0, 1), (0, 1)):
+    for bits, nb8, smem, books, tile, xs, bf in itertools.product((8, 12), (1, 4, 16), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1)):
         src = (f"#define BITS {bits}\n#define NFULL 2\n#define JT 4\n#define NB8 {nb8}\n#define SMEM {smem}\n"
-               f"#define BOOKS {books}\n#define THREADS 256\n#define ACC16 0\n#define TILE {tile}\n#define XS {xs}\n") + br._COMMON + br._SRC_RUNS
+               f"#define BOOKS {books}\n#define THREADS 256\n#define ACC16 0\n#define TILE {tile}\n#define XS {xs}\n"
+               f"#define XBF16 {bf}\n#define YBF16 {bf}\n") + br._COMMON + br._SRC_RUNS
         cp.RawModule(code=src, options=opts + ("--use_fast_math",)).compile()
         n += 1
     for bits, (nfull, jt) in itertools.product((8, 10, 12), ((2, 4), (0, 4), (2, 0))):
-        src = f"#define BITS {bits}
-#define NFULL {nfull}
-#define JT {jt}
-" + br._SRC_DEQ_TILE
+        src = f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n" + br._SRC_DEQ_TILE
         cp.RawModule(code=src, options=opts).compile()
         n += 1
     print(f"compiled {n} variants")

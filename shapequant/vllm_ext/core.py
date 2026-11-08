@@ -68,6 +68,9 @@ def neutral_defaults():
 
 
 _TUNED: dict = {}
+_LAUNCH: dict = {}          # (runs_key, bucket, layout) -> (xs, warps, bps, max_split)
+BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+LAUNCH_GRID = [(w, b, m) for w in (4, 8) for b in (1, 2, 4) for m in (1, 2, 4, 8)]
 
 
 def _time(fn, reps: int, n: int = 10) -> float:
@@ -150,6 +153,53 @@ class PackedShards:
         # the batched kernel writes Y [B, R_piece] contiguous: one buffer per piece, then a copy
         # into the stacked output (skipped for a single piece)
         self.device = rls[0].words.device
+        self.buckets, self.blaunch = None, None          # tune_launch(): per batch-size bucket launchers
+
+    @torch.no_grad()
+    def tune_launch(self, reps: int = 3) -> list:
+        """Per piece and batch-size bucket (1, 2, 4, ... up to bmax), the fastest batched-kernel launch
+        (X in shared memory or not x warps x blocks/SM x split-K), timed on bf16 X / Y as vLLM calls
+        it, cached per matrix shape (s40 3090: 15-30% over the default config at B 1-8)."""
+        from ..kernels import batched_runs as br
+        bl = [b for b in BUCKETS if b < self.bmax] + [self.bmax]
+        blaunch = []
+        for rl, base in zip(self.rls, self.launchers):
+            per = []
+            for b in bl:
+                k = (br.runs_key(rl), b, self.layout)
+                cfg = _LAUNCH.get(k)
+                if cfg is None:
+                    x = torch.randn(b, self.C, device=self.device, dtype=torch.bfloat16)
+                    y = torch.empty(b, rl.R, device=self.device, dtype=torch.bfloat16)
+                    best, seen = None, set()
+                    for xs in (False, True):
+                        if not xs and b > br.BMAX:
+                            continue
+                        for w, bps, m in LAUNCH_GRID:
+                            lb = br.RunsBatch(rl, bmax=b, warps=w, bps=bps, max_split=m, layout=self.layout, xs=xs)
+                            eff = (xs, w, lb.grid, lb.S)
+                            if eff in seen:
+                                continue
+                            seen.add(eff)
+                            t = _time(lambda: lb.run(x, y, b), reps)
+                            if best is None or t < best[0]:
+                                best = (t, (xs, w, bps, m))
+                    cfg = _LAUNCH[k] = best[1]
+                xs, w, bps, m = cfg
+                lb = br.RunsBatch(rl, bmax=b, warps=w, bps=bps, max_split=m, layout=self.layout, xs=xs)
+                if self.layout == "tile" and not torch.equal(lb.tiles, base.tiles):
+                    raise RuntimeError("tile order differs between launch configs (shared tile words)")
+                per.append(lb)
+            blaunch.append(per)
+        self.buckets, self.blaunch = bl, blaunch
+        return [_LAUNCH[(br.runs_key(rl), b, self.layout)] for rl in self.rls for b in bl]
+
+    def _launchers_for(self, M: int) -> list:
+        if self.blaunch is None:
+            return self.launchers
+        import bisect
+        i = bisect.bisect_left(self.buckets, M)
+        return [per[i] for per in self.blaunch]
 
     def key(self) -> tuple:
         return (tuple(self.Rs), self.C, tuple(rl.bits for rl in self.rls), self.large, self.bmax, self.compact)
@@ -167,9 +217,9 @@ class PackedShards:
         for M in Ms:
             if M > self.bmax:
                 break
-            x = torch.randn(M, self.C, device=self.device, dtype=torch.float16)
+            x = torch.randn(M, self.C, device=self.device, dtype=torch.bfloat16)      # vLLM's activations
             t_small = _time(lambda: self._small(x, M), reps)
-            t_large = _time(lambda: self._large(x), reps)
+            t_large = _time(lambda: self._large(x.to(torch.float16)), reps)
             if t_large < t_small:
                 break
             cross = M
@@ -204,26 +254,26 @@ class PackedShards:
         shp = x.shape
         x2 = x.reshape(-1, self.C)
         M = x2.shape[0]
-        x16 = x2.to(torch.float16).contiguous()
         if M == 0:
-            y = x16.new_empty(0, self.R)
+            y = x2.new_empty(0, self.R)
         elif M <= self.cross:
-            y = self._small(x16, M)
+            # the batched kernel reads bf16 / fp16 X and writes Y in the same dtype, every stacked
+            # piece straight into its column slice: no cast or concat kernels around it
+            xin = x2 if x2.dtype in (torch.float16, torch.bfloat16) else x2.to(torch.float16)
+            y = self._small(xin.contiguous(), M)
         else:
-            y = self._large(x16)
+            y = self._large(x2.to(torch.float16).contiguous())
         return y.to(x.dtype).view(*shp[:-1], self.R)
 
-    def _small(self, x16: torch.Tensor, M: int) -> torch.Tensor:
-        if len(self.launchers) == 1:
-            y = torch.empty(M, self.R, dtype=torch.float16, device=x16.device)
-            self.launchers[0].run(x16, y, M)
+    def _small(self, x: torch.Tensor, M: int) -> torch.Tensor:
+        y = torch.empty(M, self.R, dtype=x.dtype, device=x.device)
+        lbs = self._launchers_for(M)
+        if len(lbs) == 1:
+            lbs[0].run(x, y, M)
             return y
-        parts = []
-        for lb, R in zip(self.launchers, self.Rs):
-            yp = torch.empty(M, R, dtype=torch.float16, device=x16.device)
-            lb.run(x16, yp, M)
-            parts.append(yp)
-        return torch.cat(parts, 1)
+        for lb, off, R in zip(lbs, self.offs, self.Rs):
+            lb.run(x, y[:, off:off + R], M)
+        return y
 
     def _large(self, x16: torch.Tensor) -> torch.Tensor:
         if self.compact:

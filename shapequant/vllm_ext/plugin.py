@@ -158,6 +158,7 @@ class ShapeQuantLinearMethod(LinearMethodBase):
                              f"[{output_size}, {input_size}] (partitions {output_partition_sizes})")
         if self.cfg.tune:
             with core.neutral_defaults():
+                ps.tune_launch()
                 ps.tune()
         layer.sq_handle = core.register(ps)
         layer.sq_shards = ps            # keeps the kernels' tensors alive with the module

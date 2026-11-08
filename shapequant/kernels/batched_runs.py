@@ -64,6 +64,30 @@ __device__ __forceinline__ void mma_code(float* c, u32 a_lo0, u32 a_lo1, u32 a_h
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a_hi0), "r"(a_hi1), "r"(b1));
 #endif
 }
+// XBF16 / YBF16: X read as bf16 (converted to fp16 on load, as a separate cast would) / Y written as
+// bf16 (round to nearest even), so vLLM's bf16 activations need no cast kernels around the call
+#ifndef XBF16
+#define XBF16 0
+#endif
+#ifndef YBF16
+#define YBF16 0
+#endif
+__device__ __forceinline__ u32 bf2_to_h2(u32 v) {
+    __half2 h = __floats2half2_rn(__uint_as_float(v << 16), __uint_as_float(v & 0xffff0000u));
+    return *(u32*)&h;
+}
+__device__ __forceinline__ uint2 xload(uint2 v) {
+#if XBF16
+    return make_uint2(bf2_to_h2(v.x), bf2_to_h2(v.y));
+#else
+    return v;
+#endif
+}
+__device__ __forceinline__ unsigned short f2bf(float f) {
+    u32 u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
 """
 
 _SRC_RUNS = r"""
@@ -115,7 +139,7 @@ __device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, con
         #pragma unroll
         for (int nb = 0; nb < NB8; ++nb) {
             const int n = nb * 8 + g;
-            const uint2 xv = n < B ? __ldg(X + (size_t)n * NCH + c) : make_uint2(0u, 0u);
+            const uint2 xv = n < B ? xload(__ldg(X + (size_t)n * NCH + c)) : make_uint2(0u, 0u);
             mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
         }
 #endif
@@ -130,7 +154,7 @@ __device__ __forceinline__ void load_xs(const uint2* __restrict__ X, uint2* xs, 
     const int base = 512 * bb + 8 * ug;
     for (int idx = threadIdx.x; idx < NB8 * 8 * 64; idx += THREADS) {
         const int n = idx >> 6, q = idx & 63, m = q >> 3;
-        const uint2 v = (n < B && m < nm) ? __ldg(X + (size_t)n * NCH + base + 64 * m + (q & 7)) : make_uint2(0u, 0u);
+        const uint2 v = (n < B && m < nm) ? xload(__ldg(X + (size_t)n * NCH + base + 64 * m + (q & 7))) : make_uint2(0u, 0u);
         xs[n * 64 + (q ^ xs_swz(n))] = v;
     }
 }
@@ -186,7 +210,7 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
             const int* __restrict__ book_off, const uint2* __restrict__ X, __half* __restrict__ Y,
             const int* __restrict__ tiles, int nitems, int S, int R, int B, int table_n,
             const float* __restrict__ yscale, const int4* __restrict__ blk, float* __restrict__ ws,
-            unsigned int* __restrict__ cnt)
+            unsigned int* __restrict__ cnt, int ldy)
 {
     constexpr int W = THREADS / 32;
     extern __shared__ __align__(16) uint2 stab[];
@@ -318,7 +342,14 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int n = nb * 8 + 2 * t + (e & 1), row = e < 2 ? r0 : r1;
-                if (n < B && row >= 0) Y[(size_t)n * R + row] = __float2half(acc[nb][e] * ys * __half2float(row_scale[row]));
+                if (n < B && row >= 0) {
+                    const float v = acc[nb][e] * ys * __half2float(row_scale[row]);
+#if YBF16
+                    ((unsigned short*)Y)[(size_t)n * ldy + row] = f2bf(v);
+#else
+                    Y[(size_t)n * ldy + row] = __float2half(v);
+#endif
+                }
             }
         }
     }
@@ -535,15 +566,16 @@ def _nb8(B: int) -> int:
     return (B + 7) // 8
 
 
-def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False, tile=False, xs=False):
+def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False, tile=False, xs=False, xbf=False, ybf=False):
     import cupy as cp
     from .proto_runs import geometry
     nfull, jt = geometry(nch)
-    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile, xs)
+    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile, xs, xbf, ybf)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define NB8 {nb8}\n"
                f"#define SMEM {int(smem)}\n#define BOOKS {int(books)}\n#define THREADS {threads}\n"
-               f"#define ACC16 {int(acc16)}\n#define TILE {int(tile)}\n#define XS {int(xs)}\n") + _COMMON + _SRC_RUNS
+               f"#define ACC16 {int(acc16)}\n#define TILE {int(tile)}\n#define XS {int(xs)}\n"
+               f"#define XBF16 {int(xbf)}\n#define YBF16 {int(ybf)}\n") + _COMMON + _SRC_RUNS
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs_b")
     return _mods[key]
 
@@ -684,13 +716,18 @@ class RunsBatch:
         self.ws = _Workspace.get(self.S * bmax * self.R if self.S > 1 else 1, dev)
 
     def run(self, X: torch.Tensor, Y: torch.Tensor, B: int | None = None):
+        """Y [B, R] = X [B, C] . W^T. X fp16 or bf16 (contiguous); Y fp16 or bf16 with unit column
+        stride, e.g. a column slice of a wider stacked output (its row stride is passed through)."""
         import cupy as cp
         rl = self.rl
         B = X.shape[0] if B is None else B
-        assert B <= self.bmax and X.is_contiguous() and X.dtype == torch.float16
+        ok = (torch.float16, torch.bfloat16)
+        assert B <= self.bmax and X.is_contiguous() and X.dtype in ok and Y.dtype in ok
+        assert Y.stride(-1) == 1 and Y.shape[-1] == self.R
         tile = self.layout == "tile"
         nb8 = _nb8(B)
-        fn = _runs_fn(rl.bits, rl.nch, nb8, self.smem, self.books, self.threads, self.acc16, tile, self.xs)
+        fn = _runs_fn(rl.bits, rl.nch, nb8, self.smem, self.books, self.threads, self.acc16, tile, self.xs,
+                      X.dtype == torch.bfloat16, Y.dtype == torch.bfloat16)
         shm = (self.table_bytes if self.smem else 0) + (nb8 * 8 * 64 * 8 if self.xs else 0)
         if shm > 48 * 1024:
             fn.max_dynamic_shared_size_bytes = shm
@@ -700,7 +737,8 @@ class RunsBatch:
                 cp.uint64(boff.data_ptr()), cp.uint64(X.data_ptr()), cp.uint64(Y.data_ptr()),
                 cp.uint64(self.tiles.data_ptr()), cp.int32(self.nitems), cp.int32(self.S), cp.int32(self.R),
                 cp.int32(B), cp.int32(K if self.books else rl.table.shape[0]), cp.uint64(rl.yscale.data_ptr()),
-                cp.uint64(self.blk.data_ptr()), cp.uint64(self.ws.data_ptr()), cp.uint64(self.cnt.data_ptr()))
+                cp.uint64(self.blk.data_ptr()), cp.uint64(self.ws.data_ptr()), cp.uint64(self.cnt.data_ptr()),
+                cp.int32(Y.stride(0) if Y.dim() == 2 else self.R))
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
             fn((self.grid,), (self.threads,), args, shared_mem=shm)
         return Y

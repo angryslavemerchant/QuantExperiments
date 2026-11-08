@@ -131,3 +131,18 @@ def test_dequant_tile_matches_lane_dequant(R, C, bits, G):
     out = torch.full((R * C + 77,), float("nan"), dtype=torch.float16, device="cuda")
     W = br.dequant_tile(lb, out)
     assert W.shape == (R, C) and torch.equal(W, ref)
+
+
+@pytest.mark.parametrize("xs", [False, True])
+def test_bf16_io_and_strided_output(xs):
+    """bf16 X / Y in-kernel (vs fp16 X + casts) and a column slice of a wider output."""
+    lin, tags = _lin(512, 3584, 10, G=4, M=1, seed=7)
+    rl = proto_runs.RunsLinear(lin, tags, 1)
+    lb = br.RunsBatch(rl, layout="tile", xs=xs, bmax=32)
+    X = (torch.randn(9, 3584, device="cuda") * 2).to(torch.bfloat16)
+    Y16 = torch.empty(9, 512, dtype=torch.float16, device="cuda")
+    lb.run(X.half(), Y16)
+    wide = torch.full((9, 700), 7.0, dtype=torch.bfloat16, device="cuda")
+    lb.run(X, wide[:, 100:612])
+    assert torch.equal(wide[:, 100:612], Y16.to(torch.bfloat16))       # same fp32 sums, one rounding
+    assert torch.all(wide[:, :100] == 7.0) and torch.all(wide[:, 612:] == 7.0)

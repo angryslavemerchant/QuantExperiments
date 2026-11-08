@@ -244,3 +244,22 @@ def test_compact_forward_matches_dense(M):
     assert torch.equal(ps.dense().float(), W)
     with pytest.raises(ValueError):
         core.PackedShards(rls, layout="lane", compact=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_tune_launch_buckets_match_default():
+    pytest.importorskip("cupy")
+    from shapequant.kernels import proto_runs
+    from test_proto_runs import _lin
+    rls = []
+    for i, R in enumerate((512, 256)):
+        lin, tags = _lin(R, 2048, 10, G=4, M=1, seed=21 + i)
+        rls.append(proto_runs.RunsLinear(lin, tags, 1))
+    ps = core.PackedShards(rls, bmax=32, layout="tile", xs=True)
+    x = (torch.randn(32, 2048, device="cuda") * 0.5).to(torch.bfloat16)
+    ref = {M: ps.forward(x[:M]).float() for M in (1, 3, 17, 32)}
+    cfgs = ps.tune_launch(reps=1)
+    assert ps.buckets == [1, 2, 4, 8, 16, 32] and len(cfgs) == 12
+    for M, r in ref.items():
+        y = ps.forward(x[:M]).float()
+        assert float((y - r).abs().max() / r.abs().max()) < 1e-2, M
