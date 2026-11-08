@@ -92,15 +92,34 @@ KV_DTYPE=fp8 MAX_LEN=262144 MAX_SEQS=2 GPU_UTIL=0.94 bash deploy/serve.sh
 
 ### Faster single requests: DSpark speculative decoding
 
-Measured on the 3090: 79 tok/s for one request instead of 38 (2.1x), 123 vs 102 tok/s total at 4
-requests. The drafter takes ~4 GB of GPU memory, so the KV cache shrinks to ~25k tokens total:
+Measured on the 3090 (2026-11-08, WSL2, thinking-mode prompts, `scripts/spec_bench.py`): **115 tok/s
+for one request instead of 51 (2.3x)**, ~150-170 tok/s total at 4 requests (vs 146). The drafter
+takes ~4 GB of GPU memory, so the KV cache shrinks to ~27k tokens total. The draft length
+(`SPEC_K`, default 7) was swept: 6 and 7 tie, 5 / 8 / 10 are 10-25% slower.
 
 ```bash
 SPEC=dspark MAX_LEN=16384 MAX_SEQS=4 bash deploy/serve.sh
 ```
 
 The first start downloads the drafter and compiles (can take ~30 min); later starts are faster.
-Best when you are the only user; for many parallel requests leave it off.
+Best when you are the only user; for many parallel requests use MTP (below) or leave it off.
+`KV_DTYPE=fp8` does not buy more context next to the drafter (a 32k request needs 5.2 GiB, 4 GiB free).
+
+### Several requests at once: MTP speculative decoding
+
+Qwen3.8's own multi-token-prediction head: 78 tok/s for one request, **~235 tok/s total at 4
+requests** (vs 146 without), KV cache ~42k tokens. Needs a checkpoint with the MTP head and a bf16
+embedding / lm_head (+~3 GB; downloads the head from the base model):
+
+```bash
+~/sq-venv/bin/python scripts/export_vllm_checkpoint.py --packed-hf luckymushy/Qwen3.8-27B-shapequant-2.5bpw:s16_25_ft.safetensors \
+    --out ~/models/q27-sq-mtp --embed-head bf16 --mtp
+MODEL_DIR=~/models/q27-sq-mtp SPEC=mtp MAX_LEN=16384 MAX_SEQS=4 bash deploy/serve.sh
+```
+
+`SPEC_K` defaults to 2 (2 and 3 tie; 4 and 5 are slower).
+
+For comparison on the same card: llama.cpp UD/lmstudio Q4_K_M 41 tok/s single, 72 with its MTP head.
 
 ### Images (vision)
 
