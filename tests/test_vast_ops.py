@@ -8714,3 +8714,17 @@ def test_pick_offer_enforces_per_gpu_price_caps() -> None:
     assert pick_offer([_offer(4, 0.69, 0.99, gpu_name="RTX 5090")])["id"] == 4
     # GPUs without a configured cap are only bounded by the manifest
     assert pick_offer([_offer(5, 1.20, 0.99, gpu_name="H100 SXM")])["id"] == 5
+
+
+def test_pick_offer_per_gpu_cap_divides_multi_gpu_totals() -> None:
+    eight = _offer(6, 4.03, 0.99, gpu_name="RTX 5090")
+    eight["num_gpus"] = 8                      # $0.50 per GPU, under the $0.70 cap
+    assert pick_offer([eight])["id"] == 6
+    pricey = _offer(7, 6.0, 0.99, gpu_name="RTX 5090")
+    pricey["num_gpus"] = 8                     # $0.75 per GPU
+    with pytest.raises(OpsError, match="per-GPU hourly price cap"):
+        pick_offer([pricey])
+    bad = _offer(8, 4.03, 0.99, gpu_name="RTX 5090")
+    bad["num_gpus"] = True                     # invalid count: strict (treated as 1)
+    with pytest.raises(OpsError, match="per-GPU hourly price cap"):
+        pick_offer([bad])

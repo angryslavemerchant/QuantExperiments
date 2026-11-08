@@ -2181,9 +2181,15 @@ def pick_offer(
         valid_offers.append(offer)
     if not valid_offers:
         raise OpsError("eligible offers did not report a finite hourly price")
+    # The ceilings are per GPU: a multi-GPU offer's total price is divided by its GPU count
+    # (a missing / invalid count is treated as 1, i.e. the strict reading).
+    def _gpus(offer: dict[str, Any]) -> int:
+        n = offer.get("num_gpus")
+        return n if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 64 else 1
+
     valid_offers = [
         offer for offer in valid_offers
-        if _finite_offer_number(offer, "dph_total")
+        if _finite_offer_number(offer, "dph_total") / _gpus(offer)
         <= OFFER_MAX_DPH_BY_GPU.get(
             _normalized_hardware_name(offer.get("gpu_name", "")), float("inf")
         )
