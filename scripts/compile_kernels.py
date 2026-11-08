@@ -30,6 +30,13 @@ def main() -> int:
                f"#define BOOKS {books}\n#define THREADS 256\n#define ACC16 0\n#define TILE {tile}\n#define XS {xs}\n") + br._COMMON + br._SRC_RUNS
         cp.RawModule(code=src, options=opts + ("--use_fast_math",)).compile()
         n += 1
+    for bits, (nfull, jt) in itertools.product((8, 10, 12), ((2, 4), (0, 4), (2, 0))):
+        src = f"#define BITS {bits}
+#define NFULL {nfull}
+#define JT {jt}
+" + br._SRC_DEQ_TILE
+        cp.RawModule(code=src, options=opts).compile()
+        n += 1
     print(f"compiled {n} variants")
     return 0
 

@@ -117,3 +117,17 @@ def test_runs_xs_matches_batch1(R, C, bits, G, layout):
             Y = torch.full((B, R), float("nan"), dtype=torch.float16, device="cuda")
             lb.run(X[:B].contiguous(), Y)
             assert _close(Y, ref[:B]) < 2e-3, (layout, split, B)
+
+
+@pytest.mark.parametrize("R,C", [(512, 3584), (300, 2048), (128, 256), (1040, 5120)])
+@pytest.mark.parametrize("bits,G", [(8, 4), (10, 1), (12, 4)])
+def test_dequant_tile_matches_lane_dequant(R, C, bits, G):
+    """The tile-layout dequant (compact mode) is bit-identical to the lane-major one."""
+    from shapequant.kernels import cuda_dequant
+    lin, tags = _lin(R, C, bits, G=G, M=1, seed=5)
+    rl = proto_runs.RunsLinear(lin, tags, 1)
+    ref = cuda_dequant.dequant(rl).clone().view(R, C)
+    lb = br.RunsBatch(rl, layout="tile", xs=True, bmax=64)
+    out = torch.full((R * C + 77,), float("nan"), dtype=torch.float16, device="cuda")
+    W = br.dequant_tile(lb, out)
+    assert W.shape == (R, C) and torch.equal(W, ref)

@@ -774,6 +774,99 @@ class Q8Batch:
         return Y
 
 
+_SRC_DEQ_TILE = r"""
+#include <cuda_fp16.h>
+typedef unsigned int u32;
+#define NWB (BITS / 2)
+#define NWT ((JT * 2 * BITS + 31) / 32)
+#define NCH ((NFULL * 8 + JT) * 64)
+#define NUNITS (NFULL * 8 + (JT > 0 ? 8 : 0))
+#define TWORDS (2 * 32 * (NFULL * 8 * NWB + (JT > 0 ? 8 * NWT : 0)))
+__device__ __forceinline__ u32 scale2(u32 t, float s) {
+    const float2 a = __half22float2(*(const __half2*)&t);
+    __half2 o = __floats2half2_rn(a.x * s, a.y * s);
+    return *(u32*)&o;
+}
+// one unit of a tile (as gemv_runs_b's unit_t): NT tags for rows g (a) and g + 8 (b); tag j -> chunk
+// cbase + (j >> 1) * 64 + (j & 1), i.e. columns 4c..4c+3 = the unscaled codeword times the row scale
+template <int NT, int NWD>
+__device__ __forceinline__ void deq_unit(const u32* __restrict__ base, int cbase, const uint2* __restrict__ tab,
+                                         uint2* o0, uint2* o1, float s0, float s1)
+{
+    u32 a[NWD + 1], b[NWD + 1];
+    #pragma unroll
+    for (int i = 0; i < NWD; ++i) { a[i] = __ldg(base + i * 32); b[i] = __ldg(base + (NWD + i) * 32); }
+    a[NWD] = 0u; b[NWD] = 0u;
+    const u32 MASK = (1u << BITS) - 1u;
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        const int bit = j * BITS, wi = bit >> 5, sh = bit & 31;
+        const u32 va = ((sh + BITS <= 32) ? (a[wi] >> sh) : __funnelshift_r(a[wi], a[wi + 1], sh)) & MASK;
+        const u32 vb = ((sh + BITS <= 32) ? (b[wi] >> sh) : __funnelshift_r(b[wi], b[wi + 1], sh)) & MASK;
+        const int c = cbase + (j >> 1) * 64 + (j & 1);
+        if (o0) { const uint2 t = __ldg(tab + va); o0[c] = make_uint2(scale2(t.x, s0), scale2(t.y, s0)); }
+        if (o1) { const uint2 t = __ldg(tab + vb); o1[c] = make_uint2(scale2(t.x, s1), scale2(t.y, s1)); }
+    }
+}
+// one warp per 16-row tile of the TILE layout (tile_words): dense fp16 rows into out [R, NCH] (uint2 =
+// 4 columns), rows >= 0 only; same numerics as cuda_dequant: half(float(codeword) * float(row_scale))
+extern "C" __global__ void __launch_bounds__(256)
+dequant_runs_tile(const u32* __restrict__ words, const uint2* __restrict__ table_raw,
+                  const __half* __restrict__ row_scale, const int* __restrict__ tile_off,
+                  const int* __restrict__ tiles, int ntiles, uint2* __restrict__ out)
+{
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int tile = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (tile >= ntiles || tiles[tile * 16] < 0) return;
+    const int r0 = tiles[tile * 16 + g], r1 = tiles[tile * 16 + g + 8];
+    const uint2* tab = table_raw + tile_off[tile];
+    const u32* wtl = words + (size_t)tile * TWORDS + lane;
+    uint2* o0 = r0 >= 0 ? out + (size_t)r0 * NCH : nullptr;
+    uint2* o1 = r1 >= 0 ? out + (size_t)r1 * NCH : nullptr;
+    const float s0 = r0 >= 0 ? __half2float(row_scale[r0]) : 0.f, s1 = r1 >= 0 ? __half2float(row_scale[r1]) : 0.f;
+    #pragma unroll 1
+    for (int u = 0; u < NFULL * 8; ++u) {
+        const int bb = u >> 3, L = 4 * (u & 7) + t;
+        deq_unit<16, NWB>(wtl + u * 2 * NWB * 32, 2 * (bb * 256 + L), tab, o0, o1, s0, s1);
+    }
+#if JT > 0
+    #pragma unroll 1
+    for (int u = 0; u < 8; ++u) {
+        const int L = 4 * u + t;
+        deq_unit<JT * 2, NWT>(wtl + (NFULL * 8 * 2 * NWB + u * 2 * NWT) * 32, 2 * (NFULL * 256 + L), tab, o0, o1, s0, s1);
+    }
+#endif
+}
+"""
+
+
+def dequant_tile(lb: "RunsBatch", out: torch.Tensor | None = None) -> torch.Tensor:
+    """Dense fp16 [R, C] of a matrix from its TILE-layout words (lb: a RunsBatch with layout="tile"),
+    so the lane-major words can be dropped (PackedShards compact mode). out: fp16 with >= R*C
+    elements (a shared scratch); its first R*C are returned as [R, C]."""
+    import cupy as cp
+    from .proto_runs import geometry
+    assert lb.layout == "tile"
+    rl = lb.rl
+    nfull, jt = geometry(rl.nch)
+    R, C = rl.R, rl.nch * 4
+    if out is None:
+        out = torch.empty(R * C, dtype=torch.float16, device=lb.wt.device)
+    if (R * C) > out.numel() or out.dtype != torch.float16:
+        raise ValueError("dequant_tile: output buffer too small / not fp16")
+    key = ("deq_tile", rl.bits, nfull, jt)
+    if key not in _mods:
+        src = f"#define BITS {rl.bits}\n#define NFULL {nfull}\n#define JT {jt}\n" + _SRC_DEQ_TILE
+        _mods[key] = cp.RawModule(code=src, options=("-std=c++17",)).get_function("dequant_runs_tile")
+    nt = lb.tiles.numel() // 16
+    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+        _mods[key](((nt + 7) // 8,), (256,),
+                   (cp.uint64(lb.wt.data_ptr()), cp.uint64(rl.table_raw.data_ptr()), cp.uint64(rl.row_scale.data_ptr()),
+                    cp.uint64(lb.tile_off.data_ptr()), cp.uint64(lb.tiles.data_ptr()), cp.int32(nt),
+                    cp.uint64(out.data_ptr())))
+    return out[:R * C].view(R, C)
+
+
 def runs_key(rl) -> tuple:
     """Launch-relevant shape of a RunsLinear: (R, C, bits, table rows)."""
     return (rl.R, rl.nch * 4, rl.bits, rl.table.shape[0])

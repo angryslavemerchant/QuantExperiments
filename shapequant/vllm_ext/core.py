@@ -111,7 +111,15 @@ class _Scratch:
 
 class PackedShards:
     def __init__(self, rls: list, *, bmax: int = BMAX, layout: str = "tile", warps: int = 8, bps: int = 2, xs: bool = False,
-                 max_split: int = 8, large: str = "dequant", chunk_bytes: int = 24 << 20, dequant_from: int = 384):
+                 max_split: int = 8, large: str = "dequant", chunk_bytes: int = 24 << 20, dequant_from: int = 384,
+                 compact: bool = False):
+        # compact: keep only the TILE-layout words (layout="tile"): the lane-major words are freed
+        # (~half the weight memory: 27B 19.8 -> ~11 GB), so the fused GEMM / lane dequant are not
+        # available: M <= cross runs the batched kernel, larger M dequantizes from the tile words
+        # (batched_runs.dequant_tile) into the shared scratch + one GEMM per piece.
+        if compact and layout != "tile":
+            raise ValueError("compact needs layout='tile'")
+        self.compact = compact
         # large-M path: "dequant" (whole matrix to scratch + GEMM), "chunked" (L2-sized row chunks,
         # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
         assert large in ("dequant", "chunked", "fused"), large
@@ -136,12 +144,15 @@ class PackedShards:
         self.dequant_from = dequant_from   # large == "fused": M >= this uses dequant + GEMM instead
         self.launchers = [br.RunsBatch(rl, bmax=bmax, warps=warps, bps=bps, max_split=max_split, layout=layout, xs=xs)
                           for rl in rls]
+        if compact:
+            for rl in rls:
+                rl.words = rl.words.new_empty(0)       # every compact path reads the tile copy
         # the batched kernel writes Y [B, R_piece] contiguous: one buffer per piece, then a copy
         # into the stacked output (skipped for a single piece)
         self.device = rls[0].words.device
 
     def key(self) -> tuple:
-        return (tuple(self.Rs), self.C, tuple(rl.bits for rl in self.rls), self.large, self.bmax)
+        return (tuple(self.Rs), self.C, tuple(rl.bits for rl in self.rls), self.large, self.bmax, self.compact)
 
     @torch.no_grad()
     def tune(self, Ms=(8, 16, 24, 32, 48, 64, 96, 128), reps: int = 5) -> int:
@@ -183,6 +194,9 @@ class PackedShards:
     def dense(self) -> torch.Tensor:
         """fp16 [R, C] (testing)."""
         from ..kernels import cuda_dequant
+        if self.compact:
+            from ..kernels import batched_runs as br
+            return torch.cat([br.dequant_tile(lb).clone() for lb in self.launchers])
         return torch.cat([cuda_dequant.dequant(rl).clone() for rl in self.rls])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -212,6 +226,8 @@ class PackedShards:
         return torch.cat(parts, 1)
 
     def _large(self, x16: torch.Tensor) -> torch.Tensor:
+        if self.compact:
+            return self._large_compact(x16)
         if self.large == "chunked":
             return self._large_chunked(x16)
         if self.large == "fused" and x16.shape[0] < self.dequant_from:
@@ -227,6 +243,16 @@ class PackedShards:
         for rl, off, R in zip(self.rls, self.offs, self.Rs):
             w = cuda_dequant.dequant(rl, scratch).view(R, self.C)
             y[:, off:off + R] = x16 @ w.t()       # the GEMM finishes before the scratch is reused (one stream)
+        return y
+
+    def _large_compact(self, x16: torch.Tensor) -> torch.Tensor:
+        from ..kernels import batched_runs as br
+        scratch = _Scratch.get(max(self.Rs) * self.C, x16.device)
+        if len(self.rls) == 1:
+            return x16 @ br.dequant_tile(self.launchers[0], scratch).t()
+        y = torch.empty(x16.shape[0], self.R, dtype=torch.float16, device=x16.device)
+        for lb, off, R in zip(self.launchers, self.offs, self.Rs):
+            y[:, off:off + R] = x16 @ br.dequant_tile(lb, scratch).t()
         return y
 
     def _large_chunked(self, x16: torch.Tensor) -> torch.Tensor:

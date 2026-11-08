@@ -219,3 +219,28 @@ def test_embed_op_compiles_on_gpu():
     ids = torch.tensor([3, 99, 0], device="cuda")
     f = torch.compile(lambda i: torch.ops.shapequant.embed(i, h) * 2, fullgraph=True)
     assert torch.equal(f(ids), torch.ops.shapequant.embed(ids, h) * 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("M", [1, 16, 64, 65, 300])
+def test_compact_forward_matches_dense(M):
+    """compact: lane words freed, batched kernel to cross, tile dequant + GEMM above."""
+    pytest.importorskip("cupy")
+    from shapequant.kernels import proto_runs
+    from test_proto_runs import _lin
+    rls = []
+    for i, R in enumerate((768, 256)):
+        lin, tags = _lin(R, 2048, 10, G=4, M=1, seed=11 + i)
+        rls.append(proto_runs.RunsLinear(lin, tags, 1))
+    ref_ps = core.PackedShards(rls, bmax=64, layout="tile", xs=True)
+    W = ref_ps.dense().float()
+    ps = core.PackedShards(rls, bmax=64, layout="tile", xs=True, compact=True)
+    assert all(rl.words.numel() == 0 for rl in rls)
+    x = (torch.randn(M, 2048, device="cuda") * 0.5).to(torch.bfloat16)
+    y = ps.forward(x).float()
+    ref = x.float() @ W.t()
+    assert y.shape == (M, 1024)
+    assert float((y - ref).abs().max() / ref.abs().max()) < 1e-2
+    assert torch.equal(ps.dense().float(), W)
+    with pytest.raises(ValueError):
+        core.PackedShards(rls, layout="lane", compact=True)

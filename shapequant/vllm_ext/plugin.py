@@ -50,7 +50,7 @@ def _resolve(file: str) -> str:
 class ShapeQuantConfig(QuantizationConfig):
     def __init__(self, packed_file: str, bmax: int = core.BMAX, layout: str = "tile", large: str = "dequant",
                  chunk_mb: int = 24, xs: bool = False, warps: int = 8, tune: bool = False,
-                 embed_head: str = "bf16"):
+                 embed_head: str = "bf16", compact: str | bool = "auto"):
         super().__init__()
         self.packed_file, self.bmax = packed_file, bmax
         # "tile": the batched kernel reads a repacked copy of every matrix's words (faster warp loads,
@@ -71,13 +71,20 @@ class ShapeQuantConfig(QuantizationConfig):
         if embed_head not in ("bf16", "packed"):
             raise ValueError(f"embed_head {embed_head!r}: bf16 | packed")
         self.embed_head = embed_head
+        # compact: drop the lane-major words, keep the tile copy only (half the weight memory; no
+        # fused GEMM). "auto": on GPUs under 40 GB. SHAPEQUANT_COMPACT=0/1 overrides.
+        # decided lazily (in the engine process, at the first layer): the config is also built in
+        # vLLM's front-end process, which must not initialize CUDA
+        self._compact_req = os.environ.get("SHAPEQUANT_COMPACT", str(compact)).lower()
+        self._compact = None
         self._pf = None
         if embed_head == "packed":
             _patch_qwen35_embedding()
 
     def __repr__(self) -> str:
         return (f"ShapeQuantConfig(packed_file={self.packed_file!r}, bmax={self.bmax}, large={self.large!r}, "
-                f"chunk_mb={self.chunk_mb}, xs={self.xs}, warps={self.warps})")
+                f"chunk_mb={self.chunk_mb}, xs={self.xs}, warps={self.warps}, layout={self.layout!r}, "
+                f"compact={self._compact_req}, embed_head={self.embed_head!r})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -101,7 +108,16 @@ class ShapeQuantConfig(QuantizationConfig):
                    layout=config.get("layout", "tile"), large=config.get("large", "dequant"),
                    chunk_mb=int(config.get("chunk_mb", 24)), xs=bool(config.get("xs", False)),
                    warps=int(config.get("warps", 8)), tune=bool(config.get("tune", False)),
-                   embed_head=config.get("embed_head", "bf16"))
+                   embed_head=config.get("embed_head", "bf16"), compact=config.get("compact", "auto"))
+
+    @property
+    def compact(self) -> bool:
+        if self._compact is None:
+            c = self._compact_req
+            self._compact = c in ("1", "true") or (
+                c == "auto" and self.layout == "tile"
+                and torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory < 40e9)
+        return self._compact
 
     @property
     def pf(self):
@@ -136,7 +152,7 @@ class ShapeQuantLinearMethod(LinearMethodBase):
         ps = core.PackedShards.from_packed(self.cfg.pf, self.pieces, dev=dev, bmax=self.cfg.bmax,
                                            layout=self.cfg.layout, large=self.cfg.large,
                                            chunk_bytes=self.cfg.chunk_mb << 20, xs=self.cfg.xs,
-                                           warps=self.cfg.warps)
+                                           warps=self.cfg.warps, compact=self.cfg.compact)
         if ps.C != input_size or ps.R != output_size:
             raise ValueError(f"{self.prefix}: packed pieces are [{ps.R}, {ps.C}], vLLM layer is "
                              f"[{output_size}, {input_size}] (partitions {output_partition_sizes})")
