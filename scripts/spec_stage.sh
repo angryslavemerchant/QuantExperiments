@@ -3,21 +3,25 @@
 # drafter, and Qwen3.8's own MTP head; decode tok/s at conc 1 / 4 and acceptance (spec_bench.py),
 # plus a 7x8 sanity answer per config.
 #   bash scripts/spec_stage.sh <out_dir>
-# Env: CONFIGS ("base dspark mtp"), DSPARK_K (7), MTP_K (3), MAX_LEN (16384).
+# Env: CONFIGS ("base dspark mtp"), DSPARK_K (7), MTP_K (3), MAX_LEN (16384); for a local box: VENV, CK, CKM
+# (checkpoint dirs), PACKED_LOCAL (export from a local packed file), ALLOC_CONF ("" on WSL2: expandable
+# segments make the plugin's shape tuning crawl there).
 set -uo pipefail
 OUT=$1
 PY=${PYTHON:-$(command -v python3 || command -v python)}
-VENV=/workspace/vllm_env; VPY=$VENV/bin/python
+VENV=${VENV:-/workspace/vllm_env}; VPY=$VENV/bin/python
 PACKED=${PACKED:-luckymushy/Qwen3.8-27B-shapequant-2.5bpw:s16_25_ft.safetensors}
 CONFIGS=${CONFIGS:-"base dspark mtp"}
 DSPARK_K=${DSPARK_K:-7}; MTP_K=${MTP_K:-3}; MAX_LEN=${MAX_LEN:-16384}
 mkdir -p "$OUT"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
-CK=/workspace/vllm_ckpt/q27.sq
-[ -e "$CK/config.json" ] || $PY scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$CK" > "$OUT/export.log" 2>&1
-CKM=/workspace/vllm_ckpt/q27.sq.mtp      # bf16 embedding / head (shareable with drafters) + the MTP head
+SRC=(--packed-hf "$PACKED"); [ -n "${PACKED_LOCAL:-}" ] && SRC=(--packed "$PACKED_LOCAL")
+ALLOC_CONF=${ALLOC_CONF-expandable_segments:True}
+CK=${CK:-/workspace/vllm_ckpt/q27.sq}
+[ -e "$CK/config.json" ] || $PY scripts/export_vllm_checkpoint.py "${SRC[@]}" --out "$CK" > "$OUT/export.log" 2>&1
+CKM=${CKM:-/workspace/vllm_ckpt/q27.sq.mtp}     # bf16 embedding / head (shareable with drafters) + the MTP head
 if [[ " $CONFIGS " == *" mtp "* || " $CONFIGS " == *" dspark_bf16 "* ]] && [ ! -e "$CKM/mtp.safetensors" ]; then
-  $PY scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$CKM" --embed-head bf16 --mtp > "$OUT/export_mtp.log" 2>&1 \
+  $PY scripts/export_vllm_checkpoint.py "${SRC[@]}" --out "$CKM" --embed-head bf16 --mtp > "$OUT/export_mtp.log" 2>&1 \
     || { log "MTP export failed"; tail -5 "$OUT/export_mtp.log"; }
 fi
 stop() {         # kill every vLLM process and wait until the GPU is actually free (s40c s3: a slow DSpark
@@ -38,7 +42,7 @@ for cfg in $CONFIGS; do
     *) log "unknown config $cfg"; continue ;;
   esac
   log "server: $cfg"
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup "$VENV/bin/vllm" serve "$ck" --served-model-name ours \
+  env ${ALLOC_CONF:+PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF} nohup "$VENV/bin/vllm" serve "$ck" --served-model-name ours \
     --host 127.0.0.1 --port 8000 --dtype bfloat16 --max-model-len $MAX_LEN --max-num-seqs 8 --gpu-memory-utilization 0.93 \
     --max-num-batched-tokens 4096 --seed 0 ${spec:+--speculative-config "$spec"} > "$OUT/server_$cfg.log" 2>&1 &
   pid=$!; up=0
