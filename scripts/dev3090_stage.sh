@@ -51,9 +51,14 @@ if has standalone; then
      > "$OUT/standalone_batched.log" 2>&1 || log "standalone failed"
   grep -iE "B=|tok/s" "$OUT/standalone_batched.log" | tail -12
 fi
+if has diag; then
+  log "plugin component check (real file)"
+  "$VPY" scripts/diag_vllm_paths.py --packed "$PK" --out "$OUT/diag.json" > "$OUT/diag.log" 2>&1 || log "diag failed"
+  tail -40 "$OUT/diag.log"
+fi
 if has vllm; then
-  CK=/workspace/vllm_ckpt/q27.sq
-  [ -e "$CK/config.json" ] || $PY scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$CK" > "$OUT/export.log" 2>&1
+  CK=${CKPT:-/workspace/vllm_ckpt/q27.sq}
+  [ -e "$CK/config.json" ] || $PY scripts/export_vllm_checkpoint.py --packed-hf "$PACKED" --out "$CK" ${EXPORT_ARGS:-} > "$OUT/export.log" 2>&1
   for cfg in ${VLLM_CONFIGS:-fused:1:64}; do
     IFS=: read -r large xs bmax <<< "$cfg"
     tag="${large}_xs${xs}_b${bmax}"
