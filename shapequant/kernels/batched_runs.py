@@ -107,6 +107,11 @@ _SRC_RUNS = r"""
 #ifndef XS
 #define XS 0
 #endif
+#ifndef NACC
+#define NACC 1
+#endif
+// NACC: independent accumulator sets per batch group, tag j feeding set j % NACC (at small B a
+// single set chains every mma of a unit back to back: latency-bound); summed before the epilogue.
 // XS: the block stages each column unit's X slice in shared memory once (all warps step through
 // the same units): xs[n][q], n < NB8*8 batch rows, q = 8m + 2t + e the unit's 64 chunks (code j of
 // slot t: m = j >> 1, e = j & 1), XOR-swizzled by the row so a warp's 8-byte reads (rows g, slots
@@ -132,7 +137,7 @@ __device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, con
         for (int nb = 0; nb < NB8; ++nb) {
             const int n = nb * 8 + g;
             const uint2 xv = xs[n * 64 + (q ^ xs_swz(n))];
-            mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
+            mma_code(acc[nb * NACC + (j % NACC)], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
         }
 #else
         const int c = cbase + (j >> 1) * 64 + (j & 1);
@@ -140,7 +145,7 @@ __device__ __forceinline__ void codes(const u32* a, const u32* b, int cbase, con
         for (int nb = 0; nb < NB8; ++nb) {
             const int n = nb * 8 + g;
             const uint2 xv = n < B ? xload(__ldg(X + (size_t)n * NCH + c)) : make_uint2(0u, 0u);
-            mma_code(acc[nb], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
+            mma_code(acc[nb * NACC + (j % NACC)], ta.x, tb.x, ta.y, tb.y, xv.x, xv.y);
         }
 #endif
     }
@@ -271,9 +276,9 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
         const u32* wb0 = r0 >= 0 ? words + (size_t)r0 * WROW : nullptr;
         const u32* wb1 = r1 >= 0 ? words + (size_t)r1 * WROW : nullptr;
 #endif
-        float acc[NB8][4];
+        float acc[NB8 * NACC][4];
         #pragma unroll
-        for (int nb = 0; nb < NB8; ++nb) { acc[nb][0] = acc[nb][1] = acc[nb][2] = acc[nb][3] = 0.f; }
+        for (int nb = 0; nb < NB8 * NACC; ++nb) { acc[nb][0] = acc[nb][1] = acc[nb][2] = acc[nb][3] = 0.f; }
         const int u0 = sl * NUNITS / S, u1 = (sl + 1) * NUNITS / S;
         #pragma unroll 1
         for (int u = u0; u < u1; ++u) {
@@ -308,6 +313,18 @@ gemv_runs_b(const u32* __restrict__ words, const uint2* __restrict__ table, cons
 #endif
         }
         if (!active) continue;
+#if NACC > 1
+        #pragma unroll
+        for (int nb = 0; nb < NB8; ++nb) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                float v = acc[nb * NACC][e];
+                #pragma unroll
+                for (int k = 1; k < NACC; ++k) v += acc[nb * NACC + k][e];
+                acc[nb][e] = v;                  // nb <= nb * NACC: in-place compaction is safe
+            }
+        }
+#endif
         if (S > 1) {
             #pragma unroll
             for (int nb = 0; nb < NB8; ++nb) {
@@ -566,16 +583,26 @@ def _nb8(B: int) -> int:
     return (B + 7) // 8
 
 
+def _nacc(nb8: int) -> int:
+    """Accumulator sets for gemv_runs_b (NACC): more independent mma chains at small batch."""
+    import os
+    env = os.environ.get("SQ_NACC")
+    if env:
+        return int(env)
+    return {1: 4, 2: 2}.get(nb8, 1)
+
+
 def _runs_fn(bits, nch, nb8, smem, books, threads, acc16=False, tile=False, xs=False, xbf=False, ybf=False):
     import cupy as cp
     from .proto_runs import geometry
     nfull, jt = geometry(nch)
-    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile, xs, xbf, ybf)
+    nacc = _nacc(nb8)
+    key = ("runs", bits, nfull, jt, nb8, smem, books, threads, acc16, tile, xs, xbf, ybf, nacc)
     if key not in _mods:
         src = (f"#define BITS {bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define NB8 {nb8}\n"
                f"#define SMEM {int(smem)}\n#define BOOKS {int(books)}\n#define THREADS {threads}\n"
                f"#define ACC16 {int(acc16)}\n#define TILE {int(tile)}\n#define XS {int(xs)}\n"
-               f"#define XBF16 {int(xbf)}\n#define YBF16 {int(ybf)}\n") + _COMMON + _SRC_RUNS
+               f"#define XBF16 {int(xbf)}\n#define YBF16 {int(ybf)}\n#define NACC {nacc}\n") + _COMMON + _SRC_RUNS
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17", "--use_fast_math")).get_function("gemv_runs_b")
     return _mods[key]
 
@@ -783,15 +810,7 @@ class Q8Batch:
                  acc16: bool = False):
         assert C % 64 == 0, "Q8Batch needs C % 64 == 0"
         self.R, self.C, self.bps, self.ku, self.acc16 = R, C, bps, ku, acc16
-        T, NSB = (R + 15) // 16, C // 64
-        qp = torch.zeros(T * 16, C, dtype=torch.int8, device=q.device)
-        qp[:R] = q
-        # [tile, h, g, sb, t, 16 bytes] -> [tile, sb, h, g, t, 16]
-        self.qt = qp.view(T, 2, 8, NSB, 4, 16).permute(0, 3, 1, 2, 4, 5).contiguous()
-        sp = torch.zeros(T * 16, C // 32, dtype=torch.float16, device=q.device)
-        sp[:R] = scales
-        self.st = sp.view(T, 16, C // 32).transpose(1, 2).contiguous()          # [tile, block, row]
-        del qp, sp
+        self.qt, self.st = q8_tile_layout(q, scales)
 
     @classmethod
     def from_lin(cls, lin, **kw):
@@ -801,15 +820,45 @@ class Q8Batch:
         return self.qt.numel() + self.st.numel() * 2
 
     def run(self, X: torch.Tensor, Y: torch.Tensor, B: int | None = None) -> torch.Tensor:
-        import cupy as cp
-        B = X.shape[0] if B is None else B
-        assert X.is_contiguous() and X.dtype == torch.float16
-        fn = _q8_fn(_nb8(B), self.ku, "tile", self.acc16)
-        grid = min(_sms(X.device) * self.bps, (self.R + 127) // 128)
-        with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-            fn((grid,), (256,), (cp.uint64(self.qt.data_ptr()), cp.uint64(self.st.data_ptr()), cp.uint64(X.data_ptr()),
-                                 cp.uint64(Y.data_ptr()), cp.int32(self.R), cp.int32(self.C // 64), cp.int32(B)))
-        return Y
+        return gemv_q8_tile(self.qt, self.st, X, Y, self.R, self.C, B, self.bps, self.ku, self.acc16)
+
+
+def q8_tile_layout(q: torch.Tensor, scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The tile-major copy of a Q8_0-like head (int8 q [R, C], fp16 scales [R, C/32]; C % 64 == 0):
+    qt int8 [T, C/64, 2, 8, 4, 16] (16-row tiles, each 64-column superblock's 1 KB in thread order;
+    rows padded to T * 16 with zeros) and st fp16 [T, C/32, 16] (per tile and block, the 16 rows'
+    scales). gemv_q8_tile reads it at ~95% of DRAM bandwidth (the natural layout: ~40%)."""
+    R, C = q.shape
+    assert C % 64 == 0 and scales.shape == (R, C // 32)
+    T, NSB = (R + 15) // 16, C // 64
+    if R % 16:
+        q = torch.cat([q, q.new_zeros(T * 16 - R, C)])
+        scales = torch.cat([scales, scales.new_zeros(T * 16 - R, C // 32)])
+    # [tile, h, g, sb, t, 16 bytes] -> [tile, sb, h, g, t, 16]
+    qt = q.view(T, 2, 8, NSB, 4, 16).permute(0, 3, 1, 2, 4, 5).contiguous()
+    st = scales.view(T, 16, C // 32).transpose(1, 2).contiguous()          # [tile, block, row]
+    return qt, st
+
+
+def q8_tile_rows(qt: torch.Tensor, st: torch.Tensor, t0: int, t1: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Natural-layout int8 [(t1 - t0) * 16, C] and scales [(t1 - t0) * 16, C/32] of tiles t0..t1-1."""
+    T, NSB = qt.shape[0], qt.shape[1]
+    q = qt[t0:t1].permute(0, 2, 3, 1, 4, 5).reshape((t1 - t0) * 16, NSB * 64)
+    return q, st[t0:t1].transpose(1, 2).reshape((t1 - t0) * 16, NSB * 2)
+
+
+def gemv_q8_tile(qt: torch.Tensor, st: torch.Tensor, X: torch.Tensor, Y: torch.Tensor, R: int, C: int,
+                 B: int | None = None, bps: int = 16, ku: int = 4, acc16: bool = False) -> torch.Tensor:
+    """Y[B, R] (row stride R) = X[B, C] . W^T from q8_tile_layout's (qt, st); rows >= R not written."""
+    import cupy as cp
+    B = X.shape[0] if B is None else B
+    assert X.is_contiguous() and X.dtype == torch.float16
+    fn = _q8_fn(_nb8(B), ku, "tile", acc16)
+    grid = min(_sms(X.device) * bps, (R + 127) // 128)
+    with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
+        fn((grid,), (256,), (cp.uint64(qt.data_ptr()), cp.uint64(st.data_ptr()), cp.uint64(X.data_ptr()),
+                             cp.uint64(Y.data_ptr()), cp.int32(R), cp.int32(C // 64), cp.int32(B)))
+    return Y
 
 
 _SRC_DEQ_TILE = r"""

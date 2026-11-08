@@ -163,10 +163,11 @@ def test_q4_embed_matches_reference_rows():
     assert torch.equal(out, ref)
 
 
-def test_q8_head_chunked_path_cpu():
+@pytest.mark.parametrize("tiled", [True, False])
+def test_q8_head_chunked_path_cpu(tiled):
     from shapequant.packed import q8_rows
     q, sc = _q8_parts()
-    head = core.Q8Head(q, sc, R=320, small_max=0, chunk_rows=64)   # padded vocab, every M on the chunked path
+    head = core.Q8Head(q, sc, R=320, small_max=0, chunk_rows=64, tiled=tiled)   # padded vocab, every M on the chunked path
     x = torch.randn(5, 128) * 0.1
     y = head.forward(x)
     assert y.shape == (5, 320) and y.dtype == x.dtype
@@ -179,12 +180,13 @@ def test_q8_head_chunked_path_cpu():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("tiled", [True, False])
 @pytest.mark.parametrize("M", [1, 7, 32, 33, 80])
-def test_q8_head_gpu_matches_dense(M):
+def test_q8_head_gpu_matches_dense(M, tiled):
     pytest.importorskip("cupy")
     from shapequant.packed import q8_rows
     q, sc = _q8_parts(V=1000, C=256)
-    head = core.Q8Head(q.cuda(), sc.cuda(), chunk_rows=384)
+    head = core.Q8Head(q.cuda(), sc.cuda(), chunk_rows=384, tiled=tiled)
     x = (torch.randn(M, 256) * 0.1).to(torch.bfloat16).cuda()
     y = torch.ops.shapequant.linear(x, core.register(head))
     ref = x.float() @ q8_rows(q, sc).cuda().t()

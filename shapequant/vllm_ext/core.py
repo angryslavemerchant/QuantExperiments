@@ -328,26 +328,38 @@ class PackedShards:
 
 class Q8Head:
     """The packed file's 8-bit block-32 lm_head (aux.lm_head: q int8 [V, C], scale fp16 [V, C/32])
-    as Y [M, R] = X [M, C] . W^T, R >= V (vLLM pads the vocab; padded logits are 0):
+    as Y [M, R] = X [M, C] . W^T, R >= V (vLLM pads the vocab; padded logits are 0).
 
-      M <= small_max: kernels.batched_runs.gemv_q8_batched on the natural layout (1.35 GB read for
-          27B's 248k x 5120 head vs 2.5 GB bf16);
+    C % 64 == 0 (27B: 248k x 5120): the weights are kept only in kernels.batched_runs' tile-major
+    layout (q8_tile_layout; same bytes), so the decode GEMV reads at ~95% of DRAM bandwidth
+    (3090: 1.53 ms per token vs 3.69 ms on the natural layout). Otherwise the natural layout.
+      M <= small_max: the batched q8 GEMV (1.35 GB read for 27B vs 2.5 GB bf16);
       M >  small_max: row chunks dequantized to fp16 into the shared scratch, then a GEMM each.
 
     Same forward / R interface as PackedShards, so it runs through the shapequant::linear op."""
 
     def __init__(self, q: torch.Tensor, sc: torch.Tensor, R: int | None = None, small_max: int = 32,
-                 chunk_rows: int = 8192):
-        self.q, self.sc = q, sc
+                 chunk_rows: int = 8192, tiled: bool | None = None):
         self.V, self.C = q.shape
         if self.C % 32 or sc.shape != (self.V, self.C // 32):
             raise ValueError(f"q8 head: q {tuple(q.shape)}, scale {tuple(sc.shape)}")
         self.R = self.V if R is None else R
         if self.R < self.V:
             raise ValueError(f"q8 head has {self.V} rows, layer wants {self.R}")
-        self.small_max, self.chunk_rows = small_max, chunk_rows
+        self.small_max = small_max
+        self.tiled = self.C % 64 == 0 if tiled is None else tiled
+        if self.tiled:
+            from ..kernels import batched_runs as br
+            self.qt, self.st = br.q8_tile_layout(q, sc)       # the caller's q / sc can be freed
+            self.q = self.sc = None
+            self.chunk_rows = max(16, chunk_rows // 16 * 16)
+        else:
+            self.q, self.sc = q, sc
+            self.chunk_rows = chunk_rows
 
     def nbytes(self) -> int:
+        if self.tiled:
+            return self.qt.numel() + self.st.numel() * 2
         return self.q.numel() + self.sc.numel() * 2
 
     def dense(self) -> torch.Tensor:
@@ -355,11 +367,20 @@ class Q8Head:
         return torch.cat([self._rows(s, min(self.V, s + self.chunk_rows)).clone()
                           for s in range(0, self.V, self.chunk_rows)])
 
+    def _parts(self, s: int, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.tiled:
+            return self.q[s:e], self.sc[s:e]
+        from ..kernels import batched_runs as br
+        assert s % 16 == 0
+        q, sc = br.q8_tile_rows(self.qt, self.st, s // 16, (e + 15) // 16)
+        return q[:e - s], sc[:e - s]
+
     def _rows(self, s: int, e: int, out: torch.Tensor | None = None) -> torch.Tensor:
         n = e - s
-        w = self.q[s:e].view(n, self.C // 32, 32).to(torch.float16)
+        q, sc = self._parts(s, e)
+        w = q.reshape(n, self.C // 32, 32).to(torch.float16)
         o = w if out is None else out[:n * self.C].view(n, self.C // 32, 32)
-        torch.mul(w, self.sc[s:e, :, None], out=o)
+        torch.mul(w, sc[:, :, None], out=o)
         return o.view(n, self.C)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -372,7 +393,10 @@ class Q8Head:
         if 0 < M <= self.small_max:
             from ..kernels import batched_runs as br
             yv = y if self.R == self.V else torch.empty(M, self.V, dtype=torch.float16, device=x16.device)
-            br.gemv_q8_batched(self.q, self.sc, x16, yv, self.V, self.C, M)
+            if self.tiled:
+                br.gemv_q8_tile(self.qt, self.st, x16, yv, self.V, self.C, M)
+            else:
+                br.gemv_q8_batched(self.q, self.sc, x16, yv, self.V, self.C, M)
             if yv is not y:
                 y[:, :self.V] = yv
         elif M > 0:
