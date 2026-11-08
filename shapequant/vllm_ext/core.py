@@ -127,6 +127,7 @@ class PackedShards:
         # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
         assert large in ("dequant", "chunked", "fused"), large
         self.large, self.chunk_bytes = large, chunk_bytes
+        self.layout = layout
         from ..kernels import batched_runs as br
         from ..kernels import cuda_dequant
         self.rls = rls

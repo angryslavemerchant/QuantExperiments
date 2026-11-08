@@ -144,5 +144,7 @@ def test_bf16_io_and_strided_output(xs):
     lb.run(X.half(), Y16)
     wide = torch.full((9, 700), 7.0, dtype=torch.bfloat16, device="cuda")
     lb.run(X, wide[:, 100:612])
-    assert torch.equal(wide[:, 100:612], Y16.to(torch.bfloat16))       # same fp32 sums, one rounding
+    # bf16 out = the fp32 sum rounded once (the fp16 path rounds twice): within one bf16 ulp of it
+    d = (wide[:, 100:612].float() - Y16.float()).abs()
+    assert float((d - Y16.float().abs() * 2 ** -8 - 1e-3).max()) <= 0
     assert torch.all(wide[:, :100] == 7.0) and torch.all(wide[:, 612:] == 7.0)
