@@ -39,7 +39,26 @@ def _shim_tokenizer_module() -> None:
     print("[lighteval_run] aliased vllm.transformers_utils.tokenizer.get_tokenizer", flush=True)
 
 
-def _patch() -> None:
+def _shim_hub_list_models() -> None:
+    """lighteval 0.13.0 builds its LLM-judge metrics at import and calls
+    HfApi.list_models(model_name=...), a keyword huggingface_hub 1.x/2.x removed (s37: every run
+    died at import). Map it to search=."""
+    from huggingface_hub import HfApi
+    import inspect
+    orig = HfApi.list_models
+    if "model_name" in inspect.signature(orig).parameters:
+        return
+
+    def list_models(self, *args, model_name=None, **kw):
+        if model_name is not None:
+            kw.setdefault("search", model_name)
+        return orig(self, *args, **kw)
+
+    HfApi.list_models = list_models
+    print("[lighteval_run] shimmed HfApi.list_models(model_name=)", flush=True)
+
+
+def _patch_vllm() -> None:
     _shim_tokenizer_module()
     import vllm
     from vllm.engine.arg_utils import EngineArgs
@@ -65,7 +84,9 @@ def _patch() -> None:
 
 
 def main() -> int:
-    _patch()
+    _shim_hub_list_models()
+    if len(sys.argv) > 1 and sys.argv[1] == "vllm":
+        _patch_vllm()
     from lighteval.__main__ import app
     sys.argv = ["lighteval"] + sys.argv[1:]
     app()
