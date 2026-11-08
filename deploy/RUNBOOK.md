@@ -68,6 +68,16 @@ Useful settings (environment variables for `serve.sh`):
 | `TOOL_PARSER` | off | Enables tool / function calling (see notes) |
 | `SPEC` | off | `dspark`: speculative decoding with RedHat's DSpark drafter (+4 GB download) |
 
+### Long context
+
+The model supports up to 262k tokens. Measured on the 3090 (`GPU_UTIL=0.94`, `MAX_SEQS=2`): with
+the default KV cache, `MAX_LEN=131072` fits (room for ~159k KV tokens); with `KV_DTYPE=fp8`,
+`MAX_LEN=262144` fits (~316k KV tokens). Retrieval accuracy at those lengths has not been measured yet.
+
+```bash
+KV_DTYPE=fp8 MAX_LEN=262144 MAX_SEQS=2 GPU_UTIL=0.94 bash deploy/serve.sh
+```
+
 ### Faster single requests: DSpark speculative decoding
 
 Measured on the 3090: 79 tok/s for one request instead of 38 (2.1x), 123 vs 102 tok/s total at 4
