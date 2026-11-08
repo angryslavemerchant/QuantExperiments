@@ -2,7 +2,7 @@
 # Wishlist stage on the 24 GB dev box: quality prompts + long-context retrieval (incl. >128k) and
 # KV-cache quantization, ours (vLLM serve + plugin) vs UD-Q4_K_M (llama-server), one server at a time.
 #   bash scripts/wishlist_stage.sh <out_dir>
-# Env: STEPS ("quality longctx kvquant"), LENGTHS, DEPTHS, OURS_MAX_LEN (131072), GGUF.
+# Env: STEPS ("quality longctx kvquant"), LENGTHS, DEPTHS, OURS_MAX_LEN (131072), GGUF, SKIP_LLAMA (0).
 set -uo pipefail
 OUT=$1
 PY=${PYTHON:-$(command -v python3 || command -v python)}
@@ -46,6 +46,7 @@ ours_up() {      # tag max_len kv_dtype [max_seqs]: on a KV-cache shortfall, ret
 }
 LSERVER=""; LLIBS=""
 llama_setup() {
+  [ "${SKIP_LLAMA:-0}" = 1 ] && return 1
   [ -n "$LSERVER" ] && return 0
   "$VPY" - > "$OUT/llama_setup.log" 2>&1 <<'PYEOF'
 import sys; sys.path.insert(0, "scripts")
