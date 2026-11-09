@@ -26,7 +26,9 @@ PORT=${PORT:-8000}
 MAX_LEN=${MAX_LEN:-32768}
 MAX_SEQS=${MAX_SEQS:-16}
 if [ -z "${GPU_UTIL:-}" ]; then
-  read -r free total < <(nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits | head -1 | tr -d ',')
+  # free / total as CUDA reports them (what vLLM sizes against): nvidia-smi inside WSL2 does not count
+  # the memory Windows programs hold, so it overstates what is free
+  read -r free total < <("$VENV/bin/python" -c 'import torch; f, t = torch.cuda.mem_get_info(); print(f >> 20, t >> 20)')
   GPU_UTIL=$(awk -v f="$free" -v t="$total" -v h="${HEADROOM_MB:-1536}"     'BEGIN { u = (f - h) / t; if (u > 0.95) u = 0.95; if (u < 0.5) u = 0.5; printf "%.3f", u }')
   echo "GPU_UTIL=$GPU_UTIL (${free} MiB free of ${total}, ${HEADROOM_MB:-1536} MiB headroom)"
 fi
