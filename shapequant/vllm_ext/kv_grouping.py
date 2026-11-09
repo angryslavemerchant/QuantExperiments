@@ -68,6 +68,40 @@ def _least_waste_groups(kp, kv_cache_spec: dict, vllm_config) -> list:
     return kp.create_kv_cache_group_specs(kv_cache_spec, grouped)
 
 
+def _divisor_block(orig):
+    """Wrap attention._largest_kernel_block_within so a sliding-window layer's block size divides
+    the primary block size (page_budget = per_token * primary block) when the backend only offers
+    fixed kernel blocks.
+
+    With fp8 KV on Ampere vLLM picks FlashInfer (fixed kernel blocks 16 / 32 / 64), the primary
+    (hybrid-aligned) block is 1840 tokens for Qwen3.8-27B, and vLLM takes the largest kernel block
+    that fits: 64. 1840 % 64 != 0, so unify_kv_cache_spec_page_size pads every 64-token drafter page
+    (131 kB) up to the shared 3.77 MB page: ~29x, ~4 GB of the KV pool at 16k context for the DSpark
+    drafter's 5 sliding-window layers. 16 divides 1840, and unify then scales the block to 1840
+    (no padding), as it does with FlashAttention (MultipleOf(16)) in bf16."""
+    from vllm.v1.attention.backend import MultipleOf
+
+    def pick(attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None):
+        b = orig(attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec)
+        try:
+            if page_budget % (b * per_token_bytes) == 0:
+                return b
+            sizes = attn_backend.get_supported_kernel_block_sizes(kv_cache_spec)
+            ints = [s for s in sizes if isinstance(s, int)]
+            if any(isinstance(s, MultipleOf) for s in sizes) or not ints:
+                return b
+            fit = [s for s in ints if page_budget % (s * per_token_bytes) == 0]
+            if fit:
+                logger.info("shapequant: sliding-window block %d instead of %d (divides the %d B page)",
+                            max(fit), b, page_budget)
+                return max(fit)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("shapequant: sliding-window block patch failed (%r)", e)
+        return b
+
+    return pick
+
+
 def install() -> bool:
     if os.environ.get("SHAPEQUANT_KV_GROUPING", "1") == "0":
         return False
@@ -75,6 +109,13 @@ def install() -> bool:
     if not vllm.__version__.startswith("0.33."):
         logger.warning("shapequant: KV grouping patch written for vLLM 0.33.x, not %s: skipped", vllm.__version__)
         return False
+    try:
+        from vllm.model_executor.layers.attention import attention as attn_mod
+        if not getattr(attn_mod, "_shapequant_swa_block", False) and hasattr(attn_mod, "_largest_kernel_block_within"):
+            attn_mod._largest_kernel_block_within = _divisor_block(attn_mod._largest_kernel_block_within)
+            attn_mod._shapequant_swa_block = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("shapequant: sliding-window block patch not installed (%r)", e)
     from vllm.v1.core import kv_cache_planning as kp
     if getattr(kp, "_shapequant_grouping", False):
         return True

@@ -59,3 +59,21 @@ def test_ties_prefer_fewer_groups():
     s = {f"a.{i}": _Spec("a", 10) for i in range(8)} | {f"b.{i}": _Spec("b", 10) for i in range(8)}
     groups = kv_grouping._least_waste_groups(_kp(), s, object())
     assert len(groups) == 2
+
+
+def test_swa_block_divides_primary_page_with_fixed_kernel_blocks():
+    """FlashInfer-like backend (fixed 16/32/64): 64 does not divide an 1840-token page, 16 does."""
+    from vllm.v1.attention.backend import MultipleOf
+    per_tok = 2048                                     # fp8: 2 x 4 heads x 256
+    page = 1840 * per_tok
+
+    def orig(backend, per_token_bytes, page_budget, fallback, spec=None):   # vLLM: largest that fits
+        return max(s for s in backend.get_supported_kernel_block_sizes(spec) if s * per_token_bytes <= page_budget)
+
+    fixed = types.SimpleNamespace(get_supported_kernel_block_sizes=lambda spec=None: [16, 32, 64])
+    pick = kv_grouping._divisor_block(orig)
+    assert pick(fixed, per_tok, page, 1840) == 16
+    assert pick(fixed, per_tok, 1856 * per_tok, 1856) == 64          # divides already: unchanged
+    flex = types.SimpleNamespace(get_supported_kernel_block_sizes=lambda spec=None: [MultipleOf(16)])
+    odd = kv_grouping._divisor_block(lambda *a, **k: 64)      # MultipleOf backends are left alone
+    assert odd(flex, per_tok, page, 1840) == 64
