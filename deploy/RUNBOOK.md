@@ -4,6 +4,26 @@ What you get: an OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models
 Qwen3.8-27B at 2.5 bpw through vLLM + the shapequant plugin. Thinking mode, 32k context per
 request, up to 16 requests at once by default, protected by an API key.
 
+**Single user on a 24 GB card (the work 3090), everything on** — images, DSpark speculative
+decoding, RecoverSSM, fp8 KV cache (measured 2026-11-09, WSL2):
+
+```bash
+MODEL_DIR=~/models/q27-sq-vl SPEC=dspark RSSM=1 KV_DTYPE=fp8 MAX_LEN=98304 MAX_SEQS=2 bash deploy/serve.sh
+python scripts/smoke_server.py --api-key "$SQ_API_KEY"      # in a second shell: 5 checks, "ALL OK"
+```
+
+| | |
+|---|---|
+| Weights in VRAM | 14.0 GiB: text model 9.85, DSpark drafter ~2.5, vision tower 0.92, FlashInfer workspace 0.75 |
+| KV cache | ~117k tokens (fp8) shared by the running requests; `MAX_LEN` up to ~98k for one request (without `SPEC`: ~231k) |
+| Decode, one request | ~122 tok/s on a short context; 90 at 8k, 68 at 32-64k, 61 at 90k already in the prompt (without `SPEC`: 48 / 47 / 44 / 42 / 40) |
+| Prompt processing | 8k in ~4 s, 32k in ~17 s, 64k in ~43 s, 90k in ~67 s (~2000 tok/s falling to ~1350; INT8 prefill GEMMs) |
+| Same card, llama.cpp Q4_K_M | prefill 1303 / 1184 / 1050 tok/s at 8k / 32k / 64k; decode 41 / 38 / 33 at 8k / 32k / 64k |
+| Checks | needle retrieval 15/15 at 8k-128k (fp8 KV), GSM8K 5-shot identical with/without INT8 prefill |
+
+Needs the patched RecoverSSM venv (`deploy/patches/make_recoverssm_venv.sh`, once) and the
+checkpoint with the vision tower (section 3, "Images").
+
 ## 0. Requirements
 
 - Linux, or Windows with **WSL2** (Ubuntu 22.04/24.04). vLLM does not run on native Windows.
@@ -61,8 +81,9 @@ The first start compiles the kernels and tunes each matrix shape: wait for
 
 Measured on an RTX 3090 (2026-11-08): wikitext NLL 2.113 (= the reference); ~50 tok/s decode for
 one request (llama.cpp on the same card: UD-IQ2_S 45, UD-Q4_K_M 41), ~220 tok/s total at 8
-requests, ~340 tok/s at 32; KV cache room for ~130k tokens in total with the defaults (shared by
-all running requests).
+requests, ~340 tok/s at 32. Prompts are processed at ~2000-2400 tok/s up to 32k tokens (INT8
+prefill GEMMs; llama.cpp Q4_K_M on the same card: ~1200-1300). The KV cache room (shared by all
+running requests) is logged at start as `GPU KV cache size: N tokens`.
 
 Keep it running after you log out: run it inside `tmux` (`tmux new -s sq`, start, then `Ctrl-b d`
 to detach; `tmux attach -t sq` to come back).
@@ -75,35 +96,52 @@ Useful settings (environment variables for `serve.sh`):
 | `PORT` | `8000` | Port |
 | `MAX_LEN` | `32768` | Max tokens per request (prompt + answer) |
 | `MAX_SEQS` | `16` | Max requests processed at once |
-| `GPU_UTIL` | `0.92` | Fraction of GPU memory vLLM may use (the rest of it becomes KV cache) |
+| `GPU_UTIL` | computed | Share of the *total* GPU memory vLLM may use (the rest of its share becomes KV cache). Default: (free VRAM at start − `HEADROOM_MB`) / total, so memory other programs hold is left alone |
+| `HEADROOM_MB` | `1536` | VRAM kept free beyond what is in use at start (vLLM needs ~0.2-0.4 GB more than it budgets) |
+| `CHUNK` | `8192` | Prefill chunk (`--max-num-batched-tokens`); 4096 frees ~0.3 GB for KV at ~10% slower prompts |
 | `KV_DTYPE` | `auto` | `fp8` halves KV-cache memory: longer contexts / more requests |
 | `TOOL_PARSER` | off | Enables tool / function calling (see notes) |
-| `SPEC` | off | `dspark`: speculative decoding with RedHat's DSpark drafter (+4 GB download) |
+| `SPEC` | off | `dspark`: speculative decoding with the DSpark drafter (FP8 build); `mtp`: Qwen's MTP head |
+| `RSSM` | off | `1`: RecoverSSM (with `SPEC`): much more KV room; needs the patched venv |
+| `MODEL_DIR` | `~/models/q27-sq` | Checkpoint; `~/models/q27-sq-vl` = the one with the vision tower |
 
 ### Long context
 
-The model supports up to 262k tokens. Measured on the 3090 (`GPU_UTIL=0.94`, `MAX_SEQS=2`): with
-the default KV cache, `MAX_LEN=131072` fits (room for ~159k KV tokens); with `KV_DTYPE=fp8`,
-`MAX_LEN=262144` fits (~316k KV tokens). Retrieval accuracy at those lengths has not been measured yet.
+The model supports up to 262k tokens. Without a drafter, fp8 KV fits `MAX_LEN=262144` (needle
+retrieval 49/49 up to 256k, measured 2026-11-08). With DSpark + RecoverSSM (text-only checkpoint,
+computed `GPU_UTIL`): ~142k fp8 KV tokens, `MAX_LEN=131072` fits, needles 15/15 at 8k / 64k / 128k,
+a 128k prompt takes ~110 s.
 
 ```bash
-KV_DTYPE=fp8 MAX_LEN=262144 MAX_SEQS=2 GPU_UTIL=0.94 bash deploy/serve.sh
+KV_DTYPE=fp8 MAX_LEN=262144 MAX_SEQS=1 bash deploy/serve.sh                       # longest, no drafter
+SPEC=dspark RSSM=1 KV_DTYPE=fp8 MAX_LEN=131072 MAX_SEQS=1 bash deploy/serve.sh    # fast decode + 128k
 ```
+
+The GPU-memory numbers above are what vLLM's own accounting allows. **On Windows/WSL2, going over
+the card's memory does not fail**: the driver moves part of it to system RAM and everything runs
+~5x slower (first request fast, later ones crawl). The computed `GPU_UTIL` avoids it; if you set
+`GPU_UTIL` by hand keep weights + KV + ~2 GB of Windows/desktop use under 24 GB, or set the NVIDIA
+Control Panel's "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" (then it is an
+out-of-memory error instead).
 
 ### Faster single requests: DSpark speculative decoding
 
-Measured on the 3090 (2026-11-08, WSL2, thinking-mode prompts, `scripts/spec_bench.py`): **115 tok/s
-for one request instead of 51 (2.3x)**, ~150-170 tok/s total at 4 requests (vs 146). The drafter
-takes ~4 GB of GPU memory, so the KV cache shrinks to ~27k tokens total. The draft length
-(`SPEC_K`, default 7) was swept: 6 and 7 tie, 5 / 8 / 10 are 10-25% slower.
+Measured on the 3090 (WSL2, thinking-mode prompts, `scripts/spec_bench.py`): **~105-125 tok/s
+for one request instead of 51**, ~205 tok/s total at 4 requests. The default drafter is the FP8
+build (`inference-optimization/Qwen3.8-27B-DSpark-FP8-DYNAMIC`, ~2.5 GB of VRAM; the bf16 original
+is slower and larger). The draft length (`SPEC_K`, default 7) was swept: 6 and 7 tie, 5 / 8 / 10 are
+10-25% slower. Acceptance varies with the text (2.5-3.2 accepted tokens per draft).
 
 ```bash
-SPEC=dspark MAX_LEN=16384 MAX_SEQS=4 bash deploy/serve.sh
+SPEC=dspark RSSM=1 KV_DTYPE=fp8 MAX_LEN=65536 MAX_SEQS=4 bash deploy/serve.sh
 ```
 
 The first start downloads the drafter and compiles (can take ~30 min); later starts are faster.
 Best when you are the only user; for many parallel requests use MTP (below) or leave it off.
-`KV_DTYPE=fp8` does not buy more context next to the drafter (a 32k request needs 5.2 GiB, 4 GiB free).
+`RSSM=1` (RecoverSSM, vLLM PR #61309 patched into a second venv by
+`deploy/patches/make_recoverssm_venv.sh`) stops the DeltaNet layers from keeping a full state copy
+per draft token: ~3x the KV room with the drafter. fp8 KV next to the drafter works since the
+plugin's sliding-window block fix (2026-11-09; before it the drafter's pages were padded ~29x).
 
 ### Several requests at once: MTP speculative decoding
 
@@ -130,14 +168,31 @@ Export with it at setup time (if you already set up text-only, `rm -rf ~/models/
 VISION=1 HF_TOKEN=hf_xxx bash deploy/setup_server.sh
 ```
 
+Or, keeping a text-only checkpoint next to it, from the local packed file (~5 min, CPU only):
+
+```bash
+~/sq-venv/bin/python scripts/export_vllm_checkpoint.py --packed <path to s16_25_ft.safetensors> --out ~/models/q27-sq-vl --vision
+```
+
 `serve.sh` then accepts images automatically (`IMAGES=4` per request by default). Send them as
 OpenAI `image_url` parts (an `https://` URL or a `data:image/png;base64,...` URL). Measured on the
-3090 (2026-11-08): both test images (a synthetic number/shapes image and a COCO photo of two cats
-with remotes) described correctly, ~1.3 s per short answer; KV cache ~92k tokens.
+3090 (2026-11-09, with DSpark + RecoverSSM + fp8 KV): both test images (a synthetic number/shapes
+image and a COCO photo of two cats with remotes) described correctly, ~0.9 s per short answer.
+The vision tower costs ~1.4 GB in all (0.92 weights + activation room), roughly 40k fp8 KV tokens.
 
 ## 4. Check it
 
-On the server:
+One command, from the server or any machine that reaches it (stdlib Python only):
+
+```bash
+python3 scripts/smoke_server.py --endpoint http://127.0.0.1:8000 --api-key "$SQ_API_KEY"
+```
+
+It checks the model list and that requests without the key are refused, a chat answer, streaming
+(time to first token), thinking (reasoning + answer) and an image (skipped on a text-only
+checkpoint), and ends with `ALL OK` or the failed checks.
+
+By hand, on the server:
 
 ```bash
 curl -s localhost:8000/health && echo ok
@@ -200,6 +255,10 @@ connection with that URL and key.
 
 - **Out of memory at start**: lower `MAX_LEN` or `MAX_SEQS`, or `KV_DTYPE=fp8`; close other GPU
   programs (`nvidia-smi`).
+- **Fast first answer, then everything ~5x slower (Windows / WSL2)**: GPU memory overflowed into
+  system RAM. Task Manager > Performance > GPU shows "Shared GPU memory" growing and "Dedicated" at
+  the top. Leave `GPU_UTIL` unset (computed) or lower it; see "Long context". Note `nvidia-smi`
+  inside WSL2 does not count what Windows programs hold.
 - **`nvidia-smi` missing in WSL**: update the Windows NVIDIA driver and WSL (`wsl --update`).
 - **CuPy errors (`CUDA_ERROR_INVALID_IMAGE`)**: two CuPy builds installed. Run
   `~/sq-venv/bin/pip uninstall -y cupy-cuda12x cupy-cuda13x`, `rm -rf ~/.cupy`, then re-run
