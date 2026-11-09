@@ -302,7 +302,8 @@ def register() -> None:
     """vllm.general_plugins entry point: importing this module registers the config; also installs
     the least-waste hybrid KV grouping (kv_grouping.py; SHAPEQUANT_KV_GROUPING=0 to skip) and turns
     on the INT8 prefill GEMMs (core._INT8_PREFILL; SHAPEQUANT_INT8_PREFILL=0 to keep bf16)."""
-    from . import kv_grouping
+    from . import flashinfer_ws, kv_grouping
     kv_grouping.install()
+    flashinfer_ws.install()
     core._INT8_PREFILL = os.environ.get("SHAPEQUANT_INT8_PREFILL", "1") != "0"
     logger.info("shapequant: INT8 prefill GEMMs %s (M >= %d)", "on" if core._INT8_PREFILL else "off", core._INT8_MIN_M)
