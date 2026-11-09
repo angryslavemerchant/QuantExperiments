@@ -5,7 +5,8 @@
 # up to 16 requests at once. Env overrides:
 #   HOST (127.0.0.1; use your Tailscale IP to reach it from home), PORT (8000), MAX_LEN (32768),
 #   MAX_SEQS (16), GPU_UTIL (default: computed at start from the VRAM free right now minus HEADROOM_MB
-#   (1536), so memory other programs hold (the Windows desktop, ~1.3 GB on the work 3090) is left alone;
+#   (2560: vLLM itself uses ~1.2-1.7 GB more than it budgets), so memory other programs hold (the Windows
+#   desktop, ~0.6-1.3 GB on the work 3090) is left alone;
 #   vLLM's own --gpu-memory-utilization is a share of the *total* VRAM. Too high a value spills VRAM to
 #   system RAM on Windows/WSL and runs many times slower (OOM instead if the driver's CUDA Sysmem
 #   Fallback Policy is off)), CHUNK (8192: prefill
@@ -29,8 +30,8 @@ if [ -z "${GPU_UTIL:-}" ]; then
   # free / total as CUDA reports them (what vLLM sizes against): nvidia-smi inside WSL2 does not count
   # the memory Windows programs hold, so it overstates what is free
   read -r free total < <("$VENV/bin/python" -c 'import torch; f, t = torch.cuda.mem_get_info(); print(f >> 20, t >> 20)')
-  GPU_UTIL=$(awk -v f="$free" -v t="$total" -v h="${HEADROOM_MB:-1536}"     'BEGIN { u = (f - h) / t; if (u > 0.95) u = 0.95; if (u < 0.5) u = 0.5; printf "%.3f", u }')
-  echo "GPU_UTIL=$GPU_UTIL (${free} MiB free of ${total}, ${HEADROOM_MB:-1536} MiB headroom)"
+  GPU_UTIL=$(awk -v f="$free" -v t="$total" -v h="${HEADROOM_MB:-2560}"     'BEGIN { u = (f - h) / t; if (u > 0.95) u = 0.95; if (u < 0.5) u = 0.5; printf "%.3f", u }')
+  echo "GPU_UTIL=$GPU_UTIL (${free} MiB free of ${total}, ${HEADROOM_MB:-2560} MiB headroom)"
 fi
 CHUNK=${CHUNK:-8192}
 NAME=${SQ_NAME:-qwen3.8-27b-sq}   # not $NAME: WSL sets it to the hostname
