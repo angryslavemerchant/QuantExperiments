@@ -4,7 +4,8 @@
 # Defaults suit a 24 GB card (RTX 3090 / 4090): compact weights (~12 GB), 32k context per request,
 # up to 16 requests at once. Env overrides:
 #   HOST (127.0.0.1; use your Tailscale IP to reach it from home), PORT (8000), MAX_LEN (32768),
-#   MAX_SEQS (16), GPU_UTIL (0.90; on Windows/WSL a too-high value silently spills VRAM to system RAM and
+#   MAX_SEQS (16), GPU_UTIL (0.86: vLLM overshoots its budget by ~2 GB on the 3090 under WSL; too high a value
+#   silently spills VRAM to system RAM there (Windows) and
 #   runs many times slower unless the driver's CUDA Sysmem Fallback Policy is off), CHUNK (8192: prefill
 #   chunk, --max-num-batched-tokens), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
 #   name), KV_DTYPE (auto | fp8: halves KV memory -> longer contexts), TOOL_PARSER (enables tool calls,
@@ -21,7 +22,7 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
 MAX_LEN=${MAX_LEN:-32768}
 MAX_SEQS=${MAX_SEQS:-16}
-GPU_UTIL=${GPU_UTIL:-0.90}
+GPU_UTIL=${GPU_UTIL:-0.86}
 CHUNK=${CHUNK:-8192}
 NAME=${SQ_NAME:-qwen3.8-27b-sq}   # not $NAME: WSL sets it to the hostname
 KV_DTYPE=${KV_DTYPE:-auto}
