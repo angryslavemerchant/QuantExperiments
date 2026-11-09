@@ -165,6 +165,7 @@ class ShapeQuantLinearMethod(LinearMethodBase):
                                            layout=self.cfg.layout, large=self.cfg.large,
                                            chunk_bytes=self.cfg.chunk_mb << 20, xs=self.cfg.xs,
                                            warps=self.cfg.warps, compact=self.cfg.compact)
+        ps.sq_name = self.prefix
         if ps.C != input_size or ps.R != output_size:
             raise ValueError(f"{self.prefix}: packed pieces are [{ps.R}, {ps.C}], vLLM layer is "
                              f"[{output_size}, {input_size}] (partitions {output_partition_sizes})")

@@ -22,6 +22,7 @@ handle in, so torch.compile sees an opaque op with a known output shape).
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 
 import torch
@@ -34,6 +35,57 @@ STACKED = {
     "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
     "linear_attn.in_proj_qkvz": ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z"),
 }
+# Diagnostic only: simulate an INT8 prefill GEMM on the large-M path by rounding to int8 and back
+# (symmetric, one scale per row: per token for activations, per output channel for weights).
+#   SHAPEQUANT_FAKEQ      = "a8" | "w8" | "w8a8"; unset = off
+#   SHAPEQUANT_FAKEQ_SKIP = comma list of name substrings left in fp16 (e.g. "down_proj")
+#   SHAPEQUANT_FAKEQ_HAD  = block size b (power of 2): rotate X and W by a block-diagonal Hadamard
+#                           along C before rounding (X W^T is unchanged by the rotation)
+_FAKEQ = os.environ.get("SHAPEQUANT_FAKEQ", "").lower()
+_FAKEQ_SKIP = [t for t in os.environ.get("SHAPEQUANT_FAKEQ_SKIP", "").split(",") if t]
+_FAKEQ_HAD = int(os.environ.get("SHAPEQUANT_FAKEQ_HAD", "0") or 0)
+_HAD: dict = {}
+
+
+def _fq_rows(t: torch.Tensor) -> torch.Tensor:
+    s = t.abs().amax(dim=1, keepdim=True).float().clamp_min(1e-12) / 127
+    return (t.float() / s).round_().clamp_(-127, 127).mul_(s).to(t.dtype)
+
+
+def _hadamard(t: torch.Tensor) -> torch.Tensor:
+    """t [N, C] @ blockdiag(H_b) along C (fp32 math), C % b == 0 or b halves until it divides."""
+    b, C = _FAKEQ_HAD, t.shape[1]
+    while C % b:
+        b //= 2
+    key = (b, t.device)
+    if key not in _HAD:
+        h = torch.ones(1, 1)
+        while h.shape[0] < b:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        _HAD[key] = (h / b ** 0.5).to(t.device)
+    return (t.float().view(t.shape[0], C // b, b) @ _HAD[key]).view(t.shape[0], C).to(t.dtype)
+
+
+def _fq_on(name: str) -> bool:
+    return bool(_FAKEQ) and not any(k in name for k in _FAKEQ_SKIP)
+
+
+def _fqx(x: torch.Tensor, name: str) -> torch.Tensor:
+    if not _fq_on(name):
+        return x
+    if _FAKEQ_HAD:
+        x = _hadamard(x)
+    return _fq_rows(x) if "a8" in _FAKEQ else x
+
+
+def _fqw(w: torch.Tensor, name: str = "") -> torch.Tensor:
+    if not _fq_on(name):
+        return w
+    if _FAKEQ_HAD:
+        w = _hadamard(w)
+    return _fq_rows(w) if "w8" in _FAKEQ else w
+
+
 _LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.(.+)$")
 
 
@@ -133,6 +185,7 @@ class PackedShards:
         if compact and layout != "tile":
             raise ValueError("compact needs layout='tile'")
         self.compact = compact
+        self.sq_name = ""        # set by the vLLM plugin (layer prefix); used by SHAPEQUANT_FAKEQ_SKIP
         # large-M path: "dequant" (whole matrix to scratch + GEMM), "chunked" (L2-sized row chunks,
         # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
         assert large in ("dequant", "chunked", "fused"), large
@@ -287,6 +340,8 @@ class PackedShards:
         return y
 
     def _large(self, x16: torch.Tensor) -> torch.Tensor:
+        if _FAKEQ:
+            x16 = _fqx(x16, self.sq_name)
         if self.compact:
             return self._large_compact(x16)
         if self.large == "chunked":
@@ -299,10 +354,10 @@ class PackedShards:
         from ..kernels import cuda_dequant
         scratch = _Scratch.get(max(self.Rs) * self.C, x16.device)
         if len(self.rls) == 1:
-            return x16 @ cuda_dequant.dequant(self.rls[0], scratch).view(self.R, self.C).t()
+            return x16 @ _fqw(cuda_dequant.dequant(self.rls[0], scratch).view(self.R, self.C), self.sq_name).t()
         y = torch.empty(x16.shape[0], self.R, dtype=torch.float16, device=x16.device)
         for rl, off, R in zip(self.rls, self.offs, self.Rs):
-            w = cuda_dequant.dequant(rl, scratch).view(R, self.C)
+            w = _fqw(cuda_dequant.dequant(rl, scratch).view(R, self.C), self.sq_name)
             y[:, off:off + R] = x16 @ w.t()       # the GEMM finishes before the scratch is reused (one stream)
         return y
 
@@ -310,10 +365,10 @@ class PackedShards:
         from ..kernels import batched_runs as br
         scratch = _Scratch.get(max(self.Rs) * self.C, x16.device)
         if len(self.rls) == 1:
-            return x16 @ br.dequant_tile(self.launchers[0], scratch).t()
+            return x16 @ _fqw(br.dequant_tile(self.launchers[0], scratch), self.sq_name).t()
         y = torch.empty(x16.shape[0], self.R, dtype=torch.float16, device=x16.device)
         for lb, off, R in zip(self.launchers, self.offs, self.Rs):
-            y[:, off:off + R] = x16 @ br.dequant_tile(lb, scratch).t()
+            y[:, off:off + R] = x16 @ _fqw(br.dequant_tile(lb, scratch), self.sq_name).t()
         return y
 
     def _large_chunked(self, x16: torch.Tensor) -> torch.Tensor:
