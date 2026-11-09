@@ -48,6 +48,37 @@ _HAD: dict = {}
 # compact mode, bf16 activations: prefill GEMMs run in bf16 (SHAPEQUANT_BF16_PREFILL=0: the older
 # fp16 path with casts around it)
 _BF16_PREFILL = os.environ.get("SHAPEQUANT_BF16_PREFILL", "1") != "0"
+# INT8 prefill (compact mode, bf16 X, M >= SHAPEQUANT_INT8_MIN_M): W8A8 GEMM with a block-128
+# Hadamard on both X and W along C (X W^T = (X H)(W H)^T), dynamic per-token int8 X, per-output-row
+# int8 W made from the dequantized tile each call; vLLM's cutlass_scaled_mm applies both scales and
+# writes bf16. 27B on wikitext: KL vs the bf16 path 0.0018 (vs 0.12 for 2.5 bpw vs bf16); without
+# the rotation 0.027 (scripts/kl_fakeq.py). Needs vLLM's _C ops (only imported on first use).
+_INT8_PREFILL = os.environ.get("SHAPEQUANT_INT8_PREFILL", "0") != "0"
+_INT8_MIN_M = int(os.environ.get("SHAPEQUANT_INT8_MIN_M", "1024"))
+_INT8_ROWS = 2048           # weight rows rotated per step (bf16 temp of _INT8_ROWS x C)
+
+
+class _Int8:
+    """Lazily bound vLLM ops + the bf16 H_128 per device."""
+    ops = None
+    h: dict = {}
+
+    @classmethod
+    def get(cls, dev):
+        if cls.ops is None:
+            import vllm._custom_ops  # noqa: F401  (registers torch.ops._C)
+            cls.ops = torch.ops._C
+        k = str(dev)
+        if k not in cls.h:
+            h = torch.ones(1, 1)
+            while h.shape[0] < 128:
+                h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+            cls.h[k] = (h / 128 ** 0.5).to(dev, torch.bfloat16)
+        return cls.ops, cls.h[k]
+
+
+def _int8_ok(ps) -> bool:
+    return ps.C % 128 == 0 and all(R % 16 == 0 for R in ps.Rs)
 
 
 def _fq_rows(t: torch.Tensor) -> torch.Tensor:
@@ -189,6 +220,7 @@ class PackedShards:
             raise ValueError("compact needs layout='tile'")
         self.compact = compact
         self.sq_name = ""        # set by the vLLM plugin (layer prefix); used by SHAPEQUANT_FAKEQ_SKIP
+        self.int8_ok = False     # set below once Rs / C are known
         # large-M path: "dequant" (whole matrix to scratch + GEMM), "chunked" (L2-sized row chunks,
         # chunk_bytes of fp16 each), "fused" (kernels.runs_gemm: decode inside the GEMM tiles)
         assert large in ("dequant", "chunked", "fused"), large
@@ -209,6 +241,7 @@ class PackedShards:
         self.Rs = [rl.R for rl in rls]
         self.R = sum(self.Rs)
         self.offs = [sum(self.Rs[:i]) for i in range(len(rls))]
+        self.int8_ok = _int8_ok(self)
         self.bmax = bmax
         self.cross = bmax        # M <= cross: batched kernel, else the large-M path (tune() moves it)
         self.dequant_from = dequant_from   # large == "fused": M >= this uses dequant + GEMM instead
@@ -328,6 +361,9 @@ class PackedShards:
             # piece straight into its column slice: no cast or concat kernels around it
             xin = x2 if x2.dtype in (torch.float16, torch.bfloat16) else x2.to(torch.float16)
             y = self._small(xin.contiguous(), M)
+        elif (self.compact and _INT8_PREFILL and x2.dtype == torch.bfloat16 and M >= _INT8_MIN_M
+              and not _FAKEQ and self.int8_ok):
+            y = self._large_int8(x2.contiguous())
         elif self.compact and _BF16_PREFILL and x2.dtype == torch.bfloat16:
             # bf16 end to end: weights dequantized straight to bf16, GEMM in bf16 (fp32 accumulate),
             # no cast kernels on X or Y
@@ -380,6 +416,36 @@ class PackedShards:
             # the column slice has row stride self.R and unit column stride, which cuBLAS takes as
             # its output directly (ldc = self.R): no temporary + copy kernel per piece
             torch.mm(x, w.t(), out=y[:, off:off + R])
+        return y
+
+    def _large_int8(self, x: torch.Tensor) -> torch.Tensor:
+        """x bf16 [M, C] -> bf16 [M, R] by the W8A8 path (see _INT8_PREFILL)."""
+        from ..kernels import batched_runs as br
+        ops, H = _Int8.get(x.device)
+        M, C = x.shape
+        # X: rotate, then dynamic per-token int8
+        xr = torch.mm(x.view(-1, 128), H).view(M, C)
+        xq = torch.empty(M, C, dtype=torch.int8, device=x.device)
+        sx = torch.empty(M, 1, dtype=torch.float32, device=x.device)
+        ops.dynamic_scaled_int8_quant(xq, xr, sx, None)
+        del xr
+        # W: every stacked piece dequantized (bf16 scratch), rotated in row chunks, int8 per row,
+        # into one [R, C] int8 matrix, so one GEMM covers all pieces
+        scratch = _Scratch.get(max(self.Rs) * self.C, x.device).view(torch.bfloat16)
+        wq = torch.empty(self.R, C, dtype=torch.int8, device=x.device)
+        sw = torch.empty(self.R, 1, dtype=torch.float32, device=x.device)
+        rows = min(_INT8_ROWS, max(self.Rs))
+        tmp = torch.empty(rows * C, dtype=torch.bfloat16, device=x.device)
+        for lb, off, R in zip(self.launchers, self.offs, self.Rs):
+            w = br.dequant_tile(lb, scratch)
+            for r0 in range(0, R, rows):
+                r1 = min(R, r0 + rows)
+                wr = tmp[:(r1 - r0) * C].view(-1, 128)
+                torch.mm(w[r0:r1].reshape(-1, 128), H, out=wr)
+                ops.dynamic_scaled_int8_quant(wq[off + r0:off + r1], wr.view(r1 - r0, C),
+                                              sw[off + r0:off + r1], None)
+        y = torch.empty(M, self.R, dtype=torch.bfloat16, device=x.device)
+        ops.cutlass_scaled_mm(y, xq, wq.t(), sx, sw.view(1, self.R), None)
         return y
 
     def _large_chunked(self, x16: torch.Tensor) -> torch.Tensor:
