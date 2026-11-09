@@ -4,7 +4,9 @@
 # Defaults suit a 24 GB card (RTX 3090 / 4090): compact weights (~12 GB), 32k context per request,
 # up to 16 requests at once. Env overrides:
 #   HOST (127.0.0.1; use your Tailscale IP to reach it from home), PORT (8000), MAX_LEN (32768),
-#   MAX_SEQS (16), GPU_UTIL (0.92), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
+#   MAX_SEQS (16), GPU_UTIL (0.90; on Windows/WSL a too-high value silently spills VRAM to system RAM and
+#   runs many times slower unless the driver's CUDA Sysmem Fallback Policy is off), CHUNK (8192: prefill
+#   chunk, --max-num-batched-tokens), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
 #   name), KV_DTYPE (auto | fp8: halves KV memory -> longer contexts), TOOL_PARSER (enables tool calls,
 #   e.g. qwen3_coder; see RUNBOOK), SPEC (dspark: DSpark drafter (default: the FP8 build of RedHat's), ~2.4x
 #   single-request speed, less KV room; mtp: Qwen3.8's own MTP head, needs a checkpoint exported
@@ -19,7 +21,8 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
 MAX_LEN=${MAX_LEN:-32768}
 MAX_SEQS=${MAX_SEQS:-16}
-GPU_UTIL=${GPU_UTIL:-0.92}
+GPU_UTIL=${GPU_UTIL:-0.90}
+CHUNK=${CHUNK:-8192}
 NAME=${SQ_NAME:-qwen3.8-27b-sq}   # not $NAME: WSL sets it to the hostname
 KV_DTYPE=${KV_DTYPE:-auto}
 [ -n "${SQ_API_KEY:-}" ] || { echo "set SQ_API_KEY (clients send it as 'Authorization: Bearer <key>')"; exit 1; }
@@ -54,6 +57,6 @@ fi
 exec "$VENV/bin/vllm" serve "$MODEL_DIR" \
   --served-model-name "$NAME" --host "$HOST" --port "$PORT" --api-key "$SQ_API_KEY" \
   --dtype bfloat16 --max-model-len "$MAX_LEN" --max-num-seqs "$MAX_SEQS" \
-  --gpu-memory-utilization "$GPU_UTIL" --max-num-batched-tokens 4096 --kv-cache-dtype "$KV_DTYPE" \
+  --gpu-memory-utilization "$GPU_UTIL" --max-num-batched-tokens "$CHUNK" --kv-cache-dtype "$KV_DTYPE" \
   --reasoning-parser qwen3 ${TOOL_PARSER:+--enable-auto-tool-choice --tool-call-parser $TOOL_PARSER} \
   ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} ${EXTRA:-}
