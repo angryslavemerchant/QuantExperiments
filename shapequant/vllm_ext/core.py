@@ -56,6 +56,7 @@ _BF16_PREFILL = os.environ.get("SHAPEQUANT_BF16_PREFILL", "1") != "0"
 _INT8_PREFILL = os.environ.get("SHAPEQUANT_INT8_PREFILL", "0") != "0"
 _INT8_MIN_M = int(os.environ.get("SHAPEQUANT_INT8_MIN_M", "1024"))
 _INT8_ROWS = 2048           # weight rows rotated per step (bf16 temp of _INT8_ROWS x C)
+_INT8_FUSED = os.environ.get("SHAPEQUANT_INT8_FUSED", "1") != "0"   # kernels/had_quant.py
 
 
 class _Int8:
@@ -423,6 +424,25 @@ class PackedShards:
         from ..kernels import batched_runs as br
         ops, H = _Int8.get(x.device)
         M, C = x.shape
+        if _INT8_FUSED:
+            # rotation + per-row int8 in one Triton kernel (kernels/had_quant.py): no bf16 temporaries
+            from ..kernels.had_quant import had_quant
+            xq, sx = had_quant(x)
+            scratch = _Scratch.get(max(self.Rs) * self.C, x.device).view(torch.bfloat16)
+            wq = torch.empty(self.R, C, dtype=torch.int8, device=x.device)
+            sw = torch.empty(self.R, 1, dtype=torch.float32, device=x.device)
+            # the weights never change, so neither do their rotated rows' scales: computed on the
+            # first call (two passes), then reused (one pass)
+            known = getattr(self, "_int8_sw", None)
+            for lb, off, R in zip(self.launchers, self.offs, self.Rs):
+                if known is not None:
+                    sw[off:off + R] = known[off:off + R]
+                had_quant(br.dequant_tile(lb, scratch), wq[off:off + R], sw[off:off + R], given=known is not None)
+            if known is None:
+                self._int8_sw = sw.clone()
+            y = torch.empty(M, self.R, dtype=torch.bfloat16, device=x.device)
+            ops.cutlass_scaled_mm(y, xq, wq.t(), sx, sw.view(1, self.R), None)
+            return y
         # X: rotate, then dynamic per-token int8
         xr = torch.mm(x.view(-1, 128), H).view(M, C)
         xq = torch.empty(M, C, dtype=torch.int8, device=x.device)
