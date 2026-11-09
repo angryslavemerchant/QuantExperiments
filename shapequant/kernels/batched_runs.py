@@ -863,6 +863,7 @@ def gemv_q8_tile(qt: torch.Tensor, st: torch.Tensor, X: torch.Tensor, Y: torch.T
 
 _SRC_DEQ_TILE = r"""
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 typedef unsigned int u32;
 #define NWB (BITS / 2)
 #define NWT ((JT * 2 * BITS + 31) / 32)
@@ -871,7 +872,11 @@ typedef unsigned int u32;
 #define TWORDS (2 * 32 * (NFULL * 8 * NWB + (JT > 0 ? 8 * NWT : 0)))
 __device__ __forceinline__ u32 scale2(u32 t, float s) {
     const float2 a = __half22float2(*(const __half2*)&t);
+#if OUT_BF16
+    __nv_bfloat162 o = __floats2bfloat162_rn(a.x * s, a.y * s);
+#else
     __half2 o = __floats2half2_rn(a.x * s, a.y * s);
+#endif
     return *(u32*)&o;
 }
 // one unit of a tile (as gemv_runs_b's unit_t): NT tags for rows g (a) and g + 8 (b); tag j -> chunk
@@ -929,8 +934,9 @@ dequant_runs_tile(const u32* __restrict__ words, const uint2* __restrict__ table
 
 def dequant_tile(lb: "RunsBatch", out: torch.Tensor | None = None) -> torch.Tensor:
     """Dense fp16 [R, C] of a matrix from its TILE-layout words (lb: a RunsBatch with layout="tile"),
-    so the lane-major words can be dropped (PackedShards compact mode). out: fp16 with >= R*C
-    elements (a shared scratch); its first R*C are returned as [R, C]."""
+    so the lane-major words can be dropped (PackedShards compact mode). out: fp16 or bf16 with
+    >= R*C elements (a shared scratch); its first R*C are returned as [R, C] in out's dtype (bf16:
+    the same float product, rounded to bf16 instead of fp16)."""
     import cupy as cp
     from .proto_runs import geometry
     assert lb.layout == "tile"
@@ -939,11 +945,12 @@ def dequant_tile(lb: "RunsBatch", out: torch.Tensor | None = None) -> torch.Tens
     R, C = rl.R, rl.nch * 4
     if out is None:
         out = torch.empty(R * C, dtype=torch.float16, device=lb.wt.device)
-    if (R * C) > out.numel() or out.dtype != torch.float16:
-        raise ValueError("dequant_tile: output buffer too small / not fp16")
-    key = ("deq_tile", rl.bits, nfull, jt)
+    if (R * C) > out.numel() or out.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("dequant_tile: output buffer too small / not fp16 or bf16")
+    bf = int(out.dtype == torch.bfloat16)
+    key = ("deq_tile", rl.bits, nfull, jt, bf)
     if key not in _mods:
-        src = f"#define BITS {rl.bits}\n#define NFULL {nfull}\n#define JT {jt}\n" + _SRC_DEQ_TILE
+        src = f"#define BITS {rl.bits}\n#define NFULL {nfull}\n#define JT {jt}\n#define OUT_BF16 {bf}\n" + _SRC_DEQ_TILE
         _mods[key] = cp.RawModule(code=src, options=("-std=c++17",)).get_function("dequant_runs_tile")
     nt = lb.tiles.numel() // 16
     with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):

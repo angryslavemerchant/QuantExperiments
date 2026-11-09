@@ -131,6 +131,10 @@ def test_dequant_tile_matches_lane_dequant(R, C, bits, G):
     out = torch.full((R * C + 77,), float("nan"), dtype=torch.float16, device="cuda")
     W = br.dequant_tile(lb, out)
     assert W.shape == (R, C) and torch.equal(W, ref)
+    # bf16 output: the same float product rounded to bf16 (within bf16 rounding of the fp16 value)
+    Wb = br.dequant_tile(lb, out.view(torch.bfloat16))
+    assert Wb.dtype == torch.bfloat16 and Wb.shape == (R, C)
+    assert (Wb.float() - ref.float()).abs().max() <= ref.float().abs().max() * 2 ** -8
 
 
 @pytest.mark.parametrize("xs", [False, True])

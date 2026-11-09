@@ -45,6 +45,9 @@ _FAKEQ = os.environ.get("SHAPEQUANT_FAKEQ", "").lower()
 _FAKEQ_SKIP = [t for t in os.environ.get("SHAPEQUANT_FAKEQ_SKIP", "").split(",") if t]
 _FAKEQ_HAD = int(os.environ.get("SHAPEQUANT_FAKEQ_HAD", "0") or 0)
 _HAD: dict = {}
+# compact mode, bf16 activations: prefill GEMMs run in bf16 (SHAPEQUANT_BF16_PREFILL=0: the older
+# fp16 path with casts around it)
+_BF16_PREFILL = os.environ.get("SHAPEQUANT_BF16_PREFILL", "1") != "0"
 
 
 def _fq_rows(t: torch.Tensor) -> torch.Tensor:
@@ -325,6 +328,10 @@ class PackedShards:
             # piece straight into its column slice: no cast or concat kernels around it
             xin = x2 if x2.dtype in (torch.float16, torch.bfloat16) else x2.to(torch.float16)
             y = self._small(xin.contiguous(), M)
+        elif self.compact and _BF16_PREFILL and x2.dtype == torch.bfloat16:
+            # bf16 end to end: weights dequantized straight to bf16, GEMM in bf16 (fp32 accumulate),
+            # no cast kernels on X or Y
+            y = self._large(x2.contiguous())
         else:
             y = self._large(x2.to(torch.float16).contiguous())
         return y.to(x.dtype).view(*shp[:-1], self.R)
@@ -361,14 +368,18 @@ class PackedShards:
             y[:, off:off + R] = x16 @ w.t()       # the GEMM finishes before the scratch is reused (one stream)
         return y
 
-    def _large_compact(self, x16: torch.Tensor) -> torch.Tensor:
+    def _large_compact(self, x: torch.Tensor) -> torch.Tensor:
+        """x fp16 or bf16; the weights are dequantized to x's dtype, Y comes out in x's dtype."""
         from ..kernels import batched_runs as br
-        scratch = _Scratch.get(max(self.Rs) * self.C, x16.device)
+        scratch = _Scratch.get(max(self.Rs) * self.C, x.device).view(x.dtype)
         if len(self.rls) == 1:
-            return x16 @ _fqw(br.dequant_tile(self.launchers[0], scratch), self.sq_name).t()
-        y = torch.empty(x16.shape[0], self.R, dtype=torch.float16, device=x16.device)
+            return x @ _fqw(br.dequant_tile(self.launchers[0], scratch), self.sq_name).t()
+        y = torch.empty(x.shape[0], self.R, dtype=x.dtype, device=x.device)
         for lb, off, R in zip(self.launchers, self.offs, self.Rs):
-            y[:, off:off + R] = x16 @ _fqw(br.dequant_tile(lb, scratch), self.sq_name).t()
+            w = _fqw(br.dequant_tile(lb, scratch), self.sq_name)
+            # the column slice has row stride self.R and unit column stride, which cuBLAS takes as
+            # its output directly (ldc = self.R): no temporary + copy kernel per piece
+            torch.mm(x, w.t(), out=y[:, off:off + R])
         return y
 
     def _large_chunked(self, x16: torch.Tensor) -> torch.Tensor:
