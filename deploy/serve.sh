@@ -6,7 +6,7 @@
 #   HOST (127.0.0.1; use your Tailscale IP to reach it from home), PORT (8000), MAX_LEN (32768),
 #   MAX_SEQS (16), GPU_UTIL (0.86: vLLM overshoots its budget by ~2 GB on the 3090 under WSL; too high a value
 #   silently spills VRAM to system RAM there (Windows) and
-#   runs many times slower unless the driver's CUDA Sysmem Fallback Policy is off), CHUNK (8192: prefill
+#   runs many times slower; with the driver's CUDA Sysmem Fallback Policy off it fails with OOM instead), CHUNK (8192: prefill
 #   chunk, --max-num-batched-tokens), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
 #   name), KV_DTYPE (auto | fp8: halves KV memory -> longer contexts), TOOL_PARSER (enables tool calls,
 #   e.g. qwen3_coder; see RUNBOOK), SPEC (dspark: DSpark drafter (default: the FP8 build of RedHat's), ~2.4x
