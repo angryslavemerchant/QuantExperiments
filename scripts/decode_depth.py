@@ -47,11 +47,14 @@ def main() -> int:
                                      "add_special_tokens": False}, a.api_key)["tokens"]
     res = {"name": a.name, "model": model, "runs": []}
     for D in map(int, a.depths.split(",")):
-        ids = (toks * (D // max(1, len(toks)) + 1))[:D] + tail
         for rep in range(a.repeats):
+            # a different starting offset per (depth, repeat): no prefix shared with earlier prompts, so
+            # the server's prefix cache cannot skip the prefill
+            off = (D * 31 + rep * 7919 + 13) % len(toks)
+            ids = ((toks[off:] + toks) * (D // max(1, len(toks)) + 2))[:D] + tail
             body = {"model": model, "prompt": ids, "max_tokens": a.gen, "temperature": 0, "ignore_eos": True,
                     "stream": True, "stream_options": {"include_usage": True}}
-            t0 = time.time()
+            t0 = time.perf_counter()
             first = None
             n = 0
             with post(f"{base}/v1/completions", body, a.api_key, stream=True) as resp:
@@ -63,8 +66,8 @@ def main() -> int:
                     if d.get("usage"):
                         n = d["usage"]["completion_tokens"]
                     if d.get("choices") and d["choices"][0].get("text") and first is None:
-                        first = time.time()
-            t1 = time.time()
+                        first = time.perf_counter()
+            t1 = time.perf_counter()
             ttft = (first or t1) - t0
             dec = (n - 1) / (t1 - first) if first and n > 1 else 0.0
             run = {"depth": D, "rep": rep, "ttft_s": round(ttft, 2), "decode_tps": round(dec, 1), "tokens": n}
