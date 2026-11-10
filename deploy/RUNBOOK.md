@@ -19,6 +19,7 @@ python scripts/smoke_server.py --api-key "$SQ_API_KEY"      # in a second shell:
 | Decode, one request | ~122 tok/s on a short context; 90 at 8k, 68 at 32-64k, 61 at 90k already in the prompt (without `SPEC`: 48 / 47 / 44 / 42 / 40) |
 | Prompt processing | 8k in ~4 s, 32k in ~17 s, 64k in ~43 s, 90k in ~67 s (~2000 tok/s falling to ~1350; INT8 prefill GEMMs) |
 | Same card, llama.cpp Q4_K_M | prefill 1303 / 1184 / 1050 tok/s at 8k / 32k / 64k; decode 41 / 38 / 33 at 8k / 32k / 64k |
+| Quality vs llama.cpp Q4_K_M (lmstudio-community GGUF, same card) | GSM8K 5-shot 91.5% vs 95.2% (`gsm8k_server.py --stops "Question:"`, Q4 also `--ban-ids 248046,248044`, scored with `gsm8k_rescore.py`; the Q4 ends the turn right after "Answer:" ~2/3 of the time otherwise); wikitext-2 PPL 6.60 vs 6.21 (llama-perplexity windows, c=2048, `ppl_llamacpp_style.py`). Looping on GSM8K: 0-2 of 1319 answers |
 | Checks | needle retrieval 15/15 at 8k-128k (fp8 KV), GSM8K 5-shot identical with/without INT8 prefill |
 
 Needs the patched RecoverSSM venv (`deploy/patches/make_recoverssm_venv.sh`, once) and the
