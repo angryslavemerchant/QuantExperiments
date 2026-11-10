@@ -49,11 +49,47 @@ def install() -> bool:
     import vllm
     if not vllm.__version__.startswith("0.33."):
         return False
-    try:
-        from vllm.v1.attention.backends import flashinfer as fi
-    except Exception as e:  # noqa: BLE001 - FlashInfer not installed / importable
-        logger.info("shapequant: FlashInfer workspace patch skipped (%r)", e)
-        return False
+    # Patch when vLLM itself imports its FlashInfer backend (the engine process), not here: importing
+    # flashinfer queries the device and so creates a CUDA context, and register() also runs in vLLM's API
+    # front-end process, where that context (~0.5 GB under WSL2) sat outside every memory budget.
+    import sys
+    mod = sys.modules.get(_FI_MOD)
+    if mod is not None:
+        return _patch(mod)
+    sys.meta_path.insert(0, _PostImport())
+    return True
+
+
+_FI_MOD = "vllm.v1.attention.backends.flashinfer"
+
+
+class _PostImport:
+    """meta_path finder: lets the normal finders locate _FI_MOD, then runs _patch after it executes."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name != _FI_MOD:
+            return None
+        import importlib.machinery
+        import sys
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(name, path, target)
+            if spec is not None and spec.loader is not None:
+                real_exec = spec.loader.exec_module
+
+                def exec_module(module, _real=real_exec):
+                    _real(module)
+                    try:
+                        _patch(module)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("shapequant: FlashInfer workspace patch failed (%r)", e)
+                spec.loader.exec_module = exec_module
+                return spec
+        return None
+
+
+def _patch(fi) -> bool:
     if getattr(fi, "_shapequant_ws", False):
         return True
     from vllm.config import get_current_vllm_config

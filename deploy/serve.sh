@@ -5,12 +5,14 @@
 # up to 16 requests at once. Env overrides:
 #   HOST (127.0.0.1; use your Tailscale IP to reach it from home), PORT (8000), MAX_LEN (32768),
 #   MAX_SEQS (16), GPU_UTIL (default: computed at start from the VRAM free right now minus HEADROOM_MB
-#   (2560: vLLM itself uses ~1.2-1.7 GB more than it budgets), so memory other programs hold (the Windows
+#   (2048: vLLM runs ~0.5 GB past its budget at CHUNK 4096 (two ~0.3 GB CUDA contexts, engine and API
+#   front-end, created before it measures; at CHUNK 8192 ~1.2-1.7 GB: its memory profile skips the
+#   attention/DeltaNet prefill activations), so memory other programs hold (the Windows
 #   desktop, ~0.6-1.3 GB on the work 3090) is left alone;
 #   vLLM's own --gpu-memory-utilization is a share of the *total* VRAM. Too high a value spills VRAM to
 #   system RAM on Windows/WSL and runs many times slower (OOM instead if the driver's CUDA Sysmem
-#   Fallback Policy is off)), CHUNK (8192: prefill
-#   chunk, --max-num-batched-tokens), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
+#   Fallback Policy is off)), CHUNK (4096: prefill
+#   chunk, --max-num-batched-tokens; 8192 is ~7% faster at prefill but costs ~1.9 GB of KV room), MODEL_DIR (~/models/q27-sq), VENV (~/sq-venv), SQ_NAME (served model
 #   name), KV_DTYPE (auto | fp8: halves KV memory -> longer contexts), TOOL_PARSER (enables tool calls,
 #   e.g. qwen3_coder; see RUNBOOK), SPEC (dspark: DSpark drafter (default: the FP8 build of RedHat's), ~2.4x
 #   single-request speed, less KV room; mtp: Qwen3.8's own MTP head, needs a checkpoint exported
@@ -30,10 +32,10 @@ if [ -z "${GPU_UTIL:-}" ]; then
   # free / total as CUDA reports them (what vLLM sizes against): nvidia-smi inside WSL2 does not count
   # the memory Windows programs hold, so it overstates what is free
   read -r free total < <("$VENV/bin/python" -c 'import torch; f, t = torch.cuda.mem_get_info(); print(f >> 20, t >> 20)')
-  GPU_UTIL=$(awk -v f="$free" -v t="$total" -v h="${HEADROOM_MB:-2560}"     'BEGIN { u = (f - h) / t; if (u > 0.95) u = 0.95; if (u < 0.5) u = 0.5; printf "%.3f", u }')
-  echo "GPU_UTIL=$GPU_UTIL (${free} MiB free of ${total}, ${HEADROOM_MB:-2560} MiB headroom)"
+  GPU_UTIL=$(awk -v f="$free" -v t="$total" -v h="${HEADROOM_MB:-2048}"     'BEGIN { u = (f - h) / t; if (u > 0.95) u = 0.95; if (u < 0.5) u = 0.5; printf "%.3f", u }')
+  echo "GPU_UTIL=$GPU_UTIL (${free} MiB free of ${total}, ${HEADROOM_MB:-2048} MiB headroom)"
 fi
-CHUNK=${CHUNK:-8192}
+CHUNK=${CHUNK:-4096}
 NAME=${SQ_NAME:-qwen3.8-27b-sq}   # not $NAME: WSL sets it to the hostname
 KV_DTYPE=${KV_DTYPE:-auto}
 [ -n "${SQ_API_KEY:-}" ] || { echo "set SQ_API_KEY (clients send it as 'Authorization: Bearer <key>')"; exit 1; }

@@ -8,16 +8,16 @@ request, up to 16 requests at once by default, protected by an API key.
 decoding, RecoverSSM, fp8 KV cache (measured 2026-11-09, WSL2):
 
 ```bash
-MODEL_DIR=~/models/q27-sq-vl SPEC=dspark RSSM=1 KV_DTYPE=fp8 MAX_LEN=81920 MAX_SEQS=2 TOOL_PARSER=qwen3_coder bash deploy/serve.sh
+MODEL_DIR=~/models/q27-sq-vl SPEC=dspark RSSM=1 KV_DTYPE=fp8 MAX_LEN=98304 MAX_SEQS=2 TOOL_PARSER=qwen3_coder bash deploy/serve.sh
 python scripts/smoke_server.py --api-key "$SQ_API_KEY"      # in a second shell: 5 checks, "ALL OK"
 ```
 
 | | |
 |---|---|
 | Weights in VRAM | 14.0 GiB: text model 9.85, DSpark drafter ~2.5, vision tower 0.92, FlashInfer workspace 0.75 |
-| KV cache | ~87k tokens (fp8, default 2.5 GB headroom) shared by the running requests; `MAX_LEN` up to ~82k for one request. `HEADROOM_MB=1536` gives ~117k / 98k but spills (prefill ~5x slower) once the desktop holds ~0.6 GB (remote session + browser) |
+| KV cache | ~133k tokens (fp8, defaults CHUNK 4096 / HEADROOM_MB 2048, measured 2026-11-10) shared by the running requests; `MAX_LEN=98304` for one request (needles correct at 32k / 64k / 96k). Stress peak (64k prompt, then two 40k prompts at once) 22.1 of 24 GB with an idle desktop: ~2.4 GB left for desktop apps. Before (CHUNK 8192 / HEADROOM 2560): ~87k |
 | Decode, one request | ~122 tok/s on a short context; 90 at 8k, 68 at 32-64k, 61 at 90k already in the prompt (without `SPEC`: 48 / 47 / 44 / 42 / 40) |
-| Prompt processing | 8k in ~4 s, 32k in ~17 s, 64k in ~43 s, 90k in ~67 s (~2000 tok/s falling to ~1350; INT8 prefill GEMMs) |
+| Prompt processing | 8k in ~4.5 s, 32k in ~18 s, 64k in ~45 s (CHUNK 4096; CHUNK 8192: 4.0 / 17.0 / 42.0 s; 2048: 5.1 / 21.3 / 51.7 s; INT8 prefill GEMMs) |
 | Same card, llama.cpp Q4_K_M | prefill 1303 / 1184 / 1050 tok/s at 8k / 32k / 64k; decode 41 / 38 / 33 at 8k / 32k / 64k |
 | Quality vs llama.cpp Q4_K_M (lmstudio-community GGUF, same card) | GSM8K 5-shot 91.5% vs 95.2% (`gsm8k_server.py --stops "Question:"`, Q4 also `--ban-ids 248046,248044`, scored with `gsm8k_rescore.py`; the Q4 ends the turn right after "Answer:" ~2/3 of the time otherwise); wikitext-2 PPL 6.60 vs 6.21 (llama-perplexity windows, c=2048, `ppl_llamacpp_style.py`). Looping on GSM8K: 0-2 of 1319 answers |
 | Checks | needle retrieval 15/15 at 8k-128k (fp8 KV), GSM8K 5-shot identical with/without INT8 prefill |
@@ -98,8 +98,8 @@ Useful settings (environment variables for `serve.sh`):
 | `MAX_LEN` | `32768` | Max tokens per request (prompt + answer) |
 | `MAX_SEQS` | `16` | Max requests processed at once |
 | `GPU_UTIL` | computed | Share of the *total* GPU memory vLLM may use (the rest of its share becomes KV cache). Default: (free VRAM at start − `HEADROOM_MB`) / total, so memory other programs hold is left alone |
-| `HEADROOM_MB` | `2560` | VRAM kept free beyond what is in use at start. vLLM itself uses ~1.2-1.7 GB more than it budgets (full stack, measured 2026-11-09); the rest covers desktop apps opened later. Too little shows as prefill dropping to ~370 tok/s (VRAM spilled to system RAM) |
-| `CHUNK` | `8192` | Prefill chunk (`--max-num-batched-tokens`); 4096 frees ~0.3 GB for KV at ~10% slower prompts |
+| `HEADROOM_MB` | `2048` | VRAM kept free beyond what is in use at start. vLLM itself runs ~0.5 GB past its budget at CHUNK 4096 (its engine and API front-end each hold a ~0.3 GB CUDA context created before it measures) and ~1.2-1.7 GB at CHUNK 8192 (its memory profile runs with attention skipped, so the attention / DeltaNet prefill activations are not counted; measured 2026-11-10, `SHAPEQUANT_MEMTRACE`); the rest covers desktop apps opened later. Too little shows as prefill dropping to ~370 tok/s (VRAM spilled to system RAM). With CHUNK 8192 use 2560 |
+| `CHUNK` | `4096` | Prefill chunk (`--max-num-batched-tokens`). 8192: ~7% faster prompts, ~1.9 GB less KV room (0.9 GB profiled activations + ~1 GB more headroom needed); 2048: +3k KV tokens, ~20% slower prompts |
 | `KV_DTYPE` | `auto` | `fp8` halves KV-cache memory: longer contexts / more requests |
 | `TOOL_PARSER` | off | Enables tool / function calling (see notes) |
 | `SPEC` | off | `dspark`: speculative decoding with the DSpark drafter (FP8 build); `mtp`: Qwen's MTP head |

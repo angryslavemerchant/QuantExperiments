@@ -148,7 +148,32 @@ class ShapeQuantConfig(QuantizationConfig):
         pieces = core.packed_pieces(prefix, self.pf.meta)
         if pieces is None:
             return UnquantizedLinearMethod()
+        if _bf16_layer(prefix):
+            # experiment: this decoder layer's linears run unquantized; their bf16 weights must be in
+            # the checkpoint directory (scripts/make_swap_checkpoint.py)
+            return UnquantizedLinearMethod()
         return ShapeQuantLinearMethod(self, prefix, pieces)
+
+
+def _bf16_layer(prefix: str) -> bool:
+    """SHAPEQUANT_BF16_LAYERS="3,17,40" (or "3:6" ranges): decoder layers kept in bf16 (layer-swap
+    sensitivity experiments). Read at call time."""
+    spec = os.environ.get("SHAPEQUANT_BF16_LAYERS", "")
+    if not spec:
+        return False
+    import re
+    m = re.search(r"layers\.(\d+)\.", prefix)
+    if m is None:
+        return False
+    i = int(m.group(1))
+    for part in spec.split(","):
+        if ":" in part:
+            a, b = part.split(":")
+            if int(a) <= i < int(b):
+                return True
+        elif part.strip() and int(part) == i:
+            return True
+    return False
 
 
 class ShapeQuantLinearMethod(LinearMethodBase):
@@ -302,7 +327,8 @@ def register() -> None:
     """vllm.general_plugins entry point: importing this module registers the config; also installs
     the least-waste hybrid KV grouping (kv_grouping.py; SHAPEQUANT_KV_GROUPING=0 to skip) and turns
     on the INT8 prefill GEMMs (core._INT8_PREFILL; SHAPEQUANT_INT8_PREFILL=0 to keep bf16)."""
-    from . import flashinfer_ws, kv_grouping
+    from . import flashinfer_ws, kv_grouping, memtrace
+    memtrace.install()     # only with SHAPEQUANT_MEMTRACE=<csv> (diagnostics)
     kv_grouping.install()
     flashinfer_ws.install()
     core._INT8_PREFILL = os.environ.get("SHAPEQUANT_INT8_PREFILL", "1") != "0"
