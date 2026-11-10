@@ -20,6 +20,7 @@ python scripts/smoke_server.py --api-key "$SQ_API_KEY"      # in a second shell:
 | Prompt processing | 8k in ~4.5 s, 32k in ~18 s, 64k in ~45 s (CHUNK 4096; CHUNK 8192: 4.0 / 17.0 / 42.0 s; 2048: 5.1 / 21.3 / 51.7 s; INT8 prefill GEMMs) |
 | Same card, llama.cpp Q4_K_M | prefill 1303 / 1184 / 1050 tok/s at 8k / 32k / 64k; decode 41 / 38 / 33 at 8k / 32k / 64k |
 | Quality vs llama.cpp Q4_K_M (lmstudio-community GGUF, same card) | GSM8K 5-shot 91.5% vs 95.2% (`gsm8k_server.py --stops "Question:"`, Q4 also `--ban-ids 248046,248044`, scored with `gsm8k_rescore.py`; the Q4 ends the turn right after "Answer:" ~2/3 of the time otherwise); wikitext-2 PPL 6.60 vs 6.21 (llama-perplexity windows, c=2048, `ppl_llamacpp_style.py`). Looping on GSM8K: 0-2 of 1319 answers |
+| Weak spots vs Q4_K_M (2026-11-10, thinking off) | coding: HumanEval+ 85.4 vs 92.7, MBPP+ 69.3 vs 77.5 (plus tests; `code_eval.py`), 16 vs 2 of 542 answers run to the token limit; MMLU-Pro 70.0 vs 77.1 (CS, chemistry, law, "other" lowest); IFEval 80.6 vs 81.5 and MGSM 87.9 vs 89.7 on par. Perplexity gap by domain: math +1-4%, English +7.5%, other languages +8-16%, Python +29%; the quant was calibrated and fine-tuned on English FineWeb-Edu only. Thinking-mode runaways ("But... Actually...") happen at the same rate on Q4_K_M: a Qwen3.8 trait |
 | Checks | needle retrieval 15/15 at 8k-128k (fp8 KV), GSM8K 5-shot identical with/without INT8 prefill |
 
 Needs the patched RecoverSSM venv (`deploy/patches/make_recoverssm_venv.sh`, once) and the
