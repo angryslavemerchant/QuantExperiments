@@ -20,7 +20,8 @@
 #   RSSM (1: RecoverSSM for the DeltaNet layers under SPEC, much more KV room; needs the patched venv from
 #   deploy/patches/make_recoverssm_venv.sh, used automatically), ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF;
 #   default expandable_segments:True, off on WSL2 where it stalls the plugin's shape tuning), IMAGES (max images per request when the model
-#   was exported with VISION=1; default 4), EXTRA (more vllm serve args).
+#   was exported with VISION=1; default 4), VISION_DTYPE (bf16 | fp8: the vision tower's linears
+#   quantized to fp8 at load, ~0.45 GB less), EXTRA (more vllm serve args).
 set -euo pipefail
 VENV=${VENV:-$HOME/sq-venv}
 MODEL_DIR=${MODEL_DIR:-$HOME/models/q27-sq}
@@ -43,6 +44,7 @@ KV_DTYPE=${KV_DTYPE:-auto}
 if grep -qi microsoft /proc/version 2>/dev/null; then ALLOC_CONF=${ALLOC_CONF-}; else ALLOC_CONF=${ALLOC_CONF-expandable_segments:True}; fi
 [ -n "$ALLOC_CONF" ] && export PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF
 SPEC_ARGS=()
+export SHAPEQUANT_VISION=${VISION_DTYPE:-bf16}
 [ -f "$MODEL_DIR/visual.safetensors" ] && SPEC_ARGS+=(--limit-mm-per-prompt "{\"image\": ${IMAGES:-4}}")
 case "${SPEC:-}" in
   "") ;;

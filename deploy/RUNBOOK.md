@@ -8,14 +8,14 @@ request, up to 16 requests at once by default, protected by an API key.
 decoding, RecoverSSM, fp8 KV cache (measured 2026-11-09, WSL2):
 
 ```bash
-MODEL_DIR=~/models/q27-sq-vl SPEC=dspark RSSM=1 KV_DTYPE=fp8 MAX_LEN=98304 MAX_SEQS=2 TOOL_PARSER=qwen3_coder bash deploy/serve.sh
+MODEL_DIR=~/models/q27-sq-vl VISION_DTYPE=fp8 SPEC=dspark SPEC_MODEL=TeenSpirit/Qwen3.8-27B-speculator.dspark-W4A16 RSSM=1 KV_DTYPE=fp8 MAX_LEN=98304 MAX_SEQS=2 TOOL_PARSER=qwen3_coder bash deploy/serve.sh
 python scripts/smoke_server.py --api-key "$SQ_API_KEY"      # in a second shell: 5 checks, "ALL OK"
 ```
 
 | | |
 |---|---|
-| Weights in VRAM | 14.0 GiB: text model 9.85, DSpark drafter ~2.5, vision tower 0.92, FlashInfer workspace 0.75 |
-| KV cache | ~133k tokens (fp8, defaults CHUNK 4096 / HEADROOM_MB 2048, measured 2026-11-10) shared by the running requests; `MAX_LEN=98304` for one request (needles correct at 32k / 64k / 96k). Stress peak (64k prompt, then two 40k prompts at once) 22.1 of 24 GB with an idle desktop: ~2.4 GB left for desktop apps. Before (CHUNK 8192 / HEADROOM 2560): ~87k |
+| Weights in VRAM | 12.35 GiB as vLLM reports it (was 13.61 with the bf16 vision tower and the FP8 drafter; 2026-11-12): text model 9.85, W4A16 DSpark drafter, vision tower in fp8 (`VISION_DTYPE=fp8`; Marlin W8A16 on Ampere), FlashInfer workspace 0.75 |
+| KV cache | ~152k tokens (2026-11-12, fp8 vision + W4A16 drafter; ~133k before) (fp8, defaults CHUNK 4096 / HEADROOM_MB 2048, measured 2026-11-10) shared by the running requests; `MAX_LEN=98304` for one request (needles correct at 32k / 64k / 96k). Stress peak (64k prompt, then two 40k prompts at once) 22.1 of 24 GB with an idle desktop: ~2.4 GB left for desktop apps. Before (CHUNK 8192 / HEADROOM 2560): ~87k |
 | Decode, one request | ~122 tok/s on a short context; 90 at 8k, 68 at 32-64k, 61 at 90k already in the prompt (without `SPEC`: 48 / 47 / 44 / 42 / 40) |
 | Prompt processing | 8k in ~4.5 s, 32k in ~18 s, 64k in ~45 s (CHUNK 4096; CHUNK 8192: 4.0 / 17.0 / 42.0 s; 2048: 5.1 / 21.3 / 51.7 s; INT8 prefill GEMMs) |
 | Same card, llama.cpp Q4_K_M | prefill 1303 / 1184 / 1050 tok/s at 8k / 32k / 64k; decode 41 / 38 / 33 at 8k / 32k / 64k |
@@ -181,6 +181,10 @@ OpenAI `image_url` parts (an `https://` URL or a `data:image/png;base64,...` URL
 3090 (2026-11-09, with DSpark + RecoverSSM + fp8 KV): both test images (a synthetic number/shapes
 image and a COCO photo of two cats with remotes) described correctly, ~0.9 s per short answer.
 The vision tower costs ~1.4 GB in all (0.92 weights + activation room), roughly 40k fp8 KV tokens.
+`VISION_DTYPE=fp8` quantizes its linears to fp8 at load (per tensor; Marlin W8A16 on Ampere).
+Measured 2026-11-12 together with the W4A16 drafter: weights 13.61 -> 12.35 GiB, KV 133k -> 152k
+tokens, both test images still described correctly (`scripts/vision_check.py`, 5/5 and 3/3
+keywords), DSpark 119 tok/s for one request (`spec_bench.py`; the FP8 drafter measured 108-124).
 
 ## 4. Check it
 

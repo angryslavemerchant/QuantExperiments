@@ -145,6 +145,11 @@ class ShapeQuantConfig(QuantizationConfig):
             return ShapeQuantEmbedMethod(self) if self.embed_head == "packed" else None
         if not isinstance(layer, LinearBase):
             return None
+        if _vision_fp8(prefix):
+            # the vision tower's linears quantized to fp8 (per tensor) as they load from the bf16
+            # checkpoint; on Ampere vLLM runs them with the Marlin W8A16 kernel. Half their memory.
+            from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerTensorOnlineLinearMethod
+            return Fp8PerTensorOnlineLinearMethod()
         pieces = core.packed_pieces(prefix, self.pf.meta)
         if pieces is None:
             return UnquantizedLinearMethod()
@@ -153,6 +158,13 @@ class ShapeQuantConfig(QuantizationConfig):
             # the checkpoint directory (scripts/make_swap_checkpoint.py)
             return UnquantizedLinearMethod()
         return ShapeQuantLinearMethod(self, prefix, pieces)
+
+
+def _vision_fp8(prefix: str) -> bool:
+    """SHAPEQUANT_VISION=fp8: the vision tower's (visual.*) linears in fp8 instead of bf16. Read at
+    call time (in the engine process)."""
+    return os.environ.get("SHAPEQUANT_VISION", "bf16") == "fp8" and (
+        prefix.startswith("visual.") or ".visual." in prefix)
 
 
 def _bf16_layer(prefix: str) -> bool:

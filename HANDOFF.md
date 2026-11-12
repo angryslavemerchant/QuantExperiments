@@ -59,6 +59,20 @@ does not fit in 24 GB. Next lever: a B=1 kernel that reads the tile layout.
    lighteval needs a fix for huggingface_hub 2.4 (`list_models(model_name=)` was removed).
 8. Large-batch vLLM throughput (>= 64 concurrent) is below bf16 on the PRO 6000; irrelevant for a
    personal server.
+9. **Rebuild the 27B with mixed calibration + fine-tune data** (needs a 96 GB card, like stage 16).
+   Tested 2026-11-12 on Qwen3.5-4B (d4 K1024 G4 LDLQ + 256-step codebook fine-tune, 2.52 bpw,
+   `configs/calmix/`; the fine-tune draws fresh sequences from the same mixture). Post-fine-tune KL
+   by eval domain, FineWeb-only / public mix / own answers / combined:
+   wikitext .204/.211/.222/.214, code .208/.133/.130/.131, chat .164/.131/.163/.135,
+   math .140/.069/.085/.087, de .318/.228/.385/.235, zh .362/.296/.412/.301,
+   the model's own thinking text .162/.125/.102/.108.
+   Public mix = FineWeb-edu 40, codeparrot 20, UltraChat 20, MATH algebra 10, de/zh Wikipedia 5+5.
+   Combined (best overall) = own answers 35 (`scripts/selfgen_calib.py`: the model's thinking-on
+   answers to chat / MATH / Magicoder prompts), FineWeb 30, code 15, chat 10, de 5, zh 5.
+   Own answers alone hurt de/zh. Caveats: code/math evals share their source datasets with the
+   mix; one seed (seed swing ~4-5% KL). Only ~300k tokens of own answers are needed (35% of
+   calibration + fine-tune data). The e-means codebook fit (`kmeans.fit: ema`) is within seed noise
+   at equal compute; 4x compute or 100 Lloyd iterations gave 5-7% (one seed).
 
 ## Key scripts
 
