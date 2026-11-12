@@ -208,6 +208,9 @@ def apply_run(model, originals: dict[str, torch.Tensor], run: dict, kcfg: dict, 
               log=print, importance: dict | None = None, hessians: dict | None = None) -> dict:
     """Restore originals, then compress every block linear per `run`. Returns stats."""
     restore_originals(model, originals)
+    cb.FIT = kcfg.get("fit", "lloyd")
+    cb.EMA_COMPUTE = float(kcfg.get("ema_compute", 1.0))
+    cb.EMA_REF_CHUNKS = int(kcfg.get("max_fit_chunks", 1_000_000))
     linears = compressible_linears(model)
     n_compressed = sum(m.weight.numel() for _, m in linears)
     n_total = unique_param_count(model)

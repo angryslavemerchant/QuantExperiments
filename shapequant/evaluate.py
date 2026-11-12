@@ -34,6 +34,16 @@ def load_wikitext_windows(tokenizer, cfg: dict) -> torch.Tensor:
     return ids[: ctx * n].reshape(n, ctx)
 
 
+def load_text_windows(tokenizer, cfg: dict) -> torch.Tensor:
+    """[num_windows, context] windows from any source calibrate.doc_texts reads (documents joined
+    with EOS), for held-out KL on other domains (eval.extra_sets)."""
+    from .calibrate import _source_sequences
+
+    gen = _source_sequences(cfg, tokenizer, cfg["context"])
+    rows = [next(gen) for _ in range(cfg["num_windows"])]
+    return torch.tensor(rows)
+
+
 def _decoder(model):
     return model.model
 
@@ -56,13 +66,16 @@ class Scorer:
     """Holds the evaluation windows, the cached reference hidden states, and a
     float32 copy of the (never-compressed) lm_head weight."""
 
-    def __init__(self, model, windows: torch.Tensor, logit_chunk: int):
+    def __init__(self, model, windows: torch.Tensor, logit_chunk: int, share: "Scorer | None" = None):
         self.windows = windows
         self.logit_chunk = logit_chunk
         self.device = next(model.parameters()).device
-        self.head_w = model.lm_head.weight.detach().to(torch.float32)
-        self.head_b = (model.lm_head.bias.detach().to(torch.float32)
-                       if model.lm_head.bias is not None else None)
+        if share is not None:   # extra eval sets reuse the main scorer's fp32 head (2.4 GB at a 248k vocab)
+            self.head_w, self.head_b = share.head_w, share.head_b
+        else:
+            self.head_w = model.lm_head.weight.detach().to(torch.float32)
+            self.head_b = (model.lm_head.bias.detach().to(torch.float32)
+                           if model.lm_head.bias is not None else None)
         self.ref_hidden = [self._hidden(model, w) for w in windows]
 
     @torch.no_grad()

@@ -1,0 +1,27 @@
+# e-means vs Lloyd codebook fitting, end to end on Qwen3.5-4B (Qwen3.8-27B's architecture family), with
+# the shipped recipe's shape at uniform K: d=4, K=1024, G=4 books, LDLQ (damp 0.1), then the codebook +
+# row-scale fine-tune. Question: does LookAtMyQuant 2's e-means codebook fit (an online, decaying-mean
+# k-means, arXiv 2611.09501) help shapequant, before and after fine-tuning?
+#   base       Lloyd: k-means++ then 25 passes (refits 10) on a 1M-chunk subsample (shipped)
+#   ema        e-means-style online fit over all chunks, same assignment count as base
+#   ema4x      same, 4x the assignments
+#   lloyd100   Lloyd with 4x the passes (100 / refits 40): compute control for ema4x
+#   refit2     base + 2 rounds of refitting codewords to LDLQ's feedback-adjusted targets
+# Run: python scripts/run_experiment.py --config configs/emeans_qwen35_4b.yaml
+stage: 17
+output_dir: artifacts/emeans/qwen35_4b
+model: Qwen/Qwen3.5-4B
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 128
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 2048, num_windows: 49}
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+calibration: {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, num_sequences: 128, context: 2048, batch_size: 4}
+kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 32768}
+runs:
+  - {name: base, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: &ft {steps: 256, seq_len: 1024, lr_books: 3.0e-5, lr_gain: 3.0e-4, log_every: 32, sequences: 128, heldout: {fineweb: 8}, heldout_every: 64, keep_best: fineweb}}
+  - {name: ema, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, kmeans: {fit: ema}, finetune: *ft}
+  - {name: ema4x, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, kmeans: {fit: ema, ema_compute: 4}, finetune: *ft}
+  - {name: lloyd100, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, kmeans: {iters: 100, refit_iters: 40}, finetune: *ft}
+  - {name: refit2, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, ldlq_refit: 2, gsm8k: false, finetune: *ft}

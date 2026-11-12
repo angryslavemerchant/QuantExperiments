@@ -71,6 +71,54 @@ def assign(x: torch.Tensor, codebook: torch.Tensor, batch: int = 65536,
     return idx, err
 
 
+# How kmeans() fits. "lloyd" (default): k-means++ then `iters` full Lloyd passes over the given chunks.
+# "ema": e-means-style online fit (arXiv 2611.09501, as used by LookAtMyQuant 2 for its trellis tables):
+# fresh random mini-batches drawn from ALL given chunks, each centroid a decaying weighted mean whose
+# new-batch weight falls along a cosine (0.5 -> 0.01 cold, EMA_WARM_A0 -> 0.01 warm-started). The step
+# count matches Lloyd's compute: iters * min(n, EMA_REF_CHUNKS) chunk assignments, times EMA_COMPUTE.
+# Set by pipeline.apply_run from kcfg["fit"] / kcfg["ema_compute"].
+FIT = "lloyd"
+EMA_BATCH = 131072
+EMA_REF_CHUNKS = 1_000_000
+EMA_COMPUTE = 1.0
+EMA_WARM_A0 = 0.1
+
+
+def _kmeans_ema(x, centers, iters, generator, batch, wt, warm):
+    import math
+    n, d = x.shape
+    K = centers.shape[0]
+    dev = x.device
+    B = min(EMA_BATCH, n)
+    steps = max(8, int(round(EMA_COMPUTE * iters * min(n, EMA_REF_CHUNKS) / B)))
+    a0 = EMA_WARM_A0 if warm else 0.5
+    sums = torch.zeros(K, d, dtype=torch.float64, device=dev)
+    wsum = torch.zeros(K, d, dtype=torch.float64, device=dev)
+    for j in range(steps):
+        a = 0.01 + (a0 - 0.01) * 0.5 * (1 + math.cos(math.pi * j / max(steps - 1, 1)))
+        pick = torch.randint(n, (B,), generator=generator).to(dev)
+        xb = x[pick]
+        wb = None if wt is None else wt[pick]
+        idx, _ = assign(xb, centers, batch, wb)
+        bs = torch.zeros(K, d, dtype=torch.float64, device=dev)
+        bw = torch.zeros(K, d, dtype=torch.float64, device=dev)
+        if wb is None:
+            bs.index_add_(0, idx, xb.to(torch.float64))
+            bw.index_add_(0, idx, torch.ones_like(xb, dtype=torch.float64))
+        else:
+            bs.index_add_(0, idx, (wb * xb).to(torch.float64))
+            bw.index_add_(0, idx, wb.to(torch.float64))
+        if j == 0 and not warm:
+            sums, wsum = bs, bw
+        else:
+            sums = (1 - a) * sums + a * bs
+            wsum = (1 - a) * wsum + a * bw
+        upd = wsum > 0
+        new = torch.where(upd, sums / wsum.clamp_min(1e-300), centers.to(torch.float64))
+        centers.copy_(new.to(torch.float32))
+    return centers
+
+
 def kmeans(
     x: torch.Tensor,
     K: int,
@@ -91,9 +139,23 @@ def kmeans(
     if n < K:
         raise ValueError(f"k-means needs at least K={K} chunks, got {n}")
     dev = x.device
+    if FIT == "ema":
+        if init is not None:
+            return _kmeans_ema(x, init.to(dev, torch.float32).clone(), iters, generator, batch, wt, warm=True)
+        m = min(n, EMA_REF_CHUNKS)   # k-means++ seeds from a subsample, then the online fit sees everything
+        s = torch.randperm(n, generator=generator)[:m].to(dev) if m < n else None
+        xs, ws = (x, wt) if s is None else (x[s], None if wt is None else wt[s])
+        seeds = _kmeanspp(xs, K, generator, ws)
+        return _kmeans_ema(x, seeds, iters, generator, batch, wt, warm=False)
     if init is not None:  # warm start (used by the mask fitting loop): skip k-means++
         centers = init.to(dev, torch.float32).clone()
         return _lloyd(x, centers, iters, batch, wt)
+    return _lloyd(x, _kmeanspp(x, K, generator, wt), iters, batch, wt)
+
+
+def _kmeanspp(x: torch.Tensor, K: int, generator: torch.Generator, wt: torch.Tensor | None) -> torch.Tensor:
+    n, d = x.shape
+    dev = x.device
     centers = torch.empty(K, d, dtype=torch.float32, device=dev)
     first = torch.randint(n, (1,), generator=generator, device="cpu").item()
     centers[0] = x[first]
@@ -116,8 +178,7 @@ def kmeans(
         pick = torch.where(total > 0, cdf_pick, uniform_pick)
         centers[k] = x[pick].reshape(d)
         dmin = torch.minimum(dmin, _d2(centers[k]))
-
-    return _lloyd(x, centers, iters, batch, wt)
+    return centers
 
 
 def _lloyd(x: torch.Tensor, centers: torch.Tensor, iters: int, batch: int,

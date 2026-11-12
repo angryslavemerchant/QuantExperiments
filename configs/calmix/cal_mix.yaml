@@ -1,0 +1,39 @@
+# Calibration-data experiment on Qwen3.5-4B (shipped recipe shape: d=4 K=1024 G=4 LDLQ, then the codebook
+# fine-tune, whose data comes from the same calibration stream). Variant: cal_mix -- public mixture: fineweb 40%, code 20%, chat 20%, math 10%, de 5%, zh 5%
+# KL is measured on held-out wikitext plus code / chat / math / German / Chinese / the model's own
+# thinking-mode responses (selfgen, documents past those the calibration uses).
+# Run: python scripts/run_experiment.py --config configs/calmix/cal_mix.yaml
+stage: 18
+output_dir: artifacts/calmix/qwen35_4b/cal_mix
+model: Qwen/Qwen3.5-4B
+reference_dtype: bfloat16
+seed: 0
+eval:
+  logit_chunk: 128
+  wikitext: {dataset: Salesforce/wikitext, subset: wikitext-2-raw-v1, split: test, context: 2048, num_windows: 49}
+  gsm8k: {enabled: false, dataset: openai/gsm8k, subset: main, split: test, num_problems: 4, max_new_tokens: 64, batch_size: 4}
+  extra_sets:
+    - {name: code, dataset: codeparrot/codeparrot-clean-valid, split: train, field: content, context: 2048, num_windows: 16}
+    - {name: chat, dataset: HuggingFaceH4/ultrachat_200k, split: test_sft, field: messages, context: 2048, num_windows: 16}
+    - {name: math, dataset: EleutherAI/hendrycks_math, subset: algebra, split: test, template: "Problem: {problem}
+
+Solution: {solution}", context: 2048, num_windows: 16}
+    - {name: de, dataset: wikimedia/wikipedia, subset: 20231101.de, split: train, skip_docs: 200000, context: 2048, num_windows: 8}
+    - {name: zh, dataset: wikimedia/wikipedia, subset: 20231101.zh, split: train, skip_docs: 200000, context: 2048, num_windows: 8}
+    - {name: selfgen, jsonl: artifacts/selfgen/qwen35_4b.jsonl, skip_docs: 1500, context: 2048, num_windows: 16}
+calibration:
+  num_sequences: 128
+  context: 2048
+  batch_size: 4
+  sources:
+    - {dataset: HuggingFaceFW/fineweb-edu, subset: sample-10BT, split: train, weight: 0.4}
+    - {dataset: codeparrot/codeparrot-clean, split: train, field: content, weight: 0.2}
+    - {dataset: HuggingFaceH4/ultrachat_200k, split: train_sft, field: messages, weight: 0.2}
+    - {dataset: EleutherAI/hendrycks_math, subset: algebra, split: train, template: "Problem: {problem}
+
+Solution: {solution}", weight: 0.1}
+    - {dataset: wikimedia/wikipedia, subset: 20231101.de, split: train, weight: 0.05}
+    - {dataset: wikimedia/wikipedia, subset: 20231101.zh, split: train, weight: 0.05}
+kmeans: {iters: 25, refit_iters: 10, max_fit_chunks: 1000000, assign_batch: 32768}
+runs:
+  - {name: cal_mix, method: stack, d: 4, K: 1024, G: 4, M: 1, rounds: 2, ldlq: true, ldlq_damp: 0.1, gsm8k: false, finetune: {steps: 256, seq_len: 1024, lr_books: 3.0e-5, lr_gain: 3.0e-4, log_every: 32, sequences: 128, heldout: {fineweb: 8}, heldout_every: 64, keep_best: fineweb}}

@@ -15,8 +15,73 @@ import torch
 from .pipeline import compressible_linears
 
 
+def doc_texts(src: dict, tok):
+    """Texts of one source, in order. src: {dataset, subset, split, field (default "text")} for a
+    Hugging Face dataset (streamed), with field "messages" rendered by the chat template; or
+    {jsonl: path} with a "text" (or src["field"]) per line. skip_docs drops the first n documents."""
+    import json
+    from itertools import islice
+
+    field = src.get("field", "text")
+    if src.get("jsonl"):
+        def it():
+            with open(src["jsonl"], encoding="utf-8") as f:
+                for line in f:
+                    yield json.loads(line)
+        rows = it()
+    else:
+        from datasets import load_dataset
+        rows = load_dataset(src["dataset"], src.get("subset"), split=src["split"], streaming=True)
+    for row in islice(rows, src.get("skip_docs", 0), None):
+        if field == "messages":
+            yield tok.apply_chat_template(row["messages"], tokenize=False)
+        elif src.get("template"):
+            yield src["template"].format(**row)
+        else:
+            yield row[field]
+
+
+def _source_sequences(src: dict, tok, context: int):
+    """Endless-until-exhausted generator of [context] token lists from one source (docs joined with EOS)."""
+    eos = tok.eos_token_id
+    buf: list[int] = []
+    for text in doc_texts(src, tok):
+        buf.extend(tok(text, add_special_tokens=False)["input_ids"])
+        buf.append(eos)
+        while len(buf) >= context:
+            yield buf[:context]
+            buf = buf[context:]
+
+
+def mixture_schedule(weights: list[float], n: int) -> list[int]:
+    """Source index of each of n sequences: deterministic weighted round robin (largest deficit first),
+    so any prefix of the schedule is the schedule of that shorter length (fine-tune data taken after the
+    calibration sequences never overlaps them)."""
+    tot = sum(weights)
+    got = [0] * len(weights)
+    out = []
+    for i in range(n):
+        j = max(range(len(weights)), key=lambda k: (weights[k] / tot) * (i + 1) - got[k])
+        got[j] += 1
+        out.append(j)
+    return out
+
+
 def load_calibration_sequences(tok, ccfg: dict, seed: int = 0) -> torch.Tensor:
-    """[num_sequences, context] token ids, from streamed documents joined with EOS."""
+    """[num_sequences, context] token ids, from streamed documents joined with EOS. With
+    ccfg["sources"] = [{..., weight}], a deterministic mixture: each sequence comes whole from one
+    source (see mixture_schedule and doc_texts)."""
+    if ccfg.get("sources"):
+        srcs = ccfg["sources"]
+        sched = mixture_schedule([float(s.get("weight", 1.0)) for s in srcs], ccfg["num_sequences"])
+        gens = [_source_sequences(s, tok, ccfg["context"]) for s in srcs]
+        rows = []
+        for j in sched:
+            try:
+                rows.append(next(gens[j]))
+            except StopIteration:
+                raise RuntimeError(f"calibration source {srcs[j]} too small") from None
+        return torch.tensor(rows)
     from datasets import load_dataset
 
     ds = load_dataset(ccfg["dataset"], ccfg.get("subset"), split=ccfg["split"], streaming=True)

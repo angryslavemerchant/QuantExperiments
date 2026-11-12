@@ -383,6 +383,8 @@ def compress_mixture(
 
     def sub(x, wt):
         n = x.shape[0]
+        if cb.FIT == "ema":     # the online fit draws its own batches from every chunk
+            return x, wt
         if n > max_fit_chunks:
             s = torch.randperm(n, generator=gen)[:max_fit_chunks].to(dev)
             return x[s], wt[s]

@@ -278,6 +278,12 @@ def main() -> int:
     windows = load_wikitext_windows(tok, ecfg["wikitext"])
     log(f"wikitext: {windows.shape[0]} windows x {windows.shape[1]} tokens; caching reference")
     scorer = Scorer(model, windows, ecfg["logit_chunk"])
+    extra_scorers = {}
+    for es in ecfg.get("extra_sets", []):
+        from shapequant.evaluate import load_text_windows
+        ew = load_text_windows(tok, es)
+        extra_scorers[es["name"]] = Scorer(model, ew, ecfg["logit_chunk"], share=scorer)
+        log(f"eval set {es['name']}: {ew.shape[0]} windows x {ew.shape[1]} tokens")
     gcfg = ecfg.get("gsm8k", {})
     lcfg = ecfg.get("lm_eval", {})
     problems = load_gsm8k(gcfg) if gcfg.get("enabled") else None
@@ -289,7 +295,8 @@ def main() -> int:
         from shapequant.calibrate import column_importance, load_calibration_sequences
         ccfg = cfg["calibration"]
         seqs = load_calibration_sequences(tok, ccfg, seed)
-        log(f"calibration: {seqs.shape[0]} x {seqs.shape[1]} tokens from {ccfg['dataset']}")
+        log(f"calibration: {seqs.shape[0]} x {seqs.shape[1]} tokens from "
+            + (ccfg["dataset"] if "dataset" in ccfg else f"a mixture of {len(ccfg['sources'])} sources"))
         importance = column_importance(model, seqs, ccfg.get("batch_size", 4))
 
     finished = done_runs(csv_path)
@@ -391,7 +398,8 @@ def main() -> int:
         log(f"=== run {name}: { {k: v for k, v in run.items() if not k.startswith('_')} }")
         seed_everything(seed)
         try:
-            stats = apply_run(model, originals, run, cfg["kmeans"], seed, log=log, importance=importance,
+            stats = apply_run(model, originals, run, {**cfg["kmeans"], **run.get("kmeans", {})}, seed, log=log,
+                              importance=importance,
                               hessians=hessians)
         except Exception as e:  # a broken external reference must not cost the whole run
             if run["method"] not in ("gguf", "vptq"):
@@ -409,6 +417,11 @@ def main() -> int:
             metrics = scorer.score(model)
             log(f"  [{row_name}] mean KL {metrics['mean_kl']:.5f}  p99 {metrics['p99_kl']:.4f}  "
                 f"top1 {metrics['top1_agree']:.2f}%  ppl {metrics['perplexity']:.3f}")
+            for en, esc in extra_scorers.items():
+                em = esc.score(model)
+                metrics[f"{en}_kl"], metrics[f"{en}_top1"] = em["mean_kl"], em["top1_agree"]
+            if extra_scorers:
+                log(f"  [{row_name}] " + "  ".join(f"{en} KL {metrics[en + '_kl']:.5f}" for en in extra_scorers))
             if ecfg.get("deploy"):
                 dm = scorer.score_deploy(model, ecfg["deploy"])
                 metrics.update(dm)
