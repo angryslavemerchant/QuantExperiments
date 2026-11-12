@@ -253,6 +253,19 @@ print(r.choices[0].message.content)
 Chat apps: Open WebUI, LibreChat, Chatbox, Continue (VS Code) etc. take an "OpenAI-compatible"
 connection with that URL and key.
 
+**Runaway-thinking guard (recommended with thinking on).** Qwen3.8 sometimes never closes its
+thinking on coding prompts: it re-checks forever ("Let's write final." ... "Double-check ..."),
+on Q4_K_M as well. Start the server with
+`EXTRA="--logits-processors shapequant.vllm_ext.think_stop:ThinkStop"`: after 8000 thinking
+tokens it adds a growing bonus to `</think>` at line breaks, never inside a ``` block, right after
+a table row or after a line ending in ":". With DSpark on, 30 loop-prone prompts went from mostly
+running to the limit to 0 of 30, with complete answers and no speed cost; in a two-phase eval
+(gate 3000) HumanEval+ and MMLU-Pro were unchanged or better (runaways count as failures).
+Defaults: `THINK_STOP_GATE` (8000, 0 = off), `THINK_STOP_SLOPE` (6 per 1000 tokens),
+`THINK_STOP_CAP` (30). Per request: `"vllm_xargs": {"think_stop_gate": 16000}` (0 = off).
+Requests with thinking off are untouched. Checks: `scripts/think_stop_check.py`. How it was
+found (activation steering tested and beaten by this plain rule): `scripts/loopmech_*.py`.
+
 ## 7. Troubleshooting
 
 - **Out of memory at start**: lower `MAX_LEN` or `MAX_SEQS`, or `KV_DTYPE=fp8`; close other GPU
