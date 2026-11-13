@@ -260,9 +260,14 @@ class ShapeQuantHeadMethod(QuantizeMethodBase):
             raise RuntimeError("shapequant embed_head=packed: the token embedding was not built by the shapequant "
                                "method (the Qwen3.5 embedding patch did not apply); it would run unloaded")
         dev = torch.device("cuda", torch.cuda.current_device())
+        q, sc, keep = self.cfg.pf.aux_tensor("lm_head.q"), self.cfg.pf.aux_tensor("lm_head.scale"), _head_keep()
+        if keep is not None:          # pruned output vocab: only the kept rows go to the GPU
+            q, sc = q.index_select(0, keep), sc.index_select(0, keep)
+            logger.info("shapequant: lm_head keeps %d of %d rows (%s); the rest get -inf",
+                        len(keep), output_size, os.environ["SHAPEQUANT_HEAD_KEEP"])
         with core.neutral_defaults():
-            head = core.Q8Head(self.cfg.pf.aux_tensor("lm_head.q").to(dev).contiguous(),
-                               self.cfg.pf.aux_tensor("lm_head.scale").to(dev).contiguous(), R=output_size)
+            head = core.Q8Head(q.to(dev).contiguous(), sc.to(dev).contiguous(), R=output_size, keep=keep)
+        del q, sc
         if head.C != input_size:
             raise ValueError(f"lm_head: packed C {head.C}, layer {input_size}")
         layer.sq_handle = core.register(head)
@@ -289,12 +294,17 @@ class ShapeQuantEmbedMethod(QuantizeMethodBase):
             raise NotImplementedError("shapequant: tensor parallelism is not supported (use TP = 1)")
         _aux_check(self.cfg, output_size, input_size, "embed")
         dev = torch.device("cuda", torch.cuda.current_device())
-        with core.neutral_defaults():
-            q = self.cfg.pf.aux_tensor("embed.q").to(dev).contiguous()
-            sc = self.cfg.pf.aux_tensor("embed.scale").to(dev).contiguous()
+        host = os.environ.get("SHAPEQUANT_EMBED_HOST") == "1"
+        q, sc = self.cfg.pf.aux_tensor("embed.q"), self.cfg.pf.aux_tensor("embed.scale")
+        if not host:
+            with core.neutral_defaults():
+                q, sc = q.to(dev).contiguous(), sc.to(dev).contiguous()
         if q.shape[1] * 2 != input_size:
             raise ValueError(f"embedding: packed C {q.shape[1] * 2}, layer {input_size}")
-        emb = core.Q4Embedding(q, sc, params_dtype)
+        emb = core.Q4Embedding(q, sc, params_dtype, host=host)
+        if host:
+            logger.info("shapequant: token embedding in pinned host RAM (%.2f GB, read by the GPU over UVA)",
+                        (q.numel() * q.element_size() + sc.numel() * sc.element_size()) / 1e9)
         global _EMBED_BUILT
         _EMBED_BUILT = True
         layer.sq_handle = core.register(emb)
@@ -308,6 +318,21 @@ class ShapeQuantEmbedMethod(QuantizeMethodBase):
 
 
 _EMBED_BUILT = False
+
+
+def _head_keep() -> torch.Tensor | None:
+    """SHAPEQUANT_HEAD_KEEP=<.npy of ascending int64 token ids> (scripts/make_head_keep.py; a
+    relative path is taken in the model directory): the lm_head keeps only these rows."""
+    p = os.environ.get("SHAPEQUANT_HEAD_KEEP")
+    if not p:
+        return None
+    import numpy as np
+    if not os.path.isabs(p):
+        p = os.path.join(_model_path()[0], p)
+    keep = torch.from_numpy(np.load(p)).to(torch.int64)
+    if keep.ndim != 1 or not bool((keep[1:] > keep[:-1]).all()):
+        raise ValueError(f"SHAPEQUANT_HEAD_KEEP {p}: want ascending unique 1-D token ids")
+    return keep
 
 
 def _patch_qwen35_embedding() -> None:

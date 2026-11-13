@@ -496,11 +496,19 @@ class Q8Head:
       M <= small_max: the batched q8 GEMV (1.35 GB read for 27B vs 2.5 GB bf16);
       M >  small_max: row chunks dequantized to fp16 into the shared scratch, then a GEMM each.
 
-    Same forward / R interface as PackedShards, so it runs through the shapequant::linear op."""
+    Same forward / R interface as PackedShards, so it runs through the shapequant::linear op.
+
+    keep (int64 [V], ascending): the rows q / sc hold are these token ids of an R-row head (a pruned
+    head, e.g. no CJK output); forward scatters them into [M, R] and the other ids get -inf."""
 
     def __init__(self, q: torch.Tensor, sc: torch.Tensor, R: int | None = None, small_max: int = 32,
-                 chunk_rows: int = 8192, tiled: bool | None = None):
+                 chunk_rows: int = 8192, tiled: bool | None = None, keep: torch.Tensor | None = None):
         self.V, self.C = q.shape
+        self.keep = None
+        if keep is not None:
+            if keep.shape != (self.V,) or R is None or int(keep.max()) >= R:
+                raise ValueError(f"q8 head: keep {tuple(keep.shape)} for {self.V} rows, R {R}")
+            self.keep = keep.to(device=q.device, dtype=torch.int64).contiguous()
         if self.C % 32 or sc.shape != (self.V, self.C // 32):
             raise ValueError(f"q8 head: q {tuple(q.shape)}, scale {tuple(sc.shape)}")
         self.R = self.V if R is None else R
@@ -547,12 +555,21 @@ class Q8Head:
         shp = x.shape
         x16 = x.reshape(-1, self.C).to(torch.float16).contiguous()
         M = x16.shape[0]
+        if self.keep is not None:
+            yk = self._logits(x16, torch.empty(M, self.V, dtype=torch.float16, device=x16.device), M)
+            y = torch.full((M, self.R), float("-inf"), dtype=x.dtype, device=x16.device)
+            y.index_copy_(1, self.keep, yk.to(x.dtype))
+            return y.view(*shp[:-1], self.R)
         y = torch.empty(M, self.R, dtype=torch.float16, device=x16.device)
         if self.R > self.V:
             y[:, self.V:] = 0
+        return self._logits(x16, y, M).to(x.dtype).view(*shp[:-1], self.R)
+
+    def _logits(self, x16: torch.Tensor, y: torch.Tensor, M: int) -> torch.Tensor:
+        """Rows 0..V-1 of the head into y[:, :V] (y: fp16 [M, >= V]); returns y."""
         if 0 < M <= self.small_max:
             from ..kernels import batched_runs as br
-            yv = y if self.R == self.V else torch.empty(M, self.V, dtype=torch.float16, device=x16.device)
+            yv = y if y.shape[1] == self.V else torch.empty(M, self.V, dtype=torch.float16, device=x16.device)
             if self.tiled:
                 br.gemv_q8_tile(self.qt, self.st, x16, yv, self.V, self.C, M)
             else:
@@ -564,7 +581,7 @@ class Q8Head:
             for s in range(0, self.V, self.chunk_rows):
                 e = min(self.V, s + self.chunk_rows)
                 y[:, s:e] = x16 @ self._rows(s, e, scratch).t()
-        return y.to(x.dtype).view(*shp[:-1], self.R)
+        return y
 
 
 def q4_embed(q: torch.Tensor, sc: torch.Tensor, ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -582,9 +599,16 @@ class Q4Embedding:
     vLLM's model build / load / torch.compile never see its tensors; s38: as registered module
     buffers it came back all zeros inside vLLM)."""
 
-    def __init__(self, q: torch.Tensor, sc: torch.Tensor, dtype: torch.dtype):
-        self.q, self.sc, self.dtype = q, sc, dtype
-        self.C = q.shape[1] * 2
+    def __init__(self, q: torch.Tensor, sc: torch.Tensor, dtype: torch.dtype, host: bool = False):
+        """host: q / sc are CPU tensors kept in pinned host RAM; the GPU reads the looked-up rows over
+        PCIe through UVA views (vLLM's get_accelerator_view_from_cpu_tensor), so the lookup stays a
+        plain device op (CUDA-graph safe) and the table costs no VRAM."""
+        self.dtype, self.C, self.host = dtype, q.shape[1] * 2, host
+        if host:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor as uva
+            self._pinned = (q.contiguous().pin_memory(), sc.contiguous().pin_memory())
+            q, sc = uva(self._pinned[0]), uva(self._pinned[1])
+        self.q, self.sc = q, sc
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         return q4_embed(self.q, self.sc, ids, self.dtype)
